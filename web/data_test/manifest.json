@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "generated_by": "tools/make_test_data.py (SYNTHETIC)",
+  "origin_cm": [
+    120000.0,
+    210000.0,
+    3000.0
+  ],
+  "terrain": {
+    "tiles": [
+      {
+        "name": "TEST_A",
+        "mesh": "meshes/TEST_A.bin",
+        "texture": "textures/TEST_A.jpg",
+        "translation_cm": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "TEST_B",
+        "mesh": "meshes/TEST_B.bin",
+        "texture": "textures/TEST_B.jpg",
+        "translation_cm": [
+          120000.0,
+          200000.0,
+          0.0
+        ]
+      }
+    ]
+  },
+  "lidar": {
+    "offset_cm": [
+      110000.0,
+      210000.0,
+      0.0
+    ],
+    "original_coordinates": [
+      71898655.0,
+      12345678.0,
+      0.0
+    ],
+    "chunks": [
+      {
+        "file": "lidar/chunk_000.bin",
+        "count": 150000
+      },
+      {
+        "file": "lidar/chunk_001.bin",
+        "count": 150000
+      }
+    ]
+  }
+}

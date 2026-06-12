@@ -1,0 +1,106 @@
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  font-family: system-ui, "Segoe UI", sans-serif;
+  /* subtle gradient sky — renderer clears transparent so this shows through */
+  background: linear-gradient(to bottom,
+    #28415e 0%,
+    #4a6b8a 35%,
+    #8fa8bb 70%,
+    #c9c2ae 100%);
+  color: #e8e8e8;
+}
+
+#viewport {
+  position: fixed;
+  inset: 0;
+}
+#viewport canvas { display: block; }
+
+#panel {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  width: 250px;
+  max-height: calc(100vh - 20px);
+  overflow-y: auto;
+  background: rgba(16, 20, 26, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  backdrop-filter: blur(4px);
+  user-select: none;
+}
+
+#panel h1 {
+  margin: 0 0 6px 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+#panel fieldset {
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  margin: 8px 0;
+  padding: 6px 8px;
+}
+#panel legend {
+  padding: 0 4px;
+  font-weight: 600;
+  color: #9fc2e8;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+  white-space: nowrap;
+}
+.row input[type="range"] { flex: 1; min-width: 60px; }
+.row span { min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.status {
+  margin: 6px 0 2px;
+  font-size: 11px;
+  color: #b8c4cf;
+  line-height: 1.45;
+  white-space: pre-line;
+}
+.status.error { color: #ff9a8a; }
+.status.ok { color: #9ee8a8; }
+.mono { font-family: ui-monospace, Consolas, monospace; }
+
+.hint {
+  font-size: 10.5px;
+  color: #8d99a6;
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+button {
+  background: #2d4a66;
+  color: #e8e8e8;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 5px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+button:hover { background: #3a5e80; }
+
+#loading-overlay {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  background: rgba(16, 20, 26, 0.8);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  pointer-events: none;
+}
+.hidden { display: none; }

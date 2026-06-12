@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UKy Campus Viewer</title>
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "./lib/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="viewport"></div>
+
+<div id="panel">
+  <h1>UKy Campus</h1>
+  <div id="manifest-status" class="status">manifest: loading&hellip;</div>
+
+  <fieldset>
+    <legend>Terrain</legend>
+    <label class="row"><input type="checkbox" id="terrain-visible" checked> visible</label>
+    <label class="row">opacity
+      <input type="range" id="terrain-opacity" min="0" max="1" step="0.05" value="1">
+      <span id="terrain-opacity-val">1.00</span>
+    </label>
+    <label class="row"><input type="checkbox" id="uv-flip" checked> UV V-flip (v = 1&minus;v)</label>
+    <label class="row"><input type="checkbox" id="terrain-wireframe"> wireframe</label>
+    <div id="terrain-status" class="status">terrain: waiting for manifest</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>LiDAR</legend>
+    <label class="row"><input type="checkbox" id="lidar-visible" checked> visible</label>
+    <label class="row">point size
+      <input type="range" id="point-size" min="0.02" max="3" step="0.02" value="0.4">
+      <span id="point-size-val">0.40</span>
+    </label>
+    <label class="row">budget (M pts)
+      <input type="range" id="point-budget" min="0.5" max="30" step="0.5" value="6">
+      <span id="point-budget-val">6.0</span>
+    </label>
+    <div id="lidar-status" class="status">lidar: waiting for manifest</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Camera</legend>
+    <button id="camera-reset">Reset view</button>
+    <div class="hint">LMB orbit &middot; RMB pan &middot; wheel zoom<br>
+      WASD move &middot; Q/E down/up &middot; Shift = fast</div>
+  </fieldset>
+
+  <div id="fps" class="status">-- fps</div>
+  <div id="cursor-readout" class="status mono">cursor: --</div>
+</div>
+
+<div id="loading-overlay" class="hidden"><div id="loading-text"></div></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

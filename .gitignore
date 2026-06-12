@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated/extracted artifacts (rebuild with tools/build_all.py)
+web/data/
+extracted/
+*.log
+
+# Editor/OS cruft
+.vscode/
+Thumbs.db
+.DS_Store
