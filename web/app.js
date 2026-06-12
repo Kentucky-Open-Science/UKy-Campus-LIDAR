@@ -19,7 +19,6 @@ const CM_TO_M = 0.01;
 const state = {
   manifest: null,
   originCm: [0, 0, 0],          // UE cm, subtracted from everything (doubles)
-  uvFlip: true,
   terrain: { tiles: [], group: null, loaded: 0, failed: 0, opacity: 1.0 },
   lidar: {
     chunks: [], group: null, material: null,
@@ -219,10 +218,9 @@ async function loadManifest() {
     if (total > 0) {
       const slider = $('point-budget');
       slider.max = Math.max(1, Math.ceil(total / 1e6));
-      if (parseFloat(slider.value) > parseFloat(slider.max)) {
-        slider.value = slider.max;
-      }
-      slider.dispatchEvent(new Event('input'));
+      slider.value = slider.max;  // show all points by default
+      $('point-budget-val').textContent = parseFloat(slider.max).toFixed(1);
+      state.lidar.budget = total;
     }
     lidarPump();
   } else {
@@ -250,22 +248,6 @@ function parseMeshBin(buffer) {
   const uv = new Float32Array(buffer, off, vc * 2); off += vc * 8;
   const idx = new Uint32Array(buffer, off, ic);
   return { vc, ic, pos, uv, idx };
-}
-
-function setUvAttribute(geometry, flip) {
-  const raw = geometry.userData.rawUv;
-  if (!raw) return;
-  let attr = geometry.getAttribute('uv');
-  if (!attr) {
-    attr = new THREE.BufferAttribute(new Float32Array(raw.length), 2);
-    geometry.setAttribute('uv', attr);
-  }
-  const a = attr.array;
-  for (let i = 0; i < raw.length; i += 2) {
-    a[i] = raw[i];
-    a[i + 1] = flip ? 1 - raw[i + 1] : raw[i + 1];
-  }
-  attr.needsUpdate = true;
 }
 
 function fallbackTexture(label) {
@@ -327,8 +309,7 @@ async function loadTile(tile) {
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
-  geometry.userData.rawUv = new Float32Array(uv); // copy: keep raw for flip toggle
-  setUvAttribute(geometry, state.uvFlip);
+  geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uv), 2));
   geometry.setIndex(new THREE.BufferAttribute(outIdx, 1));
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
@@ -556,12 +537,6 @@ $('terrain-opacity').addEventListener('input', (e) => {
   $('terrain-opacity-val').textContent = state.terrain.opacity.toFixed(2);
   for (const t of state.terrain.tiles) {
     if (t.object) applyOpacity(t.object.material);
-  }
-});
-$('uv-flip').addEventListener('change', (e) => {
-  state.uvFlip = e.target.checked;
-  for (const t of state.terrain.tiles) {
-    if (t.object) setUvAttribute(t.object.geometry, state.uvFlip);
   }
 });
 $('terrain-wireframe').addEventListener('change', (e) => {

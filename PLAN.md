@@ -111,15 +111,16 @@ are cached. Pillow 12.2 + numpy 2.4.6 installed. `.gitignore` created.
 
 - [x] Core uasset parser + inspector
 - [x] Texture format identified (PNG payload)
-- [~] Mesh native region decode (brute-force the 142-byte tail; then RawMesh vs MeshDescription)
-- [ ] LiDAR octree reverse-engineering (biggest unknown; check engine plugin source)
-- [ ] extract_texture.py + run on 18 textures (needs Pillow: `pip install pillow`)
-- [ ] extract_mesh.py + run on 16 meshes; sanity: tile XY extents ≈ 2640 ft × 2640 ft, contiguous neighbors
-- [ ] extract_lidar.py + decimation/chunking
-- [ ] Blueprint transforms (or derive placement from mesh names/bounds if Blueprint parse is hard)
-- [ ] web viewer; verify: tiles seamless, textures not flipped (check V flip!), LiDAR registers onto basemap (same coordinate frame; LiDAR was colored FROM basemap so XY should match)
-- [ ] .gitignore (exclude web/data, __pycache__, extracted intermediates; keep *.uasset out or LFS — they're 3.6 GB)
-- [ ] README with how-to-run
+- [x] Mesh native region decode (FMeshDescription, fully reverse-engineered)
+- [x] LiDAR octree reverse-engineering (octree node-walk, point struct verified byte-exact)
+- [x] extract_texture.py + run on 18 textures
+- [x] extract_mesh.py + run on 16 meshes
+- [x] extract_lidar.py + decimation/chunking (24.9M -> 12M pts, 64 chunks)
+- [x] Blueprint transforms (GRID_DTM_COMBINED parsed -> shared origin transform)
+- [x] web viewer (Three.js, OrbitControls, WASD fly, terrain + LiDAR layers, UV flip, point budget)
+- [x] build_all.py orchestrator + web/data/manifest.json
+- [x] .gitignore
+- [x] README with how-to-run
 
 ## Notes / gotchas
 - Python 3.13 available. Windows; prefer forward-slash paths in bash tool.
