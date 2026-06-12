@@ -1,6 +1,6 @@
 """Orchestrate full pipeline: extract everything -> generate web/data/manifest.json.
 
-Run:  python tools/build_all.py [--skip-textures] [--skip-meshes] [--skip-lidar]
+Run:  python tools/build_all.py [--skip-textures] [--skip-meshes] [--skip-lidar] [--skip-buildings]
 
 After extraction is complete, merges the per-domain manifests and writes the
 unified manifest.json that the web viewer (web/app.js) expects.
@@ -10,15 +10,14 @@ The data contract expected by the viewer is documented in web/README.md.
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_texture import main as extract_textures_main
 from extract_mesh import main as extract_meshes_main
-from extract_lidar import main as extract_lidar_main, read_original_coords, ORIGINAL_COORDS
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-extract_lidar_main.ORIGINAL_COORDS = read_original_coords() if ORIGINAL_COORDS is None else ORIGINAL_COORDS
 
 
 class Args:
@@ -27,7 +26,7 @@ class Args:
             setattr(self, k, v)
 
 
-def run_extraction(skip_textures, skip_meshes, skip_lidar):
+def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings):
     """Run extraction steps (these may be no-ops if data already exists)."""
     print('=' * 60)
     print(' UKy Campus — full data extraction pipeline')
@@ -50,9 +49,15 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar):
 
     if not skip_lidar:
         print('\n--- Step 3: LiDAR (uasset -> chunked .bin) ---')
-        extract_lidar_main()
+        subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'extract_lidar.py')],
+                       cwd=ROOT, check=True)
 
-    print('\n--- Step 4: Merge manifests -> web/data/manifest.json ---')
+    if not skip_buildings:
+        print('\n--- Step 4: Buildings (lidar -> .bin) ---')
+        subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'extract_buildings.py')],
+                       cwd=ROOT, check=True)
+
+    print('\n--- Step 5: Merge manifests -> web/data/manifest.json ---')
     merge_manifests()
 
 
@@ -91,8 +96,7 @@ def merge_manifests():
             'visible': scene.get('visible', True),
         })
 
-    # Compute a natural origin (centroid of all terrain bounding boxes)
-    # The viewer subtracts origin_cm then converts cm->m
+    # Compute a natural origin
     origin_cm = scene_manifest['origin_node']['translation_cm'] if scene_manifest.get('origin_node') else [0, 0, 0]
 
     # Build lidar section
@@ -110,6 +114,16 @@ def merge_manifests():
         ],
     }
 
+    # Build buildings section (T024)
+    buildings = None
+    bld_path = os.path.join(ext, 'manifest-buildings.json')
+    if os.path.exists(bld_path):
+        with open(bld_path) as f:
+            bld_manifest = json.load(f)
+        buildings = {'tiles': bld_manifest.get('tiles', [])}
+        if 'total_mesh_bytes' in bld_manifest:
+            buildings['total_mesh_bytes'] = bld_manifest['total_mesh_bytes']
+
     manifest = {
         'title': 'UKy Campus — extracted from UE 4.24.3 editor assets',
         'origin_cm': origin_cm,
@@ -119,20 +133,30 @@ def merge_manifests():
             'tiles': tiles,
         },
         'lidar': lidar,
-        'extraction_stats': {
-            'textures': tex_manifest['count'],
-            'meshes': len(mesh_manifest['tiles']),
-            'lidar_full_points': lidar_manifest['total_points_full'],
-            'lidar_kept_points': lidar_manifest['total_points_kept'],
-            'lidar_chunks': len(lidar_manifest['chunks']),
-        },
     }
+
+    if buildings:
+        manifest['buildings'] = buildings
+
+    manifest['extraction_stats'] = {
+        'textures': tex_manifest['count'],
+        'meshes': len(mesh_manifest['tiles']),
+        'lidar_full_points': lidar_manifest['total_points_full'],
+        'lidar_kept_points': lidar_manifest['total_points_kept'],
+        'lidar_chunks': len(lidar_manifest['chunks']),
+    }
+    if buildings:
+        manifest['extraction_stats']['buildings'] = len(buildings['tiles'])
+        if 'total_mesh_bytes' in buildings:
+            manifest['extraction_stats']['building_mesh_bytes'] = buildings['total_mesh_bytes']
 
     out_path = os.path.join(ROOT, 'web', 'data', 'manifest.json')
     with open(out_path, 'w') as f:
         json.dump(manifest, f, indent=2)
+    bl = len(buildings['tiles']) if buildings else 0
     print(f'  wrote {out_path}')
     print(f'  tiles: {len(tiles)}, lidar chunks: {len(lidar["chunks"])}, '
+          f'buildings: {bl}, '
           f'origin_cm: [{origin_cm[0]:.1f}, {origin_cm[1]:.1f}, {origin_cm[2]:.1f}]')
     print('\nDone. Run: cd web && python -m http.server 8000')
 
@@ -144,7 +168,7 @@ def verify():
 
     manifest_path = os.path.join(data, 'manifest.json')
     if not os.path.exists(manifest_path):
-        issues.append('web/data/manifest.json missing — run: python tools/build_all.py')
+        issues.append('web/data/manifest.json missing -- run: python tools/build_all.py')
         print('Issues found:')
         for i in issues:
             print(f'  [MISSING] {i}')
@@ -166,6 +190,19 @@ def verify():
         if not os.path.exists(chunk_path):
             issues.append(f"missing lidar chunk: {c['file']}")
 
+    # T025: Verify buildings
+    if 'buildings' in m:
+        for b in m['buildings']['tiles']:
+            bpath = os.path.join(data, b['file'])
+            if not os.path.exists(bpath):
+                issues.append(f"missing building: {b['file']}")
+            req_fields = ['name', 'file', 'bounds_min_cm', 'bounds_max_cm',
+                          'height_cm', 'footprint_area_m2', 'point_count',
+                          'vertex_count', 'index_count']
+            for rf in req_fields:
+                if rf not in b:
+                    issues.append(f"building {b.get('name','?')} missing field: {rf}")
+
     if issues:
         print('Issues found:')
         for i in issues:
@@ -173,10 +210,13 @@ def verify():
         return False
 
     stats = m['extraction_stats']
-    print(f'verification OK — {stats["textures"]} textures, '
+    bld = stats.get('buildings', 0)
+    bld_mb = stats.get('building_mesh_bytes', 0) / (1024 * 1024)
+    print(f'verification OK -- {stats["textures"]} textures, '
           f'{stats["meshes"]} meshes, '
           f'{stats["lidar_kept_points"]/1e6:.1f}M lidar pts in '
-          f'{stats["lidar_chunks"]} chunks')
+          f'{stats["lidar_chunks"]} chunks, '
+          f'{bld} buildings ({bld_mb:.1f} MB)')
     return True
 
 
@@ -185,6 +225,7 @@ if __name__ == '__main__':
     ap.add_argument('--skip-textures', action='store_true')
     ap.add_argument('--skip-meshes', action='store_true')
     ap.add_argument('--skip-lidar', action='store_true')
+    ap.add_argument('--skip-buildings', action='store_true')
     ap.add_argument('--verify', action='store_true',
                     help='Verify data integrity without extracting')
     args = ap.parse_args()
@@ -193,4 +234,5 @@ if __name__ == '__main__':
         ok = verify()
         sys.exit(0 if ok else 1)
 
-    run_extraction(args.skip_textures, args.skip_meshes, args.skip_lidar)
+    run_extraction(args.skip_textures, args.skip_meshes, args.skip_lidar,
+                   args.skip_buildings)

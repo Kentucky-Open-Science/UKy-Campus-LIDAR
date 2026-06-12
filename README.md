@@ -28,6 +28,7 @@ CAMPUS/
 │   ├── extract_mesh.py       # StaticMesh -> .bin (positions, UVs, indices)
 │   ├── extract_lidar.py      # LidarPointCloud -> decimated chunked .bin
 │   ├── extract_scene.py      # Blueprint scene assembly (transforms, materials)
+│   ├── extract_buildings.py  # LiDAR building-class → 3D mesh extraction
 │   ├── build_all.py          # Full pipeline orchestrator
 │   └── verify_viewer.py      # Headless viewer test (requires playwright)
 ├── web/                      # Three.js viewer (static)
@@ -39,7 +40,8 @@ CAMPUS/
 │       ├── manifest.json     # Unified scene manifest
 │       ├── meshes/*.bin      # 16 terrain tiles (verts, UVs, indices)
 │       ├── textures/*.jpg    # 18 aerial imagery textures
-│       └── lidar/chunk_*.bin # 64 decimated point-cloud chunks
+│       ├── lidar/chunk_*.bin # 64 decimated point-cloud chunks
+│       └── buildings/*.bin   # ~890 extracted building meshes
 └── extracted/                # Per-domain manifests + reports
 ```
 
@@ -73,4 +75,5 @@ wireframe mode, camera reset.
 - 16 terrain tiles (804 m square grid, half-mile spacing)
 - 18 ortho imagery textures (4096x4096, ~74 MB total JPEG)
 - ~24.9M LiDAR points (decimated to ~12M in 64 chunks, ~183 MB)
+- ~890 building meshes from ~5.7M building-class LiDAR points (~1.3 MB total)
 - Viewport: ~1.8 km x 3.4 km area centered on UKy Lexington campus

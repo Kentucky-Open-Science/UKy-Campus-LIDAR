@@ -25,6 +25,7 @@ const state = {
     offsetCm: [0, 0, 0], originalCoordinates: null,
     budget: 6_000_000, pumping: false,
   },
+  buildings: { tiles: [], group: null, loaded: 0, failed: 0 },
   helpers: null,
   hasRealData: false,
 };
@@ -74,7 +75,8 @@ controls.target.set(0, 0, 0);
 
 state.terrain.group = new THREE.Group();
 state.lidar.group = new THREE.Group();
-scene.add(state.terrain.group, state.lidar.group);
+state.buildings.group = new THREE.Group();
+scene.add(state.terrain.group, state.lidar.group, state.buildings.group);
 
 // orientation helpers shown until real data arrives
 state.helpers = new THREE.Group();
@@ -171,7 +173,23 @@ function normalizeManifest(m) {
 
   if (!origin && tiles.length) origin = tiles[0].translationCm;
   if (!origin) origin = [0, 0, 0];
-  return { origin, tiles, lidar };
+
+  let buildings = null;
+  if (m.buildings) {
+    buildings = (m.buildings.tiles || []).map((b) => ({
+      name: b.name,
+      file: b.file,
+      boundsMinCm: b.bounds_min_cm || b.boundsMinCm,
+      boundsMaxCm: b.bounds_max_cm || b.boundsMaxCm,
+      heightCm: b.height_cm || b.heightCm || 0,
+      footprintAreaM2: b.footprint_area_m2 || b.footprintAreaM2 || 0,
+      pointCount: b.point_count || b.pointCount || 0,
+      vertexCount: b.vertex_count || b.vertexCount || 0,
+      indexCount: b.index_count || b.indexCount || 0,
+    }));
+  }
+
+  return { origin, tiles, lidar, buildings };
 }
 
 async function loadManifest() {
@@ -202,7 +220,8 @@ async function loadManifest() {
   state.originCm = norm.origin.map(Number);
   setStatus(el.manifestStatus,
     `manifest: ok — ${norm.tiles.length} tiles, ` +
-    `${norm.lidar ? norm.lidar.chunks.length : 0} lidar chunks\n` +
+    `${norm.lidar ? norm.lidar.chunks.length : 0} lidar chunks, ` +
+    `${norm.buildings ? norm.buildings.length : 0} buildings\n` +
     `origin_cm: [${state.originCm.map((v) => v.toFixed(0)).join(', ')}]`, 'ok');
 
   loadTerrain(norm.tiles);
@@ -225,6 +244,11 @@ async function loadManifest() {
     lidarPump();
   } else {
     setStatus(el.lidarStatus, 'lidar: not in manifest', 'error');
+  }
+  if (norm.buildings) {
+    loadBuildings(norm.buildings);
+  } else {
+    setStatus($('buildings-status'), 'buildings: not in manifest', 'error');
   }
 }
 
@@ -524,6 +548,137 @@ async function lidarPump() {
   }
 }
 
+// --------------------------------------------------------------- buildings ---
+
+// building .bin contract (no UVs variant):
+//   u32 vert_count, u32 index_count,
+//   f32 positions[vert_count*3] (UE cm), u32 indices[index_count] (triangle list)
+function parseBuildingBin(buffer) {
+  if (buffer.byteLength < 8) throw new Error('building bin too small');
+  const dv = new DataView(buffer);
+  const vc = dv.getUint32(0, true);
+  const ic = dv.getUint32(4, true);
+  const need = 8 + vc * 12 + ic * 4;
+  if (buffer.byteLength < need) {
+    throw new Error(`building bin truncated: need ${need} B, have ${buffer.byteLength} B`);
+  }
+  const pos = new Float32Array(buffer, 8, vc * 3);
+  const idx = new Uint32Array(buffer, 8 + vc * 12, ic);
+  return { vc, ic, pos, idx };
+}
+
+function buildingHeightColor(heightM, minH, maxH) {
+  const range = maxH - minH || 1;
+  const t = (heightM - minH) / range;
+  return new THREE.Color().setHSL(0.55 + t * 0.15, 0.6, 0.35 + t * 0.3);
+}
+
+let _buildingGreyMat = null;
+function buildingGreyMaterial() {
+  if (!_buildingGreyMat) {
+    _buildingGreyMat = new THREE.MeshStandardMaterial({
+      color: 0x8899aa, roughness: 0.8, metalness: 0.1, side: THREE.DoubleSide,
+    });
+  }
+  return _buildingGreyMat;
+}
+
+function makeBuildingMaterial(bld, minH, maxH) {
+  const mode = $('buildings-color-mode').value;
+  if (mode === 'grey') {
+    return buildingGreyMaterial().clone();
+  }
+  return new THREE.MeshStandardMaterial({
+    color: buildingHeightColor(bld.heightCm / 100, minH, maxH),
+    roughness: 0.8, metalness: 0.1, side: THREE.DoubleSide,
+  });
+}
+
+async function loadBuilding(bld, minH, maxH) {
+  const url = DATA_DIR + bld.file;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const { vc, ic, pos, idx } = parseBuildingBin(await resp.arrayBuffer());
+
+  const o = state.originCm;
+  const outPos = new Float32Array(vc * 3);
+  for (let i = 0; i < vc; i++) {
+    const j = i * 3;
+    outPos[j]     = (pos[j]     - o[0]) * CM_TO_M;
+    outPos[j + 1] = (pos[j + 2] - o[2]) * CM_TO_M;
+    outPos[j + 2] = (pos[j + 1] - o[1]) * CM_TO_M;
+  }
+
+  // flip winding for handedness change (same as terrain)
+  const triCount = Math.floor(ic / 3);
+  const outIdx = new Uint32Array(triCount * 3);
+  for (let i = 0; i < triCount * 3; i += 3) {
+    outIdx[i] = idx[i];
+    outIdx[i + 1] = idx[i + 2];
+    outIdx[i + 2] = idx[i + 1];
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+  geometry.setIndex(new THREE.BufferAttribute(outIdx, 1));
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  const material = makeBuildingMaterial(bld, minH, maxH);
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.name = bld.name;
+  mesh.userData = { buildingName: bld.name, heightCm: bld.heightCm };
+  state.buildings.group.add(mesh);
+  bld.object = mesh;
+  bld.stats = { vc, ic };
+}
+
+function updateBuildingsStatus() {
+  const tiles = state.buildings.tiles;
+  if (!tiles.length) {
+    setStatus($('buildings-status'), 'buildings: no tiles in manifest', 'error');
+    return;
+  }
+  const loaded = tiles.filter((t) => t.status === 'loaded').length;
+  const failed = tiles.filter((t) => t.status === 'error');
+  let txt = `buildings: ${loaded}/${tiles.length} loaded`;
+  if (failed.length) {
+    txt += `\nfailed: ${failed.slice(0, 3).map((t) => t.name).join(', ')}` +
+      (failed.length > 3 ? ` +${failed.length - 3} more` : '');
+  }
+  setStatus($('buildings-status'), txt,
+    failed.length === tiles.length ? 'error' : (loaded ? 'ok' : null));
+}
+
+async function loadBuildings(blds) {
+  state.buildings.tiles = blds;
+  updateBuildingsStatus();
+  if (!blds.length) return;
+
+  // Compute height range for color mapping
+  const heights = blds.map((b) => b.heightCm / 100);
+  const minH = Math.min(...heights);
+  const maxH = Math.max(...heights);
+
+  let firstLoad = true;
+  for (const bld of blds) {
+    bld.status = 'loading';
+    showOverlay(`buildings: loading ${bld.name}…`);
+    try {
+      await loadBuilding(bld, minH, maxH);
+      bld.status = 'loaded';
+      onRealData();
+      if (firstLoad) { firstLoad = false; }
+    } catch (e) {
+      bld.status = 'error';
+      bld.error = String(e.message || e);
+      console.warn(`building ${bld.name}:`, e);
+    }
+    updateBuildingsStatus();
+  }
+  hideOverlay();
+}
+
 // ------------------------------------------------------------------- UI ---
 
 $('terrain-visible').addEventListener('change', (e) => {
@@ -558,6 +713,34 @@ $('point-budget').addEventListener('input', (e) => {
   lidarPump(); // load more if budget grew
 });
 $('camera-reset').addEventListener('click', () => resetView());
+
+$('buildings-visible').addEventListener('change', (e) => {
+  state.buildings.group.visible = e.target.checked;
+});
+$('buildings-wireframe').addEventListener('change', (e) => {
+  for (const t of state.buildings.tiles) {
+    if (t.object) t.object.material.wireframe = e.target.checked;
+  }
+});
+$('buildings-color-mode').addEventListener('change', () => {
+  const mode = $('buildings-color-mode').value;
+  const heights = state.buildings.tiles.map((b) => b.heightCm / 100);
+  const minH = Math.min(...heights);
+  const maxH = Math.max(...heights);
+  for (const t of state.buildings.tiles) {
+    if (!t.object) continue;
+    const oldMat = t.object.material;
+    const newMat = mode === 'grey'
+      ? buildingGreyMaterial().clone()
+      : new THREE.MeshStandardMaterial({
+          color: buildingHeightColor(t.heightCm / 100, minH, maxH),
+          roughness: 0.8, metalness: 0.1, side: THREE.DoubleSide,
+        });
+    newMat.wireframe = oldMat.wireframe;
+    t.object.material = newMat;
+    oldMat.dispose();
+  }
+});
 
 function resetView() {
   const box = new THREE.Box3();
@@ -637,23 +820,32 @@ function fmt(v, d = 1) { return v.toFixed(d); }
 function updateCursorReadout() {
   if (!mouseMoved) return;
   mouseMoved = false;
-  if (!state.terrain.group.children.length || !state.terrain.group.visible) {
-    setStatus(el.cursor, 'cursor: (no terrain to raycast)');
+  const hasTerrain = state.terrain.group.children.length && state.terrain.group.visible;
+  const hasBuildings = state.buildings.group.children.length && state.buildings.group.visible;
+  if (!hasTerrain && !hasBuildings) {
+    setStatus(el.cursor, 'cursor: (no terrain or buildings to raycast)');
     return;
   }
   raycaster.setFromCamera(mouseNdc, camera);
-  const hits = raycaster.intersectObjects(state.terrain.group.children, false);
+  const targets = [];
+  if (hasBuildings) targets.push(...state.buildings.group.children);
+  if (hasTerrain) targets.push(...state.terrain.group.children);
+  const hits = raycaster.intersectObjects(targets, false);
   if (!hits.length) {
     setStatus(el.cursor, 'cursor: --');
     return;
   }
   const p = hits[0].point;
+  const obj = hits[0].object;
   const ue = sceneToUeCm(p.x, p.y, p.z);
   let txt = `scene m: ${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)}\n` +
     `UE cm: ${fmt(ue[0], 0)}, ${fmt(ue[1], 0)}, ${fmt(ue[2], 0)}`;
+  if (obj.userData && obj.userData.buildingName) {
+    txt += `\nbuilding: ${obj.userData.buildingName}` +
+      ` (${(obj.userData.heightCm / 100).toFixed(1)}m)`;
+  }
   const oc = state.lidar.originalCoordinates;
   if (oc && oc.length === 3) {
-    // georef = lidar.original_coordinates + UE cm (per-component, same frame)
     txt += `\ngeo: ${fmt(oc[0] + ue[0], 0)}, ${fmt(oc[1] + ue[1], 0)}, ` +
       `${fmt(oc[2] + ue[2], 0)}`;
   }

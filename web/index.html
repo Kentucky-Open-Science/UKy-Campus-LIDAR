@@ -46,6 +46,19 @@
   </fieldset>
 
   <fieldset>
+    <legend>Buildings</legend>
+    <label class="row"><input type="checkbox" id="buildings-visible" checked> visible</label>
+    <label class="row">color
+      <select id="buildings-color-mode">
+        <option value="height">by height</option>
+        <option value="grey">grey</option>
+      </select>
+    </label>
+    <label class="row"><input type="checkbox" id="buildings-wireframe"> wireframe</label>
+    <div id="buildings-status" class="status">buildings: waiting for manifest</div>
+  </fieldset>
+
+  <fieldset>
     <legend>Camera</legend>
     <button id="camera-reset">Reset view</button>
     <div class="hint">LMB orbit &middot; RMB pan &middot; wheel zoom<br>

@@ -23,7 +23,8 @@ def check(page, url, shot, wait_ms=7000):
     print(f"--- {url}")
     page.goto(url)
     page.wait_for_timeout(wait_ms)
-    for sid in ("manifest-status", "terrain-status", "lidar-status", "fps"):
+    for sid in ("manifest-status", "terrain-status", "lidar-status",
+                 "buildings-status", "fps"):
         print(f"  #{sid}: " +
               page.locator("#" + sid).inner_text().replace("\n", " | "))
     page.mouse.move(640, 420)
