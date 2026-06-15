@@ -53,8 +53,11 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings):
                        cwd=ROOT, check=True)
 
     if not skip_buildings:
-        print('\n--- Step 4: Buildings (lidar -> .bin) ---')
-        subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'extract_buildings.py')],
+        print('\n--- Step 4: Buildings (lidar + OSM -> .bin) ---')
+        # Hybrid extractor: OSM footprints split/bound the LiDAR, LiDAR gives
+        # shape + height. Run as a module so tools.* imports resolve and the
+        # stdlib `inspect` isn't shadowed by tools/inspect.py.
+        subprocess.run([sys.executable, '-m', 'tools.extract_buildings_hybrid'],
                        cwd=ROOT, check=True)
 
     print('\n--- Step 5: Merge manifests -> web/data/manifest.json ---')

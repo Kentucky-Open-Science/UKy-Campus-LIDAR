@@ -28,7 +28,9 @@ CAMPUS/
 │   ├── extract_mesh.py       # StaticMesh -> .bin (positions, UVs, indices)
 │   ├── extract_lidar.py      # LidarPointCloud -> decimated chunked .bin
 │   ├── extract_scene.py      # Blueprint scene assembly (transforms, materials)
-│   ├── extract_buildings.py  # LiDAR building-class → 3D mesh extraction
+│   ├── extract_buildings.py  # LiDAR building-class → 3D mesh (legacy, DBSCAN)
+│   ├── extract_buildings_hybrid.py  # OSM footprints split LiDAR + give height
+│   ├── verify_buildings_osm.py      # verify footprints vs OSM ground truth
 │   ├── build_all.py          # Full pipeline orchestrator
 │   └── verify_viewer.py      # Headless viewer test (requires playwright)
 ├── web/                      # Three.js viewer (static)
@@ -75,5 +77,7 @@ wireframe mode, camera reset.
 - 16 terrain tiles (804 m square grid, half-mile spacing)
 - 18 ortho imagery textures (4096x4096, ~74 MB total JPEG)
 - ~24.9M LiDAR points (decimated to ~12M in 64 chunks, ~183 MB)
-- ~890 building meshes from ~5.7M building-class LiDAR points (~1.3 MB total)
+- 3,109 building meshes (2,346 OSM-split + LiDAR-shaped, 763 LiDAR-only) from
+  ~5.5M building-class LiDAR points + OpenStreetMap footprints (~3.9 MB total).
+  Median footprint IoU vs OSM 0.93; verify with `python -m tools.verify_buildings_osm`
 - Viewport: ~1.8 km x 3.4 km area centered on UKy Lexington campus
