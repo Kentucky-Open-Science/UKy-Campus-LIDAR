@@ -15,6 +15,7 @@ extracted/
 
 # Node (web viewer dev server)
 node_modules/
+web/node_modules/
 
 # Editor/OS cruft
 .vscode/
