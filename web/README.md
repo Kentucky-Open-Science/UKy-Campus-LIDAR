@@ -5,9 +5,19 @@ UE 4.24 packages. Pure static files; no build step.
 
 ## Run
 
+Any static file server works (there is no build step). Either:
+
 ```sh
 cd web
-python -m http.server 8000
+npm install     # one-time: installs the http-server dev dependency
+npm start       # serves on http://localhost:8000/ and opens a browser
+```
+
+or, with no Node at all:
+
+```sh
+cd web
+python -m http.server 8000   # same as: npm run serve:python
 # then open http://localhost:8000/
 ```
 
@@ -114,3 +124,66 @@ u32 indices[index_count]      // triangle list
 
 Missing files are reported per-layer in the panel; the viewer starts fine with
 no data at all (shows a placeholder grid).
+
+## Roads & props (real road network)
+
+`roads.js` adds a real road network the scan data doesn't contain, plus props
+anchored to it: raised asphalt **ribbons** that follow the actual streets and
+terrain (mitre-jointed, draped on elevation), dashed **lane markings**,
+**intersection** pads, and (optionally) re-anchored street **trees**, parked
+**cars**, and mast-arm **traffic signals**. Props are heavily instanced
+(`InstancedMesh`). `createRoadNetwork(data, opts)` returns `{ group, layers,
+stats }` with toggleable `layers` (`roads / markings / trees / cars / signals`);
+`opts.trees/cars/signals` gate generation (the app currently builds streets-only:
+`{ trees:false, cars:false }`).
+
+The geometry is data-driven from `data/roads.json`. Two tools can produce it
+(run from the repo root); both write the same contract:
+
+**Primary — OpenStreetMap** (clean, complete, named streets):
+
+```sh
+python -m tools.osm_roads            # fetches OSM via Overpass for the campus bbox
+python -m tools.osm_roads --service  # also include named service roads
+```
+
+The viewer scene is georeferenced: from `manifest.lidar.original_coordinates` +
+`origin_cm`, the viewer's own cursor read-out implies an exact, rotation-free,
+unit-scale map between scene metres and **UTM zone 16N** (EPSG:32616):
+`easting = A + sceneX`, `northing = B − sceneZ`. `osm_roads.py` derives the
+campus lat/lon bbox from that, fetches highways, projects lon/lat→UTM→scene,
+clips to the terrain footprint, **bakes terrain elevation** into every point, and
+emits `[x,y,z]` polylines + intersection nodes. (Verified: the bbox centre
+projects to lon/lat −84.505, 38.030 = UK campus, and the ribbons land on the
+aerial streets.)
+
+**Alternative — extract from the aerial textures** (no external data, but partial
+coverage):
+
+```sh
+python -m tools.extract_roads --mpp 50 [--qc]
+```
+
+It stitches the tile JPGs into a world raster using each tile's exact planar
+UV→world mapping (the SAME convention three.js renders with — `flipY=false` ⇒
+image `row = v*height`, validated against the building footprints), gates asphalt
+by colour, masks building rooftops + wide parking blobs, skeletonises, vectorises,
+and bakes elevation. It is a heuristic detector — expect gaps (tree-occluded
+streets) and a few spurs; tune the constants at the top of the tool.
+
+Two lights (hemisphere + directional sun) were added so the `MeshStandard`
+materials used by buildings and the road props actually shade. This also fixed
+buildings rendering black — `loadBuilding()` now computes vertex normals. Terrain
+stays unaffected (it's unlit `MeshBasic`).
+
+`data/roads.json` contract:
+
+```jsonc
+{
+  "roads": [ { "pts": [[x, y, z], ...], "width": 7.8 } ],  // scene metres, y draped
+  "intersections": [ [x, y, z], ... ]
+}
+```
+
+UI (Roads & props fieldset): master visibility + per-category toggles (road
+surface / lane markings / trees / cars / traffic signals).

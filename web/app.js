@@ -9,6 +9,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from './lib/OrbitControls.js';
+import { createRoadNetwork } from './roads.js';
 
 // ---------------------------------------------------------------- config ---
 
@@ -26,6 +27,7 @@ const state = {
     budget: 6_000_000, pumping: false,
   },
   buildings: { tiles: [], group: null, loaded: 0, failed: 0 },
+  roadnet: null,       // real road network + props from roads.json (roads.js)
   helpers: null,
   hasRealData: false,
 };
@@ -77,6 +79,17 @@ state.terrain.group = new THREE.Group();
 state.lidar.group = new THREE.Group();
 state.buildings.group = new THREE.Group();
 scene.add(state.terrain.group, state.lidar.group, state.buildings.group);
+
+// Lights — terrain uses unlit MeshBasic so it is unaffected, but buildings and
+// the procedural city use MeshStandard and need light to shade (and show up).
+const hemiLight = new THREE.HemisphereLight(0xbcd4ff, 0x40402f, 1.0);
+const sunLight = new THREE.DirectionalLight(0xfff2e0, 1.5);
+sunLight.position.set(0.6, 1.0, 0.35); // direction only (target stays at origin)
+scene.add(hemiLight, sunLight);
+
+// Real road network + props (streets, intersections, trees, cars, traffic
+// signals) extracted from the aerial textures and draped on the terrain — see
+// tools/extract_roads.py and roads.js. Loaded from data/roads.json (loadRoads()).
 
 // orientation helpers shown until real data arrives
 state.helpers = new THREE.Group();
@@ -621,6 +634,7 @@ async function loadBuilding(bld, minH, maxH) {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
   geometry.setIndex(new THREE.BufferAttribute(outIdx, 1));
+  geometry.computeVertexNormals(); // MeshStandard needs normals to shade (else black)
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
 
@@ -679,6 +693,39 @@ async function loadBuildings(blds) {
   hideOverlay();
 }
 
+// ----------------------------------------------------------------- roads ---
+
+// Load the road network extracted from the aerial textures (already draped on
+// terrain elevation by tools/extract_roads.py), build ribbons + props.
+async function loadRoads() {
+  let data;
+  try {
+    const resp = await fetch(DATA_DIR + 'roads.json', { cache: 'no-cache' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    data = await resp.json();
+  } catch (e) {
+    setStatus($('road-status'), `roads: ${DATA_DIR}roads.json not found — ` +
+      `run tools/extract_roads.py`, 'error');
+    return;
+  }
+  state.roadnet = createRoadNetwork(data, { trees: false, cars: false });
+  scene.add(state.roadnet.group);
+  onRealData();
+  // if roads arrive before/without any terrain or lidar, frame them
+  if (!state.terrain.tiles.some((t) => t.status === 'loaded') &&
+      !state.lidar.chunks.some((c) => c.status === 'loaded')) resetView();
+  updateRoadStatus();
+}
+
+function updateRoadStatus() {
+  const node = $('road-status');
+  if (!node || !state.roadnet) return;
+  const s = state.roadnet.stats;
+  setStatus(node,
+    `roads: ${s.roads} (${s.km} km), ${s.intersections} intersections\n` +
+    `${s.trees} trees, ${s.cars} cars, ${s.signals} signals`, 'ok');
+}
+
 // ------------------------------------------------------------------- UI ---
 
 $('terrain-visible').addEventListener('change', (e) => {
@@ -713,6 +760,16 @@ $('point-budget').addEventListener('input', (e) => {
   lidarPump(); // load more if budget grew
 });
 $('camera-reset').addEventListener('click', () => resetView());
+
+$('road-visible').addEventListener('change', (e) => {
+  if (state.roadnet) state.roadnet.group.visible = e.target.checked;
+});
+for (const key of ['roads', 'markings', 'trees', 'cars', 'signals']) {
+  const cb = $('road-' + key);
+  if (cb) cb.addEventListener('change', (e) => {
+    if (state.roadnet) state.roadnet.layers[key].visible = e.target.checked;
+  });
+}
 
 $('buildings-visible').addEventListener('change', (e) => {
   state.buildings.group.visible = e.target.checked;
@@ -749,6 +806,9 @@ function resetView() {
   }
   if (box.isEmpty() && state.lidar.group.children.length) {
     box.expandByObject(state.lidar.group);
+  }
+  if (box.isEmpty() && state.roadnet && state.roadnet.group.visible) {
+    box.expandByObject(state.roadnet.group); // no terrain/lidar: frame the roads
   }
   if (box.isEmpty()) {
     camera.position.set(150, 120, 150);
@@ -880,4 +940,8 @@ function animate() {
 
 setStatus(el.manifestStatus, `manifest: loading ${DATA_DIR}manifest.json…`);
 loadManifest();
+loadRoads();
 animate();
+
+// debug hook (handy for screenshots / console poking; harmless in production)
+window.__viewer = { THREE, scene, camera, controls, state, resetView };

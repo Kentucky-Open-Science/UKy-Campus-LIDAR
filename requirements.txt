@@ -1,5 +1,7 @@
 numpy>=2.0,<3.0
 pillow>=10.0,<12.0
 playwright>=1.40,<2.0
+pyproj>=3.6,<4.0
+scikit-image>=0.22,<1.0
 scipy>=1.12,<2.0
 shapely>=2.0,<3.0

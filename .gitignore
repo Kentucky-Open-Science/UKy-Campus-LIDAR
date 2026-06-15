@@ -8,6 +8,9 @@ web/data/
 extracted/
 *.log
 
+# Node (web viewer dev server)
+node_modules/
+
 # Editor/OS cruft
 .vscode/
 Thumbs.db
