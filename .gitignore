@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 .venv/
 
+# Large UE source assets (raw LiDAR + DTM grid meshes/textures; multi-GB).
+# Kept locally; never committed — the viewer uses the processed web/data/ output.
+LIDAR/
+MESHES/
+
 # Generated/extracted artifacts (rebuild with tools/build_all.py)
 web/data/
 extracted/
