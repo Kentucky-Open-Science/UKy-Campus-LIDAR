@@ -31,11 +31,17 @@ CAMPUS/
 │   ├── extract_buildings.py  # LiDAR building-class → 3D mesh (legacy, DBSCAN)
 │   ├── extract_buildings_hybrid.py  # OSM footprints split LiDAR + give height
 │   ├── verify_buildings_osm.py      # verify footprints vs OSM ground truth
+│   ├── osm_roads.py          # OpenStreetMap → road network (roads.json)
+│   ├── extract_roads.py      # aerial-texture road detector (alt. road source)
+│   ├── fetch_lfucg_signals.py # download LFUCG real traffic-signal locations
+│   ├── smooth_roads.py       # smooth roads + signalise junctions → signals.json
+│   ├── ground_buildings.py   # drop floating buildings onto the terrain (keep bridges)
 │   ├── build_all.py          # Full pipeline orchestrator
 │   └── verify_viewer.py      # Headless viewer test (requires playwright)
 ├── web/                      # Three.js viewer (static)
 │   ├── index.html
 │   ├── app.js
+│   ├── roads.js              # road ribbons + signals/crosswalks + agent API
 │   ├── style.css
 │   ├── lib/                  # Vendored Three.js 0.160 + OrbitControls
 │   └── data/                 # Generated extraction output
@@ -43,7 +49,9 @@ CAMPUS/
 │       ├── meshes/*.bin      # 16 terrain tiles (verts, UVs, indices)
 │       ├── textures/*.jpg    # 18 aerial imagery textures
 │       ├── lidar/chunk_*.bin # 64 decimated point-cloud chunks
-│       └── buildings/*.bin   # ~890 extracted building meshes
+│       ├── buildings/*.bin   # ~890 extracted building meshes
+│       ├── roads.json        # smoothed road centrelines + real intersections
+│       └── signals.json      # machine-readable signal model (autonomous agents)
 └── extracted/                # Per-domain manifests + reports
 ```
 
@@ -80,4 +88,21 @@ wireframe mode, camera reset.
 - 3,109 building meshes (2,346 OSM-split + LiDAR-shaped, 763 LiDAR-only) from
   ~5.5M building-class LiDAR points + OpenStreetMap footprints (~3.9 MB total).
   Median footprint IoU vs OSM 0.93; verify with `python -m tools.verify_buildings_osm`
+- 449 road centrelines (~70 km), smoothed + draped on terrain; 266 real
+  intersections, **51 signalised** (gated against the **real LFUCG traffic-signal
+  layer**), 112 stop-controlled, 103 uncontrolled — each with traffic + pedestrian
+  signals, crosswalks, and stop bars (see `web/README.md`). Regenerate with
+  `python -m tools.smooth_roads`.
+- All 3,109 buildings dropped onto the terrain (no floaters; 4 road-spanning bridges
+  left elevated) — `python -m tools.ground_buildings`.
 - Viewport: ~1.8 km x 3.4 km area centered on UKy Lexington campus
+
+## Digital twin — controllable signals
+
+The road network is built for autonomous-agent simulation: `tools/smooth_roads.py`
+emits `web/data/signals.json`, a machine-readable model of every intersection
+(approach legs, stop-line coordinates, crosswalk polygons, signal phase groups, and
+a fixed-time phase plan). The viewer ticks a deterministic signal state machine and
+exposes it at `window.__twin.signals`, so an agent can ask "what is my light right
+now and where do I stop" (`getLegState` / `queryByPosition`) and even drive the
+lights (`setOverride`). Full API + schema in [web/README.md](web/README.md).

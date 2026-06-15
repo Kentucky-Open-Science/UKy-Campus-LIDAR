@@ -24,6 +24,7 @@ const CAR_COLORS = [
 const _pos = new THREE.Vector3(), _scl = new THREE.Vector3();
 const _quat = new THREE.Quaternion(), _euler = new THREE.Euler();
 const _white = new THREE.Color(1, 1, 1);
+const _tmpcol = new THREE.Color();   // scratch for live lamp recolouring
 
 function mat4(px, py, pz, yaw, sx, sy, sz) {
   _pos.set(px, py, pz);
@@ -49,6 +50,7 @@ class InstanceSet {
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     }
     mesh.computeBoundingSphere();
+    this.mesh = mesh;     // kept so the signal controller can recolour lamps in place
     return mesh;
   }
 }
@@ -80,18 +82,22 @@ export function createRoadNetwork(data, opts = {}) {
     treeSpacing: 16, treeChance: 0.55, treeOffset: 4,
     carSpacing: 13, carChance: 0.22,
     signalSpacing: 70, signalCap: 80,
+    signalModel: null,   // parsed signals.json -> real signalised intersections + agent API
     ...opts,
   };
   const roads = data.roads || [];
   const intersections = data.intersections || [];
+  const sig = o.signalModel && o.signalModel.intersections ? o.signalModel : null;
 
   const group = new THREE.Group(); group.name = 'roadnet';
   const layers = {
     roads: new THREE.Group(), markings: new THREE.Group(),
+    crosswalks: new THREE.Group(),
     trees: new THREE.Group(), cars: new THREE.Group(), signals: new THREE.Group(),
   };
   for (const k of Object.keys(layers)) layers[k].name = 'road-' + k;
-  group.add(layers.roads, layers.markings, layers.trees, layers.cars, layers.signals);
+  group.add(layers.roads, layers.markings, layers.crosswalks,
+            layers.trees, layers.cars, layers.signals);
 
   // ---- shared materials / geometries ----
   const mat = {
@@ -104,6 +110,8 @@ export function createRoadNetwork(data, opts = {}) {
     tyre: new THREE.MeshStandardMaterial({ color: 0x111316, roughness: 0.9 }),
     metal: new THREE.MeshStandardMaterial({ color: 0x33383d, roughness: 0.6, metalness: 0.7 }),
     light: new THREE.MeshBasicMaterial({ color: 0xffffff }),
+    paint: new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.6, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }),
+    signRed: new THREE.MeshStandardMaterial({ color: 0xc02626, roughness: 0.5, side: THREE.DoubleSide }),
   };
   const box = new THREE.BoxGeometry(1, 1, 1);
   const trunkGeo = new THREE.CylinderGeometry(0.16, 0.22, 1, 6);
@@ -164,11 +172,40 @@ export function createRoadNetwork(data, opts = {}) {
   }
 
   // ---------- intersection pads ----------
-  const pads = new InstanceSet(box, mat.asphalt);
-  for (const p of intersections) {
-    pads.add(mat4(p[0], p[1] + LIFT - 0.02, p[2], 0, 11, 0.1, 11));
+  // The crossing road ribbons already cover the junction, but acute / multi-leg
+  // junctions can leave small wedges. Fill each one with an ORIENTED convex polygon
+  // (the hull of where the approaches meet the box) rather than an axis-aligned
+  // square — a square spills its corners onto the grass and cuts across the
+  // crosswalks. Skipped without a signal model (no per-leg geometry to fit).
+  if (sig) {
+    const ppos = [], pidx = [];
+    for (const it of sig.intersections) {
+      const corners = [];
+      for (const leg of it.legs) {
+        const b = leg.bearingDeg * (Math.PI / 180);
+        const ox = Math.cos(b), oz = Math.sin(b), px = -Math.sin(b), pz = Math.cos(b);
+        const hw = (leg.width || 7) / 2, r = (it.footprintRadius || 9) + 0.5;
+        corners.push([it.center[0] + ox * r + px * hw, it.center[2] + oz * r + pz * hw]);
+        corners.push([it.center[0] + ox * r - px * hw, it.center[2] + oz * r - pz * hw]);
+      }
+      const hull = convexHull2D(corners);
+      if (hull.length < 3) continue;
+      const cy = it.center[1] + LIFT - 0.02;
+      let ccx = 0, ccz = 0; for (const p of hull) { ccx += p[0]; ccz += p[1]; }
+      ccx /= hull.length; ccz /= hull.length;
+      const base = ppos.length / 3;
+      ppos.push(ccx, cy, ccz);                       // centroid, then fan to the hull
+      for (const p of hull) ppos.push(p[0], cy, p[1]);
+      for (let i = 0; i < hull.length; i++) pidx.push(base, base + 1 + i, base + 1 + ((i + 1) % hull.length));
+    }
+    if (ppos.length) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ppos), 3));
+      geo.setIndex(pidx); geo.computeVertexNormals(); geo.computeBoundingSphere();
+      const mesh = new THREE.Mesh(geo, mat.asphalt); mesh.name = 'intersection-pads';
+      layers.roads.add(mesh);
+    }
   }
-  addTo(layers.roads, pads.build('intersection-pads'));
 
   // ---------- dashed lane markings ----------
   const dashes = new InstanceSet(box, mat.lane);
@@ -223,26 +260,33 @@ export function createRoadNetwork(data, opts = {}) {
   addTo(layers.cars, wheels.build('car-wheels'));
   }
 
-  // ---------- mast-arm traffic signals at major intersections ----------
-  if (o.signals) {
-  const chosen = [];
-  for (const p of intersections) {
-    if (chosen.length >= o.signalCap) break;
-    if (chosen.every((q) => (p[0] - q[0]) ** 2 + (p[2] - q[2]) ** 2 > o.signalSpacing ** 2)) chosen.push(p);
-  }
-  const poles = new InstanceSet(poleGeo, mat.metal);
-  const arms = new InstanceSet(box, mat.metal);
-  const heads = new InstanceSet(box, mat.metal);
-  const lamps = new InstanceSet(lampGeo, mat.light);
-  for (const p of chosen) { addSignal(poles, arms, heads, lamps, p, stats); }
-  addTo(layers.signals, poles.build('signal-poles'));
-  addTo(layers.signals, arms.build('signal-arms'));
-  addTo(layers.signals, heads.build('signal-heads'));
-  addTo(layers.signals, lamps.build('signal-lamps'));
+  // ---------- traffic signals / stop signs / crosswalks ----------
+  // With a signals.json model: real per-approach signalised intersections with
+  // oriented R/Y/G heads, pedestrian walk/don't-walk heads, crosswalks, stop bars,
+  // stop signs, and a live signal-state controller for autonomous agents. Without
+  // it: the legacy random-mast fallback so the viewer still works standalone.
+  let signalController = null;
+  if (sig) {
+    signalController = buildSignalSystem(sig);
+  } else if (o.signals) {
+    const chosen = [];
+    for (const p of intersections) {
+      if (chosen.length >= o.signalCap) break;
+      if (chosen.every((q) => (p[0] - q[0]) ** 2 + (p[2] - q[2]) ** 2 > o.signalSpacing ** 2)) chosen.push(p);
+    }
+    const poles = new InstanceSet(poleGeo, mat.metal);
+    const arms = new InstanceSet(box, mat.metal);
+    const heads = new InstanceSet(box, mat.metal);
+    const lamps = new InstanceSet(lampGeo, mat.light);
+    for (const p of chosen) { addSignal(poles, arms, heads, lamps, p, stats); }
+    addTo(layers.signals, poles.build('signal-poles'));
+    addTo(layers.signals, arms.build('signal-arms'));
+    addTo(layers.signals, heads.build('signal-heads'));
+    addTo(layers.signals, lamps.build('signal-lamps'));
   }
 
   stats.km = Math.round(stats.km * 10) / 10;
-  return { group, layers, stats };
+  return { group, layers, stats, signals: signalController };
 
   // ---------- per-object builders (closures over geometry sizes) ----------
   function addTree(trunks, balls, cones, c, stats) {
@@ -289,6 +333,250 @@ export function createRoadNetwork(data, opts = {}) {
     lamps.add(local(hx + 0.16, hy - 0.42, 0, 1, 1, 1), new THREE.Color(0x2ad24a));
     stats.signals++;
   }
+
+  // ------------------------------------------------------------------------
+  // Real signalised intersections from signals.json. Builds oriented per-approach
+  // fixtures (vehicle R/Y/G heads facing oncoming traffic, pedestrian walk/don't
+  // heads, crosswalk stripes, stop bars, stop signs) and returns a live controller
+  // that ticks a deterministic fixed-time phase plan and exposes a query/override
+  // API for autonomous agents (see web/README.md "signals.json").
+  function buildSignalSystem(model) {
+    const poles = new InstanceSet(poleGeo, mat.metal);
+    const arms = new InstanceSet(box, mat.metal);
+    const heads = new InstanceSet(box, mat.metal);
+    const vlamps = new InstanceSet(lampGeo, mat.light);     // vehicle R/Y/G bulbs
+    const pheads = new InstanceSet(box, mat.metal);
+    const plamps = new InstanceSet(box, mat.light);         // ped walk/don't bulbs
+    const signs = new InstanceSet(box, mat.signRed);
+    const signPoles = new InstanceSet(poleGeo, mat.metal);
+    const bars = new InstanceSet(box, mat.paint);           // stop bars (road paint)
+    const stripes = new InstanceSet(box, mat.paint);        // crosswalk stripes
+
+    const vehReg = [];   // { index, intId, group, aspect:'R'|'Y'|'G', on, off }
+    const pedReg = [];   // { index, intId, group, kind:'walk'|'dont', on, off }
+    const RED = 0xff2a22, YEL = 0xffb01f, GRN = 0x2ad24a;
+    const RED_D = 0x401010, YEL_D = 0x402c08, GRN_D = 0x0e3a1c;
+    const WALK = 0xeafff0, WALK_D = 0x16361f, DONT = 0xff8a2a, DONT_D = 0x3a1e08;
+    const D2R = Math.PI / 180;
+    let nSignals = 0;
+
+    for (const it of model.intersections) {
+      const cx = it.center[0], cz = it.center[2];
+      const footR = it.footprintRadius || 9;
+      if (it.control === 'signal') nSignals++;
+      for (const leg of it.legs) {
+        const b = leg.bearingDeg * D2R;
+        const ox = Math.cos(b), oz = Math.sin(b);   // outward (away from centre)
+        const px = -Math.sin(b), pz = Math.cos(b);  // left-perpendicular
+        const hw = (leg.width || 7) / 2;
+        const sy = leg.stopPoint ? leg.stopPoint[1] : it.center[1];
+        // stop bar across the approach (signal + stop legs)
+        if (leg.stopLine && (it.control === 'signal' || it.control === 'stop')) {
+          const a = leg.stopLine[0], c = leg.stopLine[1];
+          const dx = c[0] - a[0], dz = c[1] - a[1], len = Math.hypot(dx, dz) || 1;
+          bars.add(mat4((a[0] + c[0]) / 2, sy + MARK_LIFT, (a[1] + c[1]) / 2,
+                        yawFor(dx / len, dz / len), len, 0.02, 0.5));
+        }
+        if (it.control === 'signal' && leg.signalGroup) {
+          // --- vehicle mast-arm head, oriented to face oncoming traffic ---
+          const poleH = 6.0;
+          const poleX = cx + ox * (footR + 3.5) + px * (hw + 1.2);
+          const poleZ = cz + oz * (footR + 3.5) + pz * (hw + 1.2);
+          poles.add(mat4(poleX, sy + poleH / 2, poleZ, 0, 1, poleH, 1));
+          const armLen = hw + 1.4, ax = -px, az = -pz;   // arm reaches over the lane
+          arms.add(mat4(poleX + ax * armLen / 2, sy + poleH - 0.3, poleZ + az * armLen / 2,
+                        yawFor(ax, az), armLen, 0.16, 0.16));
+          const hX = poleX + ax * armLen, hZ = poleZ + az * armLen, hY = sy + poleH - 0.95;
+          heads.add(mat4(hX, hY, hZ, yawFor(ox, oz), 0.45, 1.35, 0.45));
+          const lX = hX + ox * 0.28, lZ = hZ + oz * 0.28;   // bulbs face the driver (+out)
+          for (const [aspect, on, off, dy] of [['R', RED, RED_D, 0.42], ['Y', YEL, YEL_D, 0], ['G', GRN, GRN_D, -0.42]]) {
+            vehReg.push({ index: vlamps.m.length, intId: it.id, group: leg.signalGroup, aspect, on, off });
+            vlamps.add(mat4(lX, hY + dy, lZ, 0, 1, 1, 1), new THREE.Color(off));
+          }
+          // --- pedestrian walk/don't head on the same pole, FACING ACROSS the crosswalk ---
+          // Only where this leg actually has a crosswalk (big junctions mark only the
+          // principal approaches). The head display face + bulbs point along -perp (toward
+          // the crossing pedestrian); bulbs are pushed proud of the housing along that
+          // normal and share its yaw, or they would be buried/edge-on.
+          if (leg.pedSignal === false) continue;
+          const pedY = sy + 2.7, pedYaw = yawFor(-px, -pz);
+          const fX = poleX - px * 0.13, fZ = poleZ - pz * 0.13;   // proud of the 0.18-thin face
+          pheads.add(mat4(poleX, pedY, poleZ, pedYaw, 0.18, 0.55, 0.5));
+          pedReg.push({ index: plamps.m.length, intId: it.id, group: leg.signalGroup, kind: 'dont', on: DONT, off: DONT_D });
+          plamps.add(mat4(fX, pedY + 0.13, fZ, pedYaw, 0.06, 0.2, 0.2), new THREE.Color(DONT_D));
+          pedReg.push({ index: plamps.m.length, intId: it.id, group: leg.signalGroup, kind: 'walk', on: WALK, off: WALK_D });
+          plamps.add(mat4(fX, pedY - 0.13, fZ, pedYaw, 0.06, 0.2, 0.2), new THREE.Color(WALK_D));
+        } else if (leg.stopSign) {
+          // --- stop sign on a short pole, octagon plate facing the driver ---
+          const sX = cx + ox * (footR + 3.8) + px * (hw + 0.8);
+          const sZ = cz + oz * (footR + 3.8) + pz * (hw + 0.8), poleH = 2.4;
+          signPoles.add(mat4(sX, sy + poleH / 2, sZ, 0, 1, poleH, 1));
+          signs.add(mat4(sX, sy + poleH + 0.05, sZ, yawFor(ox, oz), 0.07, 0.66, 0.66));
+        }
+      }
+      // crosswalk stripes (continental bars, parallel to travel, across the road)
+      for (const xw of it.crosswalks || []) {
+        const leg = it.legs[xw.legIdx];
+        if (!leg || !xw.polygon) continue;
+        let mx = 0, mz = 0;
+        for (const q of xw.polygon) { mx += q[0]; mz += q[1]; }
+        mx /= xw.polygon.length; mz /= xw.polygon.length;
+        const b = leg.bearingDeg * D2R, ox = Math.cos(b), oz = Math.sin(b);
+        const px = -Math.sin(b), pz = Math.cos(b), hw = (leg.width || 7) / 2;
+        // crosswalk y is draped at the crosswalk's own ground (falls back to stop point)
+        const sy = (xw.y != null) ? xw.y : (leg.stopPoint ? leg.stopPoint[1] : it.center[1]);
+        const n = Math.max(4, Math.min(12, Math.floor((2 * hw) / 0.9)));
+        for (let k = 0; k < n; k++) {
+          const off = -hw + 0.5 + k * (2 * hw - 1.0) / (n - 1);
+          stripes.add(mat4(mx + px * off, sy + MARK_LIFT + 0.01, mz + pz * off,
+                           yawFor(ox, oz), 2.0, 0.02, 0.45));
+        }
+      }
+    }
+    addTo(layers.signals, poles.build('signal-poles'));
+    addTo(layers.signals, arms.build('signal-arms'));
+    addTo(layers.signals, heads.build('signal-heads'));
+    addTo(layers.signals, vlamps.build('signal-veh-lamps'));
+    addTo(layers.signals, pheads.build('ped-heads'));
+    addTo(layers.signals, plamps.build('ped-lamps'));
+    addTo(layers.signals, signs.build('stop-signs'));
+    addTo(layers.signals, signPoles.build('stop-sign-poles'));
+    addTo(layers.markings, bars.build('stop-bars'));
+    addTo(layers.crosswalks, stripes.build('crosswalk-stripes'));
+    stats.signals = nSignals;
+
+    // ---- live signal-state controller (deterministic fixed-time phase plan) ----
+    function statesAt(plan, t) {
+      const cyc = plan.cycleSec, local = ((t + plan.offsetSec) % cyc + cyc) % cyc;
+      let acc = 0;
+      for (let i = 0; i < plan.phases.length; i++) {
+        const ph = plan.phases[i];
+        if (local < acc + ph.durSec) return { idx: i, phase: ph, left: acc + ph.durSec - local };
+        acc += ph.durSec;
+      }
+      const last = plan.phases.length - 1;
+      return { idx: last, phase: plan.phases[last], left: 0 };
+    }
+    function secToChange(plan, t, group) {
+      const s = statesAt(plan, t), cur = s.phase.groupStates[group];
+      let rem = s.left;
+      for (let n = 1; n <= plan.phases.length; n++) {
+        const ph = plan.phases[(s.idx + n) % plan.phases.length];
+        if (ph.groupStates[group] !== cur) return Math.round(rem * 10) / 10;
+        rem += ph.durSec;
+      }
+      return Math.round(rem * 10) / 10;
+    }
+
+    const byId = new Map(), legList = [];
+    for (const it of model.intersections) {
+      byId.set(it.id, it);
+      for (const leg of it.legs) {
+        legList.push({ intId: it.id, legIdx: leg.idx, stopPoint: leg.stopPoint,
+                       group: leg.signalGroup, control: it.control });
+      }
+    }
+
+    const ctl = {
+      model, byId, legs: legList, t: 0, overrides: new Map(),
+      now() { return this.t; },
+      setClock(t) { this.t = t; this._apply(); },
+      tick(dt) { this.t += (dt || 0); this._apply(); },
+      update(dt) { this.tick(dt); },
+      _apply() {
+        const t = this.t, dirty = new Set();
+        for (const it of model.intersections) {
+          if (it.control !== 'signal' || !it.phasePlan) continue;
+          const ov = this.overrides.get(it.id);
+          if (ov) it._state = { groupStates: ov.groupStates, pedStates: ov.pedStates || { A: 'dont', B: 'dont' } };
+          else { const s = statesAt(it.phasePlan, t); it._state = { groupStates: s.phase.groupStates, pedStates: s.phase.pedStates || {} }; }
+        }
+        if (vlamps.mesh) {
+          for (const r of vehReg) {
+            const st = byId.get(r.intId)._state; if (!st) continue;
+            const g = st.groupStates[r.group];
+            const onAsp = g === 'green' ? 'G' : g === 'yellow' ? 'Y' : 'R';
+            vlamps.mesh.setColorAt(r.index, _tmpcol.setHex(r.aspect === onAsp ? r.on : r.off));
+          }
+          dirty.add(vlamps.mesh);
+        }
+        if (plamps.mesh) {
+          for (const r of pedReg) {
+            const st = byId.get(r.intId)._state; if (!st) continue;
+            const p = st.pedStates[r.group] || 'dont';
+            let lit = r.kind === 'walk' ? (p === 'walk') : (p !== 'walk');
+            if (r.kind === 'dont' && p === 'flash') lit = (Math.floor(t * 1.4) % 2 === 0);
+            plamps.mesh.setColorAt(r.index, _tmpcol.setHex(lit ? r.on : r.off));
+          }
+          dirty.add(plamps.mesh);
+        }
+        for (const m of dirty) if (m.instanceColor) m.instanceColor.needsUpdate = true;
+      },
+      // ---- agent-facing query / control API ----
+      getLegState(intId, legIdx) {
+        const it = byId.get(intId); if (!it) return null;
+        const leg = it.legs[legIdx]; if (!leg) return null;
+        let signal = null, ped = null, sec = null;
+        if (it.control === 'signal' && it.phasePlan) {
+          const st = it._state || {};
+          signal = (st.groupStates || {})[leg.signalGroup] || null;
+          ped = (st.pedStates || {})[leg.signalGroup] || null;
+          sec = secToChange(it.phasePlan, this.t, leg.signalGroup);
+        }
+        // canProceed: signals gate on green; uncontrolled approaches may proceed (yield);
+        // a stop sign requires a halt first, so it is not a free "go" (agent uses `control`
+        // + stopPoint to stop-then-proceed when clear — the controller can't see traffic).
+        return { intersection: intId, leg: legIdx, control: it.control, signal, ped,
+                 stopPoint: leg.stopPoint, stopLine: leg.stopLine, secToChange: sec,
+                 canProceed: it.control === 'signal' ? signal === 'green'
+                           : it.control === 'uncontrolled' };
+      },
+      queryByPosition(pos, maxR) {
+        const r2 = (maxR || 60) ** 2; let best = null, bd = r2;
+        for (const l of this.legs) {
+          if (!l.stopPoint) continue;
+          const dx = l.stopPoint[0] - pos[0], dz = l.stopPoint[2] - pos[1];
+          const d = dx * dx + dz * dz;
+          if (d < bd) { bd = d; best = l; }
+        }
+        return best ? this.getLegState(best.intId, best.legIdx) : null;
+      },
+      setOverride(intId, groupStates, pedStates) {
+        if (groupStates && Object.values(groupStates).filter((s) => s === 'green').length > 1)
+          throw new Error('refusing >1 conflicting green at ' + intId);
+        this.overrides.set(intId, { groupStates, pedStates }); this._apply();
+      },
+      clearOverride(intId) { this.overrides.delete(intId); this._apply(); },
+      snapshot() {
+        const out = { t: this.t, intersections: {} };
+        for (const it of model.intersections) {
+          out.intersections[it.id] = {
+            control: it.control, center: it.center,
+            state: it.control === 'signal' ? it._state || null : null,
+            legs: it.legs.map((l) => ({ idx: l.idx, group: l.signalGroup,
+              signal: it._state ? (it._state.groupStates || {})[l.signalGroup] : null,
+              stopPoint: l.stopPoint })),
+          };
+        }
+        return out;
+      },
+    };
+    ctl._apply();
+    return ctl;
+  }
 }
 
 function addTo(parent, mesh) { if (mesh) parent.add(mesh); }
+
+// Andrew's monotone-chain convex hull of [x,z] points (CCW, no collinear points).
+function convexHull2D(pts) {
+  const P = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (P.length < 3) return P;
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [];
+  for (const p of P) { while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  const up = [];
+  for (let i = P.length - 1; i >= 0; i--) { const p = P[i]; while (up.length >= 2 && cross(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  lo.pop(); up.pop();
+  return lo.concat(up);
+}

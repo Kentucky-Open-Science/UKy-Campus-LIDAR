@@ -199,6 +199,8 @@ function normalizeManifest(m) {
       pointCount: b.point_count || b.pointCount || 0,
       vertexCount: b.vertex_count || b.vertexCount || 0,
       indexCount: b.index_count || b.indexCount || 0,
+      groundYm: b.ground_y_m != null ? b.ground_y_m : (b.groundYm != null ? b.groundYm : null),
+      bridge: !!b.bridge,
     }));
   }
 
@@ -641,6 +643,11 @@ async function loadBuilding(bld, minH, maxH) {
   const material = makeBuildingMaterial(bld, minH, maxH);
   const mesh = new THREE.Mesh(geometry, material);
   mesh.name = bld.name;
+  // Drop the building so its base sits on the terrain (ground_y_m baked by
+  // tools/ground_buildings.py), unless it is a bridge crossing over a road.
+  if (bld.groundYm != null && !bld.bridge && geometry.boundingBox) {
+    mesh.position.y = bld.groundYm - geometry.boundingBox.min.y;
+  }
   mesh.userData = { buildingName: bld.name, heightCm: bld.heightCm };
   state.buildings.group.add(mesh);
   bld.object = mesh;
@@ -708,8 +715,21 @@ async function loadRoads() {
       `run tools/extract_roads.py`, 'error');
     return;
   }
-  state.roadnet = createRoadNetwork(data, { trees: false, cars: false });
+  // Optional machine-readable signal model (real signalised intersections + the
+  // agent API). Missing -> the viewer degrades to the legacy random-mast fallback.
+  let signalModel = null;
+  try {
+    const sresp = await fetch(DATA_DIR + 'signals.json', { cache: 'no-cache' });
+    if (sresp.ok) signalModel = await sresp.json();
+  } catch (e) { /* no signals.json: legacy fallback */ }
+
+  state.roadnet = createRoadNetwork(data, { trees: false, cars: false, signalModel });
   scene.add(state.roadnet.group);
+  if (state.roadnet.signals) {
+    // expose the live signal controller so an autonomous agent can query "what is my
+    // light right now / where do I stop" and even drive the lights deterministically.
+    window.__twin = { signals: state.roadnet.signals, model: signalModel };
+  }
   onRealData();
   // if roads arrive before/without any terrain or lidar, frame them
   if (!state.terrain.tiles.some((t) => t.status === 'loaded') &&
@@ -721,9 +741,17 @@ function updateRoadStatus() {
   const node = $('road-status');
   if (!node || !state.roadnet) return;
   const s = state.roadnet.stats;
+  const model = window.__twin && window.__twin.model;
+  let line2;
+  if (model) {
+    const c = { signal: 0, stop: 0, uncontrolled: 0 };
+    for (const it of model.intersections) c[it.control] = (c[it.control] || 0) + 1;
+    line2 = `${c.signal} signalised, ${c.stop} stop-controlled, ${c.uncontrolled} uncontrolled`;
+  } else {
+    line2 = `${s.trees} trees, ${s.cars} cars, ${s.signals} signals`;
+  }
   setStatus(node,
-    `roads: ${s.roads} (${s.km} km), ${s.intersections} intersections\n` +
-    `${s.trees} trees, ${s.cars} cars, ${s.signals} signals`, 'ok');
+    `roads: ${s.roads} (${s.km} km), ${s.intersections} intersections\n${line2}`, 'ok');
 }
 
 // ------------------------------------------------------------------- UI ---
@@ -764,7 +792,7 @@ $('camera-reset').addEventListener('click', () => resetView());
 $('road-visible').addEventListener('change', (e) => {
   if (state.roadnet) state.roadnet.group.visible = e.target.checked;
 });
-for (const key of ['roads', 'markings', 'trees', 'cars', 'signals']) {
+for (const key of ['roads', 'markings', 'crosswalks', 'trees', 'cars', 'signals']) {
   const cb = $('road-' + key);
   if (cb) cb.addEventListener('change', (e) => {
     if (state.roadnet) state.roadnet.layers[key].visible = e.target.checked;
@@ -924,6 +952,7 @@ function animate() {
   applyFly(dt);
   controls.update();
   updateCursorReadout();
+  if (state.roadnet && state.roadnet.signals) state.roadnet.signals.tick(dt);
   renderer.render(scene, camera);
 
   frames++;

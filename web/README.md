@@ -71,12 +71,20 @@ DoubleSide as belt-and-braces.
         "footprint_area_m2": 425.3,
         "point_count": 3450,
         "vertex_count": 128,
-        "index_count": 384
+        "index_count": 384,
+        "ground_y_m": 285.4,           // scene-metre foundation level (tools/ground_buildings.py);
+        "bridge": false                //   viewer drops the base here unless bridge==true
       }
     ]
   }
 }
 ```
+
+Building meshes are LiDAR-derived and often float above (or sink below) the DTM
+terrain. `tools/ground_buildings.py` samples the terrain under each footprint and
+bakes `ground_y_m`; `loadBuilding()` then offsets each building so its base sits on
+the ground — except buildings flagged `bridge` (a road passes under them), which keep
+their modelled elevation.
 
 If `origin_cm` is missing the viewer falls back to `lidar.offset_cm`, then the
 first tile's `translation_cm`, then `[0,0,0]`.
@@ -129,16 +137,20 @@ no data at all (shows a placeholder grid).
 
 `roads.js` adds a real road network the scan data doesn't contain, plus props
 anchored to it: raised asphalt **ribbons** that follow the actual streets and
-terrain (mitre-jointed, draped on elevation), dashed **lane markings**,
-**intersection** pads, and (optionally) re-anchored street **trees**, parked
-**cars**, and mast-arm **traffic signals**. Props are heavily instanced
-(`InstancedMesh`). `createRoadNetwork(data, opts)` returns `{ group, layers,
-stats }` with toggleable `layers` (`roads / markings / trees / cars / signals`);
-`opts.trees/cars/signals` gate generation (the app currently builds streets-only:
-`{ trees:false, cars:false }`).
+terrain (mitre-jointed, draped on elevation), dashed **lane markings** + **stop
+bars**, **intersection** pads, **crosswalks**, **traffic + pedestrian signals**,
+**stop signs**, and (optionally) re-anchored street **trees** and parked **cars**.
+Props are heavily instanced (`InstancedMesh`). `createRoadNetwork(data, opts)`
+returns `{ group, layers, stats, signals }` with toggleable `layers`
+(`roads / markings / crosswalks / trees / cars / signals`); `opts.trees/cars` gate
+prop generation (the app builds streets-only: `{ trees:false, cars:false }`), and
+`opts.signalModel` (the parsed `data/signals.json`) enables real per-approach
+signalised intersections + the live controller returned as `network.signals`
+(see **Autonomous-agent signal API** below). Without a `signalModel` the viewer
+falls back to legacy random mast-arm signals so it still works standalone.
 
-The geometry is data-driven from `data/roads.json`. Two tools can produce it
-(run from the repo root); both write the same contract:
+The geometry is data-driven from `data/roads.json`. Two tools can produce the raw
+network (run from the repo root); both write the same contract:
 
 **Primary — OpenStreetMap** (clean, complete, named streets):
 
@@ -171,19 +183,114 @@ by colour, masks building rooftops + wide parking blobs, skeletonises, vectorise
 and bakes elevation. It is a heuristic detector — expect gaps (tree-occluded
 streets) and a few spurs; tune the constants at the top of the tool.
 
+**Smoothing + signalisation post-process (run after either tool):**
+
+```sh
+python -m tools.smooth_roads          # rewrites roads.json + writes signals.json
+```
+
+`smooth_roads.py` is an offline, network-free post-processor that fixes jagged
+edges and builds the machine-readable signal model the digital twin needs:
+
+- **No jagged edges.** Each centreline is corner-cut with 3 iterations of Chaikin
+  (convex-hull-bounded, so a road never bows off the asphalt), resampled to a
+  uniform 4 m, re-draped on a finer Gaussian-smoothed terrain heightmap, and its
+  elevation profile low-passed (1-D Gaussian) + clamped to the ground. Shared
+  junction endpoints are welded (identical `x,y,z` on every leg) so smoothing
+  never tears a join. (Vertical roughness median `|d²y|` drops ≈7×, 0.07→0.01 m.)
+- **Real intersections.** The 452 raw OSM nodes collapse to ~266 real junctions.
+  Each junction's **degree** is the count of distinct approach legs found by
+  bearing-clustering, with same-named legs fused at a wider angle so a **divided
+  carriageway** (two ways down one street) reads as one approach, not several — this
+  is what stops crosswalks forming hexagonal rings. Junctions are classified
+  `signal` / `stop` / `uncontrolled`; signalisation is **gated against the real
+  LFUCG traffic-signal layer** (`tools/fetch_lfucg_signals.py` →
+  `tools/lfucg_traffic_signals.geojson`, projected UTM-16N→scene), so only genuine
+  signalised intersections get lights. At big (5+ leg) junctions crosswalks +
+  pedestrian heads are kept on the 4 principal approaches only. The original
+  `roads.json` is backed up to `roads.raw.json` on first run.
+
+Run order: `osm_roads` (or `extract_roads`) → `smooth_roads` → `ground_buildings`.
+
 Two lights (hemisphere + directional sun) were added so the `MeshStandard`
 materials used by buildings and the road props actually shade. This also fixed
 buildings rendering black — `loadBuilding()` now computes vertex normals. Terrain
 stays unaffected (it's unlit `MeshBasic`).
 
-`data/roads.json` contract:
+`data/roads.json` contract (smoothed; `intersections` are now the real centres):
 
 ```jsonc
 {
-  "roads": [ { "pts": [[x, y, z], ...], "width": 7.8 } ],  // scene metres, y draped
-  "intersections": [ [x, y, z], ... ]
+  "roads": [ { "pts": [[x, y, z], ...], "width": 7.8, "class": "primary", "name": "S Limestone" } ],
+  "intersections": [ [x, y, z], ... ]   // real junction centres (scene metres, y draped)
 }
 ```
 
+### `data/signals.json` — machine-readable signal model (for autonomous agents)
+
+```jsonc
+{
+  "version": 1, "tickHz": 10,
+  "intersections": [{
+    "id": "int_0006",
+    "center": [x, y, z],
+    "degree": 4,
+    "control": "signal",              // "signal" | "stop" | "uncontrolled"
+    "controllingClass": "primary",
+    "footprintRadius": 8.5,
+    "legs": [{
+      "idx": 0, "bearingDeg": -43.1,
+      "roadIndex": 177, "roadName": "South Limestone", "class": "primary", "width": 13.0,
+      "stopLine": [[x, z], [x, z]],    // the two ends of the white stop bar (XZ)
+      "stopPoint": [x, y, z],          // where a vehicle on this leg halts (agent target; y draped locally)
+      "signalGroup": "A",              // movement-group id "A".."H" (null if unsignalised)
+      "stopSign": false,
+      "pedSignal": true,               // whether this leg has a pedestrian head + crosswalk
+      "vehSignalKey": "int_0006:0", "pedSignalKey": "int_0006:p0"
+    }],
+    "crosswalks": [{ "legIdx": 0, "polygon": [[x,z],[x,z],[x,z],[x,z]], "y": 290.3, "pedGroup": "A" }],
+    "phasePlan": {                     // only for control == "signal"
+      "cycleSec": 102, "offsetSec": 36, "groups": ["A", "B"],
+      "phases": [{ "groupStates": {"A":"green","B":"red"}, "pedStates": {"A":"dont","B":"walk"},  "durSec": 23 },
+                 { "groupStates": {"A":"green","B":"red"}, "pedStates": {"A":"dont","B":"flash"}, "durSec":  5 },  // in-green ped clearance
+                 { "groupStates": {"A":"yellow","B":"red"},"pedStates": {"A":"dont","B":"dont"},  "durSec":  4 },
+                 { "groupStates": {"A":"red","B":"red"},   "pedStates": {"A":"dont","B":"dont"},  "durSec":  2 }, ... ]
+    }
+  }]
+}
+```
+
+The phase plan is traffic-engineering-correct: each movement group (opposing legs
+paired so a group's own legs never conflict) gets its own green, so **only one group
+is ever green** — conflicting greens are impossible by construction. Each green ends
+with an in-green flashing-don't-walk clearance sized to the crossed leg's width, then
+yellow + an all-red clearance. A crosswalk shows `walk`/`flash` only while its own
+group is red (i.e. while the road it crosses is stopped). `pedGroup` equals the leg's
+own `signalGroup`. Each intersection gets a deterministic `offsetSec` so the campus
+isn't synchronised.
+
+### Autonomous-agent signal API
+
+When `signals.json` is present the viewer ticks a deterministic state machine each
+frame and exposes the controller at **`window.__twin.signals`** so an external
+agent (or test harness) can read and drive the lights:
+
+```js
+const sig = window.__twin.signals;
+sig.now();                              // current sim seconds
+sig.setClock(t); sig.tick(dt);          // drive time (deterministic, seekable)
+sig.getLegState("int_0006", 0);         // -> { control, signal:"green|yellow|red",
+                                        //      ped:"walk|dont|flash", stopPoint,
+                                        //      secToChange, canProceed }
+sig.queryByPosition([x, z], 60);        // nearest approach to a world point + its state
+sig.setOverride("int_0006", {A:"green", B:"red"});  // drive a junction (rejects conflicting greens)
+sig.clearOverride("int_0006");
+sig.snapshot();                         // full live state of every intersection
+```
+
+The lit bulb always equals `snapshot()` state, so the rendered scene and the
+queryable model never disagree.
+
 UI (Roads & props fieldset): master visibility + per-category toggles (road
-surface / lane markings / trees / cars / traffic signals).
+surface / lane markings & stop bars / crosswalks / trees / cars / traffic &
+pedestrian signals).
