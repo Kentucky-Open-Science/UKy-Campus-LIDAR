@@ -10,6 +10,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from './lib/OrbitControls.js';
 import { createRoadNetwork } from './roads.js';
+import { createAgentSystem } from './agents.js';
 
 // ---------------------------------------------------------------- config ---
 
@@ -28,6 +29,7 @@ const state = {
   },
   buildings: { tiles: [], group: null, loaded: 0, failed: 0 },
   roadnet: null,       // real road network + props from roads.json (roads.js)
+  agents: null,        // autonomous-agent simulation layer (agents.js)
   helpers: null,
   hasRealData: false,
 };
@@ -725,11 +727,38 @@ async function loadRoads() {
 
   state.roadnet = createRoadNetwork(data, { trees: false, cars: false, signalModel });
   scene.add(state.roadnet.group);
-  if (state.roadnet.signals) {
-    // expose the live signal controller so an autonomous agent can query "what is my
-    // light right now / where do I stop" and even drive the lights deterministically.
-    window.__twin = { signals: state.roadnet.signals, model: signalModel };
-  }
+
+  // Autonomous-agent simulation layer (cars/trucks/robots/drones with camera,
+  // position, collision-detection, and ground/surface sensors). Created
+  // unconditionally — it works with or without signals.json. Terrain/buildings
+  // may still be streaming; the ground raycast degrades to surface:'none' until
+  // they arrive, then re-snaps automatically (see agents.js).
+  state.agents = createAgentSystem({
+    THREE, scene, renderer,
+    viewerCamera: camera, controls,
+    groups: {
+      terrain: state.terrain.group,
+      buildings: state.buildings.group,
+      roadRibbons: () => state.roadnet && state.roadnet.layers.roads,
+    },
+    coords: {
+      ueCmToScene, sceneToUeCm, ueRotationMatrix,
+      originCm: () => state.originCm,
+      originalCoordinates: () => state.lidar.originalCoordinates,
+    },
+    signals: () => state.roadnet && state.roadnet.signals,
+  });
+  scene.add(state.agents.group);
+
+  // Expose the live controllers for external/console autonomy. MERGE (never
+  // clobber): the old code only set window.__twin inside `if (signals)`, which
+  // dropped the whole twin (and now the agents API) when signals.json is absent.
+  window.__twin = Object.assign(window.__twin || {}, {
+    signals: state.roadnet.signals || null,
+    model: signalModel,
+    agents: state.agents,
+  });
+
   onRealData();
   // if roads arrive before/without any terrain or lidar, frame them
   if (!state.terrain.tiles.some((t) => t.status === 'loaded') &&
@@ -827,6 +856,53 @@ $('buildings-color-mode').addEventListener('change', () => {
   }
 });
 
+// ----------------------------------------------------------------- agents ---
+// Spawn/clear buttons + camera PiP. The live per-agent readout (#agent-list /
+// #agent-surface) is refreshed from inside agents.tick (throttled), so app.js
+// only wires the controls and an initial refresh. All handlers null-guard on
+// state.agents (created after roads.json loads).
+function refreshAgentUI() {
+  if (!state.agents) return;
+  const list = state.agents.list();
+  $('agent-list').textContent = list.length
+    ? list.map((a) => `${a.id} ${a.name} ${a.type} ${a.getState().speed.toFixed(1)}m/s ${a.surface || '--'}`).join('\n')
+    : 'agents: none';
+  const sel = $('agent-pip-select');
+  const prev = sel.value;
+  sel.innerHTML = list.map((a) => `<option value="${a.id}">${a.name}</option>`).join('');
+  if (list.some((a) => String(a.id) === prev)) sel.value = prev;
+}
+$('agent-spawn').addEventListener('click', () => {
+  if (!state.agents) { $('agent-list').textContent = 'agents: roads not loaded yet'; return; }
+  const t = controls.target;
+  let agent;
+  try {
+    agent = state.agents.spawn({ type: $('agent-type').value, position: [t.x, null, t.z], heading: 0, showHeading: true });
+  } catch (e) { $('agent-list').textContent = 'spawn failed: ' + e.message; return; }
+  refreshAgentUI();
+  // Spawning takes you to the wheel: third-person chase cam + WASD on the new agent.
+  $('agent-pip-select').value = String(agent.id);  // PiP (if on) follows the driven agent
+  applyPiP();
+  enterDrive(agent);
+});
+$('agent-clear').addEventListener('click', () => {
+  exitDrive();
+  if (state.agents) state.agents.clear();
+  state.agents && state.agents.setPiP(null);
+  $('agent-pip').checked = false;
+  $('agent-pip-canvas').classList.add('hidden');
+  refreshAgentUI();
+});
+function applyPiP() {
+  if (!state.agents) return;
+  const on = $('agent-pip').checked;
+  const a = on ? state.agents.get(Number($('agent-pip-select').value)) : null;
+  state.agents.setPiP(a || null);
+  $('agent-pip-canvas').classList.toggle('hidden', !(on && a));
+}
+$('agent-pip').addEventListener('change', applyPiP);
+$('agent-pip-select').addEventListener('change', applyPiP);
+
 function resetView() {
   const box = new THREE.Box3();
   if (state.terrain.group.children.length && state.terrain.group.visible) {
@@ -859,6 +935,7 @@ function resetView() {
 const keys = new Set();
 window.addEventListener('keydown', (e) => {
   if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  if (e.code === 'Escape' && drive.agent) { exitDrive(); return; } // release the driven agent
   keys.add(e.code);
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
@@ -891,6 +968,106 @@ function applyFly(dt) {
   camera.position.add(_move);
   controls.target.add(_move); // fly = move the orbit target with the camera
 }
+
+// --------------------------------------------- third-person agent driving ---
+// Spawning an agent enters "drive mode": the main camera becomes a chase cam that
+// follows the agent, and WASD/QE drive the AGENT instead of flying the camera.
+// (OrbitControls is disabled while chasing — we set the camera manually — and the
+// mouse wheel adjusts the chase distance. Esc, Clear, or despawn releases it.)
+const drive = { agent: null, distance: 12 };
+const _chasePos = new THREE.Vector3(), _chaseTgt = new THREE.Vector3();
+
+function enterDrive(agent) {
+  if (!agent || !agent.alive) return;
+  if (drive.agent && drive.agent !== agent && drive.agent.alive && drive.agent.stop) {
+    drive.agent.stop(); // don't leave the previously-driven agent rolling on its last input
+  }
+  drive.agent = agent;
+  const L = agent.halfExtents ? agent.halfExtents[0] * 2 : 4; // footprint length
+  drive.distance = Math.max(6, L * 2.4 + 4);
+  controls.enabled = false;          // chase cam drives the camera; no orbit/pan while driving
+  keys.clear();
+  if (agent.stop) agent.stop();      // start from rest
+  updateChaseCamera(0, true);        // snap behind the agent immediately
+  updateDriveHint();
+}
+
+function exitDrive() {
+  const a = drive.agent;
+  drive.agent = null;
+  if (a && a.alive && a.stop) a.stop();   // don't keep rolling once released
+  controls.enabled = true;
+  if (a && a.alive) controls.target.copy(a.object.position); // resume orbit around it
+  controls.update();
+  updateDriveHint();
+}
+
+function updateDriveHint() {
+  const node = $('drive-hint');
+  if (!node) return;
+  const a = drive.agent;
+  if (a && a.alive) {
+    node.innerHTML = `Driving <b>${a.name}</b> &middot; ` +
+      (a.type === 'drone'
+        ? 'W throttle &middot; A/D turn &middot; E/Q up/down'
+        : 'W throttle &middot; S brake/reverse &middot; A/D steer') +
+      ' &middot; <b>Esc</b> release';
+    node.classList.remove('hidden');
+  } else {
+    node.classList.add('hidden');
+  }
+}
+
+// held keys -> agent controls (called each frame before agents.tick)
+function applyAgentDrive() {
+  const a = drive.agent;
+  if (!a || !a.alive) return;
+  const w = keys.has('KeyW'), s = keys.has('KeyS'),
+        left = keys.has('KeyA'), right = keys.has('KeyD'),
+        up = keys.has('KeyE'), down = keys.has('KeyQ');
+  if (a.type === 'drone') {
+    const yawDegMax = a.maxYawRateRad ? a.maxYawRateRad * 180 / Math.PI : 120;
+    a.setControls({
+      thrust: w ? 1 : 0,
+      climb: (up ? 1 : 0) - (down ? 1 : 0),
+      yawRate: ((left ? 1 : 0) - (right ? 1 : 0)) * yawDegMax, // A=left (+yaw)
+    });
+  } else {
+    const steer = (left ? 1 : 0) - (right ? 1 : 0);    // A=left (+yaw), D=right
+    let throttle = 0, brake = 0, reverse = false;
+    if (w) throttle = 1;
+    else if (s) {
+      if (a.speed > 0.5) brake = 1;          // rolling forward -> brake first
+      else { reverse = true; throttle = 1; } // stopped/slow -> back up
+    }
+    a.setControls({ throttle, brake, steer, reverse });
+  }
+}
+
+// chase camera: sit behind + above the agent along its heading and look at it
+function updateChaseCamera(dt, snap) {
+  const a = drive.agent;
+  if (!a || !a.alive) return;
+  const p = a.object.position, yaw = a.yaw;
+  const fx = Math.cos(yaw), fz = -Math.sin(yaw);     // forward = (cos,0,-sin)
+  const h = drive.distance * 0.5;
+  _chasePos.set(p.x - fx * drive.distance, p.y + h, p.z - fz * drive.distance);
+  const groundY = a.groundY != null ? a.groundY : p.y;
+  if (_chasePos.y < groundY + 2) _chasePos.y = groundY + 2; // keep the cam above ground
+  const eye = (a.halfExtents ? a.halfExtents[1] : 1) + 0.5;
+  _chaseTgt.set(p.x, p.y + eye, p.z);
+  const k = snap ? 1 : 1 - Math.exp(-8 * dt);        // frame-rate-independent smoothing
+  camera.position.lerp(_chasePos, k);
+  controls.target.lerp(_chaseTgt, k);
+  camera.lookAt(controls.target);
+}
+
+// mouse wheel adjusts chase distance while driving (OrbitControls handles zoom otherwise)
+renderer.domElement.addEventListener('wheel', (e) => {
+  if (!drive.agent) return;
+  e.preventDefault();
+  drive.distance = Math.max(3, Math.min(150, drive.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+}, { passive: false });
 
 // -------------------------------------------------- cursor world readout ---
 
@@ -949,10 +1126,17 @@ const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.1);
-  applyFly(dt);
-  controls.update();
+  if (drive.agent && !drive.agent.alive) exitDrive(); // driven agent was despawned
+  if (drive.agent) {
+    applyAgentDrive();          // WASD -> agent controls
+  } else {
+    applyFly(dt);               // WASD -> free camera fly
+    controls.update();          // (skip while chasing: updateChaseCamera owns the camera)
+  }
   updateCursorReadout();
   if (state.roadnet && state.roadnet.signals) state.roadnet.signals.tick(dt);
+  if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
+  if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame
   renderer.render(scene, camera);
 
   frames++;
@@ -973,4 +1157,5 @@ loadRoads();
 animate();
 
 // debug hook (handy for screenshots / console poking; harmless in production)
-window.__viewer = { THREE, scene, camera, controls, state, resetView };
+window.__viewer = { THREE, scene, camera, controls, state, resetView,
+                    get agents() { return state.agents; } };

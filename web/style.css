@@ -104,3 +104,38 @@ button:hover { background: #3a5e80; }
   pointer-events: none;
 }
 .hidden { display: none; }
+
+/* Agent POV picture-in-picture (top-right) */
+.agent-pip {
+  position: fixed;
+  right: 12px;
+  top: 12px;
+  width: 320px;
+  height: 240px;
+  border: 1px solid #2a3340;
+  border-radius: 4px;
+  background: #000;
+  image-rendering: pixelated;
+  z-index: 5;
+}
+.agent-pip.hidden { display: none; }
+
+#agent-list, #agent-surface { white-space: pre; }
+code { color: #ffcf5e; }
+
+/* "Now driving …" banner shown while WASD is bound to a third-person agent */
+#drive-hint {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  background: rgba(16, 20, 26, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  z-index: 6;
+  pointer-events: none;
+}
+#drive-hint b { color: #ffcf5e; }
+#drive-hint.hidden { display: none; }

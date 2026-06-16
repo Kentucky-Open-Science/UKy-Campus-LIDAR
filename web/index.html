@@ -77,11 +77,36 @@
       WASD move &middot; Q/E down/up &middot; Shift = fast</div>
   </fieldset>
 
+  <fieldset>
+    <legend>Agents</legend>
+    <label class="row">type
+      <select id="agent-type">
+        <option value="car">car</option>
+        <option value="truck">truck</option>
+        <option value="robot">robot</option>
+        <option value="drone">drone</option>
+      </select>
+    </label>
+    <div class="row">
+      <button id="agent-spawn">Spawn at view</button>
+      <button id="agent-clear">Clear all</button>
+    </div>
+    <label class="row"><input type="checkbox" id="agent-pip"> camera PiP</label>
+    <label class="row">PiP agent
+      <select id="agent-pip-select"></select>
+    </label>
+    <div id="agent-list" class="status mono">agents: none</div>
+    <div id="agent-surface" class="status mono">surface: --</div>
+    <div class="hint">Drive from the console: <code>window.__twin.agents</code></div>
+  </fieldset>
+
   <div id="fps" class="status">-- fps</div>
   <div id="cursor-readout" class="status mono">cursor: --</div>
 </div>
 
 <div id="loading-overlay" class="hidden"><div id="loading-text"></div></div>
+<canvas id="agent-pip-canvas" class="agent-pip hidden"></canvas>
+<div id="drive-hint" class="hidden"></div>
 
 <script type="module" src="app.js"></script>
 </body>

@@ -294,3 +294,120 @@ queryable model never disagree.
 UI (Roads & props fieldset): master visibility + per-category toggles (road
 surface / lane markings & stop bars / crosswalks / trees / cars / traffic &
 pedestrian signals).
+
+## Autonomous-agent API (`agents.js`)
+
+Spawn controllable **agents** (`car` / `truck` / `robot` / `drone`) on the scene
+and drive them from your own code, reading back four sensors: a POV **camera**,
+live **position** (scene m + UE cm + UTM-16N georef + heading/velocity), object
+**collision detection** (detection only — *you* program avoidance), and a
+**ground/surface** probe that keeps non-drone agents touching the ground and
+reports which surface they're on. The system mirrors the signals controller: a
+deterministic, frame-ticked object reached at **`window.__twin.agents`**, ticked
+from `animate()` right after the signals (so a controller reads fresh lights),
+before the main render. The agent group lives in the scene, so agents render for
+free; it is excluded from `resetView` and from each agent's own
+camera/ground/collision queries (an agent never detects itself).
+
+```js
+const A = window.__twin.agents;
+
+const car = A.spawn({
+  type: 'car',                                  // car | truck | robot | drone
+  position: [controls.target.x, null, controls.target.z], // y=null -> auto-snap to ground
+  heading: 0,                                   // degrees; 0 = +X. forward = (cos,0,-sin)
+  color: 0x33aaff,
+  camera: { size: [160, 120], fov: 75 },        // or `camera:false` for no POV (zero GPU cost)
+});
+
+car.setController((s) => {                       // s = full sensor snapshot for this tick
+  if (s.surface === 'none') return { brake: 1 }; // off the map -> stop
+  const ahead = s.collisions.find((c) => c.relativeSpeed > 0);   // closing contact?
+  if (ahead) return { throttle: 0.2, brake: 0.4, steer: 1 };     // YOU steer away
+  if (s.frame % 4 === 0) s.camera.read({ format: 'pixels' });    // {width,height,data:RGBA}
+  return { throttle: s.surface === 'road' ? 0.5 : 0.3, steer: 0 };
+});
+```
+
+### Controller / state objects
+
+`spawn(opts)` returns a live **agent handle**; `get(idOrName)` / `list()` resolve
+others. A registered controller `fn(sensors, agent)` runs each tick and returns a
+`controls` object (return nothing to hold the last one); a throw is caught and the
+agent holds its last controls — it never aborts the render or the signals tick.
+`sensors` is `getState()` (below) plus `frame`, `dt`, `t`, `collisions` (this
+frame's contacts), `signals` (the live signal controller, or null), and
+`camera.read()/pose()` (lazy — rendering only happens if you call it).
+
+```jsonc
+// agent.getState()  (also passed into the controller each tick)
+{
+  "position":  [x, y, z],          // scene metres, Y-up  (canonical)
+  "positionUE":[ux, uy, uz],       // UE cm, Z-up
+  "utm": { "easting": e, "northing": n, "zone": "16N" },   // null if no georef
+  "heading": 0, "headingRad": 0, "forward": [1, 0, 0],     // deg / rad / unit vector
+  "velocity": [vx, vy, vz], "speed": 0, "angularVel": 0,   // m/s (world) / m/s fwd / deg/s
+  "surface": "road",               // "road" | "terrain" | "building" | "none"
+  "groundY": 290.3, "groundNormal": [nx, ny, nz], "slopeDeg": 4.1,
+  "altitudeAGL": 0, "onGround": true, "offMap": false       // AGL is meaningful for drones
+}
+```
+
+### Controlling agents
+
+- **`setControls(c)`** — low-level, persists until changed. Ground (`car`/`truck`/
+  `robot`): `{ throttle 0..1, brake 0..1, steer -1..1, reverse, handbrake }`; the
+  robot also accepts tank `{ left, right }`. Drone: `{ move:[vx,vy,vz] }` (world
+  velocity) **or** `{ thrust 0..1, climb -1..1, yawRate deg/s }`. Out-of-range
+  values are clamped (one warning), never thrown.
+- **`setController(fn|null)`**, **`setVelocity([vx,vy,vz])`** (zero ⇒ stop),
+  **`driveTo([x,z]|[x,y,z], {speed,arriveRadius,stop})`**, **`stop()`**,
+  **`setHeading(deg)`**, **`teleport([x,y,z])`**. A controller (incl. the built-in
+  ones from `driveTo`/`setVelocity`) wins over `setControls`.
+- Kinematics: car/truck = bicycle/Ackermann, robot = differential (can pivot),
+  drone = holonomic 3D with inertia. Non-drone agents are snapped to the ground
+  each frame; the drone holds altitude with a ground-clearance floor.
+
+### Sensors
+
+- **`agent.camera.read({ size, format, flipY })`** — renders the agent's POV to an
+  offscreen target and returns `{ width, height, data }` (RGBA `Uint8Array`,
+  `format:'pixels'`), an `ImageData` (`'imageData'`), or a PNG `'dataURL'`. Reads
+  are **on-demand** (a controller that never calls `read()` costs no render time);
+  one shared render target per resolution bounds VRAM. `camera.pose()` returns the
+  camera world position + forward without rendering.
+- **Collision (detection only).** Each tick fills `agent.getContacts()` /
+  `sensors.collisions` with contacts vs **buildings** and **other agents** (OBB SAT
+  in XZ + a Y-interval gate; a 64 m broad-phase grid keeps it cheap against the
+  ~3,100 buildings). A contact = `{ with, id, name, point, normal, penetration,
+  relativeSpeed, phase }` where `normal` points from the other body toward the
+  agent and `relativeSpeed > 0` means closing. `agent.onCollision(fn)` fires once
+  on the rising edge, `onContactEnd(fn)` on the falling edge. The engine never
+  steers, brakes, or pushes out — avoidance is yours to program.
+- **Ground / surface.** A downward ray (road ribbons + the terrain tile under the
+  agent + nearby buildings) finds the topmost surface; because road ribbons sit
+  0.3 m above terrain they win, so `surface` is `road` on a street and `terrain`
+  off it. Ground-bound agents snap to `groundY`; the drone reports `altitudeAGL`.
+  Off-map (no data under the agent yet) ⇒ `surface:'none'` and the agent holds its
+  altitude, then re-snaps automatically once tiles stream in.
+
+### Controller object & UI
+
+`window.__twin.agents`: `spawn` / `despawn` / `get` / `list` / `clear` / `count`;
+`config` (`maxAgents`, `collisionTargets`, `cameraSize`, `timeScale`);
+`setPaused` / `setTimeScale`; `snapshot()`; coordinate helpers `toUE` / `toScene`
+/ `toUTM`; and `setPiP(agent)` to mirror one agent's camera into the on-screen
+picture-in-picture canvas (**top-right**).
+
+**UI (Agents fieldset).** Pick a type, **Spawn at view** / **Clear all**, a
+**camera PiP** toggle + agent selector, and a live per-agent speed/surface
+readout. **Spawning takes you to the wheel:** the main camera switches to a
+third-person chase view that follows the new agent, and **WASD/QE drive the
+agent** instead of flying the camera — ground vehicles use *W* throttle, *S*
+brake-then-reverse, *A/D* steer; the drone uses *W* thrust, *A/D* turn, *E/Q*
+up/down. The mouse wheel adjusts chase distance; **Esc** (or Clear) releases
+control and restores orbit. Driving just calls the same `setControls` API each
+frame, so anything you can do from a script you can also do from the keyboard.
+
+Headless smoke test (spawn + all four sensors + third-person drive):
+`python tools/verify_agents.py`.

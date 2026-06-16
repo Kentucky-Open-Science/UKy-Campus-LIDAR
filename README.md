@@ -37,11 +37,13 @@ CAMPUS/
 │   ├── smooth_roads.py       # smooth roads + signalise junctions → signals.json
 │   ├── ground_buildings.py   # drop floating buildings onto the terrain (keep bridges)
 │   ├── build_all.py          # Full pipeline orchestrator
-│   └── verify_viewer.py      # Headless viewer test (requires playwright)
+│   ├── verify_viewer.py      # Headless viewer test (requires playwright)
+│   └── verify_agents.py      # Headless agent-API sensor test (requires playwright)
 ├── web/                      # Three.js viewer (static)
 │   ├── index.html
 │   ├── app.js
-│   ├── roads.js              # road ribbons + signals/crosswalks + agent API
+│   ├── roads.js              # road ribbons + signals/crosswalks + live signal controller
+│   ├── agents.js             # autonomous agents (car/truck/robot/drone) + sensors
 │   ├── style.css
 │   ├── lib/                  # Vendored Three.js 0.160 + OrbitControls
 │   └── data/                 # Generated extraction output
@@ -97,7 +99,7 @@ wireframe mode, camera reset.
   left elevated) — `python -m tools.ground_buildings`.
 - Viewport: ~1.8 km x 3.4 km area centered on UKy Lexington campus
 
-## Digital twin — controllable signals
+## Digital twin — controllable signals + autonomous agents
 
 The road network is built for autonomous-agent simulation: `tools/smooth_roads.py`
 emits `web/data/signals.json`, a machine-readable model of every intersection
@@ -105,4 +107,12 @@ emits `web/data/signals.json`, a machine-readable model of every intersection
 a fixed-time phase plan). The viewer ticks a deterministic signal state machine and
 exposes it at `window.__twin.signals`, so an agent can ask "what is my light right
 now and where do I stop" (`getLegState` / `queryByPosition`) and even drive the
-lights (`setOverride`). Full API + schema in [web/README.md](web/README.md).
+lights (`setOverride`).
+
+On top of that, `web/agents.js` adds **controllable agents** — spawn a car, truck,
+robot, or drone at `window.__twin.agents`, drive it from your own code, and read
+back a POV **camera**, live **position** (scene m / UE cm / UTM-16N), object
+**collision detection** (you program the avoidance), and a **ground/surface** probe
+that keeps ground vehicles on the road or terrain and tells you which one they're
+on. Full API + schemas for both in [web/README.md](web/README.md); smoke-test the
+agent sensors with `python tools/verify_agents.py`.
