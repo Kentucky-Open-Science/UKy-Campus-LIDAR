@@ -26,8 +26,17 @@ from gymnasium.envs.registration import register  # noqa: E402
 from .env import CampusEnv, DEFAULT_REWARD  # noqa: E402
 from .parallel_env import CampusParallelEnv  # noqa: E402
 from .tasks import CampusNavEnv, NamedGoals  # noqa: E402
+from .scenarios import Scenario, SCENARIOS, make_scenario, train_test_seeds  # noqa: E402
 
-__all__ = ["CampusEnv", "CampusParallelEnv", "CampusNavEnv", "NamedGoals", "DEFAULT_REWARD"]
+__all__ = ["CampusEnv", "CampusParallelEnv", "CampusNavEnv", "NamedGoals", "DEFAULT_REWARD",
+           "Scenario", "SCENARIOS", "make_scenario", "train_test_seeds", "make_env"]
+
+
+def make_env(env_id="Campus-v0", **kwargs):
+    """Top-level, picklable env factory — use with gymnasium.vector.AsyncVectorEnv
+    (whose subprocess workers must pickle the env constructor)."""
+    import gymnasium as gym
+    return gym.make(env_id, **kwargs)
 
 # random-point navigation (Campus*-v0) and named/language-goal navigation (CampusNav*-v0)
 register(id="Campus-v0", entry_point="campus_gym.env:CampusEnv", max_episode_steps=1000)
@@ -37,3 +46,8 @@ for _t in ("car", "truck", "robot", "drone"):
              max_episode_steps=1000, kwargs={"agent_type": _t})
     register(id=f"CampusNav{_t.capitalize()}-v0", entry_point="campus_gym.tasks:CampusNavEnv",
              max_episode_steps=1500, kwargs={"agent_type": _t})
+# traffic variants: NPC cars on the real roads + deterministic signals to sense/yield to
+register(id="CampusTraffic-v0", entry_point="campus_gym.env:CampusEnv", max_episode_steps=1500,
+         kwargs={"agent_type": "car", "npc_traffic": 12, "signals": True})
+register(id="CampusNavTraffic-v0", entry_point="campus_gym.tasks:CampusNavEnv", max_episode_steps=1500,
+         kwargs={"agent_type": "car", "npc_traffic": 12})

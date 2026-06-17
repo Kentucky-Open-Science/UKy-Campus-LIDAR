@@ -26,12 +26,15 @@ from gymnasium import spaces
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from tools.twin_server import World, Ground, Buildings, DEFS  # noqa: E402
 
-OBS_DIM = 13
+OBS_DIM = 18          # ego(7) + building(3) + goal(3) + vehicle(3) + signal(2)
 OBS_RANGE = 60.0      # normaliser for nearest-building distance (m)
 GOAL_RANGE = 200.0    # normaliser for goal distance (m)
+VEH_RANGE = 40.0      # normaliser for nearest-vehicle distance (m)
+SIG_RANGE = 25.0      # normaliser for signal-ahead distance (m)
 GOAL_RADIUS = 8.0     # within this of the goal counts as reached (m)
 
 _SHARED = None        # (Ground, Buildings) loaded once, shared read-only
+_SIGNALS = None       # shared deterministic signal controller
 
 
 def shared_world_data():
@@ -39,6 +42,14 @@ def shared_world_data():
     if _SHARED is None:
         _SHARED = (Ground(), Buildings())
     return _SHARED
+
+
+def shared_signals():
+    global _SIGNALS
+    if _SIGNALS is None:
+        from tools.traffic import Signals
+        _SIGNALS = Signals()
+    return _SIGNALS
 
 
 # ----------------------------------------------------------------- spaces ---
@@ -96,10 +107,33 @@ def build_observation(agent, world, goal):
         gdx, gdz = gx / GOAL_RANGE, gz / GOAL_RANGE
         gdist = math.hypot(goal[0] - agent.x, goal[1] - agent.z) / GOAL_RANGE
 
+    # nearest OTHER vehicle (NPC or another agent), ego frame
+    vdx = vdz = vdist = 0.0
+    vbest, vbd = None, VEH_RANGE * VEH_RANGE
+    for o in world.agents.values():
+        if o is agent:
+            continue
+        d = (o.x - agent.x) ** 2 + (o.z - agent.z) ** 2
+        if d < vbd:
+            vbd, vbest = d, o
+    if vbest is not None:
+        ex, ez = ego(vbest.x - agent.x, vbest.z - agent.z)
+        vdx, vdz, vdist = ex / VEH_RANGE, ez / VEH_RANGE, math.sqrt(vbd) / VEH_RANGE
+
+    # traffic signal ahead (1 = a red/yellow we must stop for; dist normalised, 1 = clear)
+    sig_dist, sig_red = 1.0, 0.0
+    sigs = getattr(world, "signals", None)
+    if sigs is not None and sigs.ok:
+        sd, st = sigs.ahead(agent.x, agent.z, agent.yaw, world.t)
+        if sd is not None:
+            sig_dist = sd / SIG_RANGE
+            sig_red = 1.0 if st in ("red", "yellow") else 0.0
+
     agl = (agent.altitudeAGL or 0.0) / 50.0 if agent.type == "drone" else 0.0
     coll = 1.0 if agent.contacts else 0.0
     return np.array([agent.speed / ms, fwd_v / ms, lat_v / ms, cy, sy, agl, coll,
-                     odx, odz, odist, gdx, gdz, gdist], dtype=np.float32)
+                     odx, odz, odist, gdx, gdz, gdist, vdx, vdz, vdist, sig_dist, sig_red],
+                    dtype=np.float32)
 
 
 # default reward as named, weighted terms (override per-env with reward_weights=...)
@@ -171,7 +205,8 @@ class CampusEnv(gym.Env):
 
     def __init__(self, agent_type="car", max_episode_steps=1000, dt=None,
                  region=(0.0, 0.0, 200.0), goal=True, reward_weights=None,
-                 goal_radius=GOAL_RADIUS, render_mode=None):
+                 goal_radius=GOAL_RADIUS, npc_traffic=0, signals=False,
+                 domain_random=False, render_mode=None):
         super().__init__()
         if agent_type not in DEFS:
             raise ValueError(f"unknown agent_type '{agent_type}'; valid: {', '.join(DEFS)}")
@@ -182,6 +217,9 @@ class CampusEnv(gym.Env):
         self.use_goal = goal
         self.reward_weights = reward_weights
         self.goal_radius = goal_radius
+        self.npc_traffic = int(npc_traffic)         # background NPC cars on the roads
+        self.signals_on = bool(signals or npc_traffic)   # deterministic traffic lights
+        self.domain_random = bool(domain_random)    # per-reset dynamics randomization (sim-to-real)
         self.render_mode = render_mode
         self.ground, self.buildings = shared_world_data()
         self.observation_space = obs_space()
@@ -192,20 +230,42 @@ class CampusEnv(gym.Env):
         self._prev_d = self._opt_dist = self._path_len = 0.0
         self._last_xz = (0.0, 0.0)
 
+    def _make_world(self):
+        """Fresh World, optionally with deterministic signals + NPC traffic attached
+        (seeded by self.np_random). Shared by the random- and named-goal resets."""
+        w = World(ground=self.ground, buildings=self.buildings)
+        if self.signals_on:
+            w.signals = shared_signals()
+        if self.npc_traffic > 0:
+            from tools.traffic import TrafficManager
+            w.traffic = TrafficManager(w, self.np_random, count=self.npc_traffic,
+                                       signals=w.signals, region=self.region)
+        return w
+
+    def _spawn_agent_in(self, region, min_from=None):
+        """Spawn the controlled agent clear of buildings (re-sampling on contact), then
+        apply per-reset dynamics randomization if enabled. Used by both reset paths."""
+        a = None
+        for _ in range(12):
+            sx, sz = free_point(self.world, self.np_random, region, min_from=min_from)
+            heading = float(self.np_random.uniform(0, 360))
+            a = self.world.spawn({"type": self.agent_type, "position": [sx, None, sz],
+                                  "heading": heading, "owner": "gym"})
+            self.world.tick(self.dt)
+            if not a.contacts:
+                break
+            self.world.despawn(a.id)
+        self.agent = a
+        if self.domain_random:                       # jitter dynamics +/-15%
+            jit = lambda: float(self.np_random.uniform(0.85, 1.15))
+            a.maxSpeed *= jit(); a.maxAccel *= jit()
+            a.brakeDecel = a.maxAccel; a.maxSteerRad *= jit()
+        return a
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)          # seeds self.np_random
-        self.world = World(ground=self.ground, buildings=self.buildings)
-        # spawn clear of buildings; re-sample a few times if we still settle in a contact
-        for _ in range(8):
-            sx, sz = free_point(self.world, self.np_random, self.region)
-            heading = float(self.np_random.uniform(0, 360))
-            self.agent = self.world.spawn({"type": self.agent_type,
-                                           "position": [sx, None, sz],
-                                           "heading": heading, "owner": "gym"})
-            self.world.tick(self.dt)
-            if not self.agent.contacts:
-                break
-            self.world.despawn(self.agent.id)
+        self.world = self._make_world()
+        self._spawn_agent_in(self.region)
         self.goal = None
         if self.use_goal:
             gx, gz = free_point(self.world, self.np_random, self.region,

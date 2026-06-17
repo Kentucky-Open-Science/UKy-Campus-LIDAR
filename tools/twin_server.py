@@ -460,6 +460,7 @@ class World:
         self.ground = ground if ground is not None else Ground()
         self.buildings = buildings if buildings is not None else Buildings()
         self.agents = {}
+        self.traffic = None        # optional TrafficManager (NPC cars + signals); ticked first
         self.lock = threading.RLock()
         self.t = 0.0
         self.frame = 0
@@ -496,6 +497,8 @@ class World:
 
     def tick(self, dt):
         with self.lock:
+            if self.traffic is not None:      # set NPC controls before integrating
+                self.traffic.tick(dt)
             arr = list(self.agents.values())
             for a in arr:
                 a.integrate(dt)
