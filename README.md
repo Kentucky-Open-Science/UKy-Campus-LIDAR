@@ -34,6 +34,8 @@ CAMPUS/
 │   ├── extract_mesh.py       # StaticMesh -> .bin (positions, UVs, indices)
 │   ├── extract_lidar.py      # LidarPointCloud -> decimated chunked .bin (campus only)
 │   ├── ky_lidar.py           # KyFromAbove/KYAPED LiDAR -> citywide point cloud + ground grid
+│   ├── ground_grid.py        # shared reader for the citywide ground-elevation grid (ground.f32)
+│   ├── city_buildings.py     # OSM footprints + KYAPED heights -> ~130k 3D buildings (citywide)
 │   ├── extract_scene.py      # Blueprint scene assembly (transforms, materials)
 │   ├── extract_buildings.py  # LiDAR building-class → 3D mesh (legacy, DBSCAN)
 │   ├── extract_buildings_hybrid.py  # OSM footprints split LiDAR + give height
@@ -115,6 +117,35 @@ ground-snapping (`tools/twin_server.Ground`) uses the new `ground.f32` grid as t
 elevation citywide, so cars/buses follow real terrain beyond the campus tiles. Everything
 lands under the gitignored `web/data/`; the previous campus manifest is backed up to
 `web/data/manifest.campus.bak.json`.
+
+## Citywide geometry — buildings, roads, signals
+
+With the KYAPED LiDAR + `ground.f32` in place, the campus's geometry treatment extends to
+all of Lexington:
+
+- **~130k 3D buildings** (`tools/city_buildings.py`) — OpenStreetMap building footprints
+  extruded to LiDAR heights. KYAPED has no building class, so each roof comes from a
+  max-elevation (DSM) grid of the non-ground returns and each base from `ground.f32`. The
+  prisms are written straight into the viewer's packed buffer (`buildings.pack.bin`, BPK1 —
+  one draw call), and the per-building AABBs feed the sim's collision exactly like the campus
+  ones. Supersedes the campus pack (backed up to `buildings.pack.campus.bak.*`).
+- **Citywide roads** (`tools/osm_roads.py --city`) — 9,569 OSM roads (~2,830 km), projected
+  and draped on `ground.f32`, then smoothed by `tools/smooth_roads.py --city`.
+- **Real traffic signals** (`tools/fetch_lfucg_signals.py` + `smooth_roads --city`) — the 627
+  real LFUCG Fayette-County signals snap onto the citywide junctions (~493 signalised, plus
+  stop-controlled + uncontrolled), each with a fixed-time phase plan + crosswalks like campus.
+
+```sh
+python -m tools.ky_lidar --download-aoi --heightmap   # tiles + ground.f32 (prereq)
+python -m tools.city_buildings                        # ~130k buildings -> buildings.pack
+python -m tools.osm_roads --city                      # citywide roads.json (draped on ground.f32)
+python -m tools.smooth_roads --city                   # smooth + signals.json
+python -m tools.twin_server                           # serve it all on :8000
+```
+
+The full build downloads ~8 GB of tiles plus OSM data; OSM footprints are cached per-tile
+under `extracted/ky/osm_buildings/` (resumable). All outputs are the gitignored `web/data/`
+files the viewer + sim already read.
 
 ## Viewer controls
 
