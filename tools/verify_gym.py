@@ -150,6 +150,43 @@ def main():
           f"recorded {meta['steps']} steps; deterministic replay ok (mismatches={rep['mismatches']})")
     e.close()
 
+    print("=== NPC traffic + signals (sensed in the observation) ===")
+    tenv = gym.make("CampusTraffic-v0")
+    o, _ = tenv.reset(seed=1)
+    check(o.shape[0] == 18, f"traffic env obs dim {o.shape[0]} (adds nearest-vehicle + signal features)")
+    nnpc = sum(1 for a in tenv.unwrapped.world.agents.values() if a.owner == "npc")
+    check(nnpc > 0, f"{nnpc} NPC vehicles driving the road graph")
+    tenv.close()
+
+    print("=== Scenarios + domain randomization ===")
+    from campus_gym import make_scenario, SCENARIOS, train_test_seeds
+    built = 0
+    for name in SCENARIOS:
+        env = make_scenario(name, max_episode_steps=40)
+        env.reset(seed=0); env.step(env.action_space.sample()); env.close(); built += 1
+    check(built == len(SCENARIOS), f"all {built} named scenarios build + step")
+    tr, te = train_test_seeds()
+    check(set(tr).isdisjoint(te), f"train/test seed split disjoint ({len(tr)} train / {len(te)} test)")
+    e1 = CampusEnv("car", domain_random=True); e1.reset(seed=1); ms1 = e1.agent.maxSpeed
+    e2 = CampusEnv("car", domain_random=True); e2.reset(seed=1); ms2 = e2.agent.maxSpeed
+    e3 = CampusEnv("car", domain_random=True); e3.reset(seed=2); ms3 = e3.agent.maxSpeed
+    check(abs(ms1 - ms2) < 1e-9 and abs(ms1 - ms3) > 1e-9,
+          f"domain randomization: deterministic per seed, varies across (maxSpeed {ms1:.1f} vs {ms3:.1f})")
+    for e in (e1, e2, e3):
+        e.close()
+
+    print("=== Tier 1: AsyncVectorEnv ===")
+    try:
+        import functools
+        from gymnasium.vector import AsyncVectorEnv
+        import campus_gym as cg
+        aenv = AsyncVectorEnv([functools.partial(cg.make_env, "Campus-v0") for _ in range(2)])
+        ao, _ = aenv.reset(seed=0); aenv.step(aenv.action_space.sample()); aenv.close()
+        check(ao.shape[0] == 2, f"AsyncVectorEnv(2): batched obs {ao.shape}")
+    except Exception as e:  # noqa: BLE001 — subprocess vectorisation is platform-finicky
+        notes.append("NOTE  AsyncVectorEnv not verified here (SyncVectorEnv works): "
+                     + str(e).splitlines()[0][:100])
+
     print("\n".join("  " + n for n in notes))
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

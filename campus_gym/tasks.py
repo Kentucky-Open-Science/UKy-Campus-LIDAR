@@ -20,7 +20,7 @@ import gymnasium as gym
 
 from tools.twin_server import DATA
 from tools.roadnet import shared_graph
-from .env import CampusEnv, build_observation, free_point
+from .env import CampusEnv, build_observation
 
 _TEMPLATES = ["drive to {name}", "navigate to {name}", "go to {name}", "head over to {name}"]
 
@@ -112,15 +112,7 @@ class CampusNavEnv(CampusEnv):
         self.instruction = self._goals.instruction(place, self.np_random)
         self.region = (gx, gz, self.spawn_radius)
         self.world = self._make_world()
-        for _ in range(12):
-            sx, sz = free_point(self.world, self.np_random, self.region, min_from=(gx, gz, 40.0))
-            heading = float(self.np_random.uniform(0, 360))
-            self.agent = self.world.spawn({"type": self.agent_type, "position": [sx, None, sz],
-                                           "heading": heading, "owner": "gym"})
-            self.world.tick(self.dt)
-            if not self.agent.contacts:
-                break
-            self.world.despawn(self.agent.id)
+        self._spawn_agent_in(self.region, min_from=(gx, gz, 40.0))
         self.goal = (gx, gz)
         self._prev_d = math.hypot(gx - self.agent.x, gz - self.agent.z)
         self._begin_episode()

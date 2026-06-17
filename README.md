@@ -43,6 +43,9 @@ CAMPUS/
 │   ├── twin_server.py        # authoritative shared-world server + agent API (/api/world/*)
 │   ├── pack_buildings.py     # merge 3,109 building meshes → one buffer (fast load)
 │   ├── transit_common.py     # shared lon/lat → scene projection (georef)
+│   ├── roadnet.py            # road graph (routing) from roads.json
+│   ├── traffic.py            # deterministic signals + NPC vehicles (sim core)
+│   ├── verify_gym.py         # gym env test suite (check_env, vectorization, traffic, SPL, …)
 │   ├── extract_roads.py      # aerial-texture road detector (alt. road source)
 │   ├── fetch_lfucg_signals.py # download LFUCG real traffic-signal locations
 │   ├── smooth_roads.py       # smooth roads + signalise junctions → signals.json
@@ -291,7 +294,8 @@ Supporting pieces:
 - **Configurable reward** — a sum of named, weighted terms (`CampusEnv(reward_weights=...)`),
   with the per-term breakdown in `info["reward_terms"]` for transparent shaping/ablation.
 - **Metrics** (`campus_gym.eval`) — `evaluate(env, policy, episodes)` reports success rate,
-  **SPL** (success weighted by path length), collision rate, and mean return.
+  **SPL** (success weighted by path length, using the road-graph shortest route), collision
+  rate, and mean return.
 - **Record + deterministic replay** (`campus_gym.record`) — log an episode to JSONL
   (seed + actions + per-step reward + the instruction) and replay it exactly.
 
@@ -299,10 +303,28 @@ Supporting pieces:
 python examples/gym_nav_eval.py --type car --episodes 10   # instructions + SPL + replay
 ```
 
+### NPC traffic + signals, scenarios, vectorization, training
+
+- **Sensable traffic** — `CampusTraffic-v0` / `CampusEnv(npc_traffic=N, signals=True)` adds
+  **NPC cars** that drive the real road graph (IDM car-following + red-light stopping) and the
+  **deterministic traffic signals** (ported from the viewer into the authoritative `World`), so
+  the agent perceives and must yield to them — the observation grows to 18 dims with nearest-
+  vehicle + signal-ahead features. (Previously signals/transit lived only in the browser.)
+- **Scenarios + domain randomization** (`campus_gym.scenarios`) — a declarative `Scenario`
+  spec + registry (`make_scenario("campus_traffic")`), `train_test_seeds()` for held-out
+  evaluation, and `domain_random=True` to jitter agent dynamics per reset (sim-to-real).
+- **Vectorization** — `SyncVectorEnv` and `AsyncVectorEnv` (use the picklable `campus_gym.make_env`).
+- **RL training** — `examples/train_ppo.py` trains Stable-Baselines3 PPO and evaluates it
+  on held-out seeds before vs. after (return improves as it learns to drive to goals).
+
+```sh
+python examples/train_ppo.py --timesteps 50000 --n-envs 6      # pip install stable-baselines3
+```
+
 Verify the whole stack (Gymnasium `check_env`, PettingZoo `parallel_api_test`, seeded
-determinism, vectorization, named/language goals, eval/SPL, record+replay) with
-`python tools/verify_gym.py`. This covers **Tiers 0-3** of the agentic-gym roadmap (the
-gym contract, vectorization, configurable reward + metrics, and the language-goal
-agentic layer). Still open for later: NPC traffic (the signals/transit live in the
-browser world, not the server's), domain randomization, a scenario DSL, and road-graph
-routing (SPL currently uses straight-line optimal distance).
+determinism, Sync+Async vectorization, named/language goals, NPC traffic + signals, eval/SPL,
+scenarios + domain randomization, record+replay) with `python -m tools.verify_gym`. This
+covers Tiers 0-3 of the agentic-gym roadmap end to end. Remaining stretch items: importing
+real traffic datasets, richer scenario authoring, and visual (camera) observations for the
+trainer (the camera feed exists via the server's `--render`, but the gym defaults to fast
+state-vector observations).

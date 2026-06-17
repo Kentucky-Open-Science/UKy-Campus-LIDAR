@@ -26,8 +26,17 @@ from gymnasium.envs.registration import register  # noqa: E402
 from .env import CampusEnv, DEFAULT_REWARD  # noqa: E402
 from .parallel_env import CampusParallelEnv  # noqa: E402
 from .tasks import CampusNavEnv, NamedGoals  # noqa: E402
+from .scenarios import Scenario, SCENARIOS, make_scenario, train_test_seeds  # noqa: E402
 
-__all__ = ["CampusEnv", "CampusParallelEnv", "CampusNavEnv", "NamedGoals", "DEFAULT_REWARD"]
+__all__ = ["CampusEnv", "CampusParallelEnv", "CampusNavEnv", "NamedGoals", "DEFAULT_REWARD",
+           "Scenario", "SCENARIOS", "make_scenario", "train_test_seeds", "make_env"]
+
+
+def make_env(env_id="Campus-v0", **kwargs):
+    """Top-level, picklable env factory — use with gymnasium.vector.AsyncVectorEnv
+    (whose subprocess workers must pickle the env constructor)."""
+    import gymnasium as gym
+    return gym.make(env_id, **kwargs)
 
 # random-point navigation (Campus*-v0) and named/language-goal navigation (CampusNav*-v0)
 register(id="Campus-v0", entry_point="campus_gym.env:CampusEnv", max_episode_steps=1000)

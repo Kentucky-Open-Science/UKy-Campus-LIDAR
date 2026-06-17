@@ -205,7 +205,8 @@ class CampusEnv(gym.Env):
 
     def __init__(self, agent_type="car", max_episode_steps=1000, dt=None,
                  region=(0.0, 0.0, 200.0), goal=True, reward_weights=None,
-                 goal_radius=GOAL_RADIUS, npc_traffic=0, signals=False, render_mode=None):
+                 goal_radius=GOAL_RADIUS, npc_traffic=0, signals=False,
+                 domain_random=False, render_mode=None):
         super().__init__()
         if agent_type not in DEFS:
             raise ValueError(f"unknown agent_type '{agent_type}'; valid: {', '.join(DEFS)}")
@@ -218,6 +219,7 @@ class CampusEnv(gym.Env):
         self.goal_radius = goal_radius
         self.npc_traffic = int(npc_traffic)         # background NPC cars on the roads
         self.signals_on = bool(signals or npc_traffic)   # deterministic traffic lights
+        self.domain_random = bool(domain_random)    # per-reset dynamics randomization (sim-to-real)
         self.render_mode = render_mode
         self.ground, self.buildings = shared_world_data()
         self.observation_space = obs_space()
@@ -240,20 +242,30 @@ class CampusEnv(gym.Env):
                                        signals=w.signals, region=self.region)
         return w
 
+    def _spawn_agent_in(self, region, min_from=None):
+        """Spawn the controlled agent clear of buildings (re-sampling on contact), then
+        apply per-reset dynamics randomization if enabled. Used by both reset paths."""
+        a = None
+        for _ in range(12):
+            sx, sz = free_point(self.world, self.np_random, region, min_from=min_from)
+            heading = float(self.np_random.uniform(0, 360))
+            a = self.world.spawn({"type": self.agent_type, "position": [sx, None, sz],
+                                  "heading": heading, "owner": "gym"})
+            self.world.tick(self.dt)
+            if not a.contacts:
+                break
+            self.world.despawn(a.id)
+        self.agent = a
+        if self.domain_random:                       # jitter dynamics +/-15%
+            jit = lambda: float(self.np_random.uniform(0.85, 1.15))
+            a.maxSpeed *= jit(); a.maxAccel *= jit()
+            a.brakeDecel = a.maxAccel; a.maxSteerRad *= jit()
+        return a
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)          # seeds self.np_random
         self.world = self._make_world()
-        # spawn clear of buildings; re-sample a few times if we still settle in a contact
-        for _ in range(8):
-            sx, sz = free_point(self.world, self.np_random, self.region)
-            heading = float(self.np_random.uniform(0, 360))
-            self.agent = self.world.spawn({"type": self.agent_type,
-                                           "position": [sx, None, sz],
-                                           "heading": heading, "owner": "gym"})
-            self.world.tick(self.dt)
-            if not self.agent.contacts:
-                break
-            self.world.despawn(self.agent.id)
+        self._spawn_agent_in(self.region)
         self.goal = None
         if self.use_goal:
             gx, gz = free_point(self.world, self.np_random, self.region,
