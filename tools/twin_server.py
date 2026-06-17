@@ -454,9 +454,11 @@ def _aabb(amin, amax, bmin, bmax):
 
 # =====================================================================
 class World:
-    def __init__(self, hz=50, max_agents=64):
-        self.ground = Ground()
-        self.buildings = Buildings()
+    def __init__(self, hz=50, max_agents=64, ground=None, buildings=None):
+        # ground + buildings are read-only world data; pass shared instances to avoid
+        # reloading the heightmap per World (e.g. when vectorising the gym env).
+        self.ground = ground if ground is not None else Ground()
+        self.buildings = buildings if buildings is not None else Buildings()
         self.agents = {}
         self.lock = threading.RLock()
         self.t = 0.0
