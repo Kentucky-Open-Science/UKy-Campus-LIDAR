@@ -23,12 +23,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from gymnasium.envs.registration import register  # noqa: E402
 
-from .env import CampusEnv  # noqa: E402
+from .env import CampusEnv, DEFAULT_REWARD  # noqa: E402
 from .parallel_env import CampusParallelEnv  # noqa: E402
+from .tasks import CampusNavEnv, NamedGoals  # noqa: E402
 
-__all__ = ["CampusEnv", "CampusParallelEnv"]
+__all__ = ["CampusEnv", "CampusParallelEnv", "CampusNavEnv", "NamedGoals", "DEFAULT_REWARD"]
 
+# random-point navigation (Campus*-v0) and named/language-goal navigation (CampusNav*-v0)
 register(id="Campus-v0", entry_point="campus_gym.env:CampusEnv", max_episode_steps=1000)
+register(id="CampusNav-v0", entry_point="campus_gym.tasks:CampusNavEnv", max_episode_steps=1500)
 for _t in ("car", "truck", "robot", "drone"):
     register(id=f"Campus{_t.capitalize()}-v0", entry_point="campus_gym.env:CampusEnv",
              max_episode_steps=1000, kwargs={"agent_type": _t})
+    register(id=f"CampusNav{_t.capitalize()}-v0", entry_point="campus_gym.tasks:CampusNavEnv",
+             max_episode_steps=1500, kwargs={"agent_type": _t})

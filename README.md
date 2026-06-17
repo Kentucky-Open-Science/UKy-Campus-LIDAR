@@ -272,8 +272,37 @@ obs, rewards, terms, truncs, infos = env.step({a: env.action_space(a).sample() f
 ```
 
 Read-only world data (terrain heightmap + building AABBs) is loaded once and shared
-across env instances, so it's cheap to vectorise. Verify the whole contract (Gymnasium
-`check_env`, PettingZoo `parallel_api_test`, seeded determinism, rollouts) with
-`python tools/verify_gym.py`; `examples/gym_random.py` is a minimal rollout. This is
-**Tier 0** of the agentic-gym roadmap (the gym contract); rewards/scenarios/curricula/
-language goals are later tiers.
+across env instances, so it **vectorises** (`gymnasium.vector.SyncVectorEnv([...])`).
+
+### Language-conditioned navigation + evaluation (the agentic layer)
+
+`CampusNav-v0` (and `CampusNav{Car,Truck,Robot,Drone}-v0`) turns the twin's **real
+named entities** — Lextran bus stops and named campus streets — into goals specified
+in **natural language**. Each episode hands the agent an instruction grounded in a real
+coordinate, so an LLM/VLM agent reads `info["instruction"]`:
+
+```python
+env = gym.make("CampusNav-v0")
+obs, info = env.reset(seed=0)
+info["instruction"]   # e.g. "drive to the Transit Center" / "navigate to Pennsylvania Avenue"
+```
+
+Supporting pieces:
+- **Configurable reward** — a sum of named, weighted terms (`CampusEnv(reward_weights=...)`),
+  with the per-term breakdown in `info["reward_terms"]` for transparent shaping/ablation.
+- **Metrics** (`campus_gym.eval`) — `evaluate(env, policy, episodes)` reports success rate,
+  **SPL** (success weighted by path length), collision rate, and mean return.
+- **Record + deterministic replay** (`campus_gym.record`) — log an episode to JSONL
+  (seed + actions + per-step reward + the instruction) and replay it exactly.
+
+```sh
+python examples/gym_nav_eval.py --type car --episodes 10   # instructions + SPL + replay
+```
+
+Verify the whole stack (Gymnasium `check_env`, PettingZoo `parallel_api_test`, seeded
+determinism, vectorization, named/language goals, eval/SPL, record+replay) with
+`python tools/verify_gym.py`. This covers **Tiers 0-3** of the agentic-gym roadmap (the
+gym contract, vectorization, configurable reward + metrics, and the language-goal
+agentic layer). Still open for later: NPC traffic (the signals/transit live in the
+browser world, not the server's), domain randomization, a scenario DSL, and road-graph
+routing (SPL currently uses straight-line optimal distance).
