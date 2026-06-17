@@ -71,6 +71,7 @@ CAMPUS/
 │       ├── signals.json      # machine-readable signal model (autonomous agents)
 │       ├── city.json         # city-wide OSM streets + ground plane
 │       └── transit.json      # Lextran routes + stops (live buses via tools/serve.py)
+├── campus_gym/              # Gymnasium (single) + PettingZoo (multi) env over the sim core
 ├── client/                  # twin.py — dependency-free Python client for the world API
 ├── examples/                # drone_demo.py + car/truck/robot vision demos (YOLO via the camera feed)
 └── extracted/                # Per-domain manifests + reports
@@ -237,3 +238,42 @@ All three spawn into the same shared world, so you can run them together (and wa
 browser) and they'll see and bump into each other. `client/twin.py` exposes the feed as
 `agent.camera()` (JPEG bytes) / `agent.camera_image()` (PIL); `examples/yolo_drive.py`
 holds the shared camera→YOLO→controls loop.
+
+## Gym environment (`campus_gym`)
+
+For training/evaluation, the simulation core (`tools/twin_server.World`/`Agent`) is
+also wrapped as a **synchronous, headless gym environment** — it advances only inside
+`step()` (no server, no browser, no real-time clock), so it runs faster than real time
+and is reproducible. The real-time REST server stays for interactive/multi-client use;
+this is its training-shaped twin.
+
+```python
+import gymnasium as gym, campus_gym          # registers Campus-v0, CampusDrone-v0, ...
+env = gym.make("Campus-v0")                   # single agent (Gymnasium)
+obs, info = env.reset(seed=0)
+obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+```
+
+Task (Tier 0): drive a `car`/`truck`/`robot`/`drone` to a seeded goal on campus
+without crashing into a building or leaving the map.
+- **observation** `Box(13)`: ego kinematics + nearest-building (ego frame) + goal (ego frame)
+- **action**: ground `[accel/brake, steer] ∈ [-1,1]`; drone `[vx,vy,vz] ∈ [-1,1]`
+- **reward**: progress toward the goal − collision/off-map penalties − small time cost
+- **terminated** reached goal / crashed / off map; **truncated** at `max_episode_steps`
+
+Multi-agent is exposed as a **PettingZoo Parallel** env (every agent acts each step;
+dict-keyed obs/reward/terminated/truncated/info; agents collide with each other):
+
+```python
+from campus_gym import CampusParallelEnv
+env = CampusParallelEnv(agent_types=("car", "truck", "drone", "robot"))
+obs, infos = env.reset(seed=0)
+obs, rewards, terms, truncs, infos = env.step({a: env.action_space(a).sample() for a in env.agents})
+```
+
+Read-only world data (terrain heightmap + building AABBs) is loaded once and shared
+across env instances, so it's cheap to vectorise. Verify the whole contract (Gymnasium
+`check_env`, PettingZoo `parallel_api_test`, seeded determinism, rollouts) with
+`python tools/verify_gym.py`; `examples/gym_random.py` is a minimal rollout. This is
+**Tier 0** of the agentic-gym roadmap (the gym contract); rewards/scenarios/curricula/
+language goals are later tiers.
