@@ -993,7 +993,7 @@ $('point-budget').addEventListener('input', (e) => {
   updateLidarStatus();
   lidarPump(); // load more if budget grew
 });
-$('camera-reset').addEventListener('click', () => { exitDrive(); exitBusFollow(); resetView(); });
+$('camera-reset').addEventListener('click', () => { exitDrive(); exitFollow(); resetView(); });
 
 $('road-visible').addEventListener('change', (e) => {
   if (state.roadnet) state.roadnet.group.visible = e.target.checked;
@@ -1077,6 +1077,7 @@ function updateTransitStatus() {
       : 'shared world: no twin server (run python -m tools.twin_server)',
       ns.server === 'ok' ? 'ok' : null);
   }
+  refreshNetAgentList();
 }
 
 $('buildings-visible').addEventListener('change', (e) => {
@@ -1173,7 +1174,7 @@ $('agent-pip-select').addEventListener('change', applyPiP);
 function resetView() {
   // Don't steal the camera from an active follow/drive — loaders call resetView()
   // as terrain/tiles stream in, which would otherwise yank you off the bus/agent.
-  if (busFollow.id || drive.agent) return;
+  if (follow.id != null || drive.agent) return;
   const box = new THREE.Box3();
   if (state.terrain.group.children.length && state.terrain.group.visible) {
     box.expandByObject(state.terrain.group);
@@ -1206,7 +1207,7 @@ const keys = new Set();
 window.addEventListener('keydown', (e) => {
   if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
   if (e.code === 'Escape' && drive.agent) { exitDrive(); return; } // release the driven agent
-  if (e.code === 'Escape' && busFollow.id) { exitBusFollow(); return; } // release the followed bus
+  if (e.code === 'Escape' && follow.id != null) { exitFollow(); return; } // release the followed target
   keys.add(e.code);
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
@@ -1250,7 +1251,7 @@ const _chasePos = new THREE.Vector3(), _chaseTgt = new THREE.Vector3();
 
 function enterDrive(agent) {
   if (!agent || !agent.alive) return;
-  if (busFollow.id) exitBusFollow();   // can't follow a bus and drive an agent at once
+  if (follow.id != null) exitFollow();   // can't follow and drive an agent at once
   if (drive.agent && drive.agent !== agent && drive.agent.alive && drive.agent.stop) {
     drive.agent.stop(); // don't leave the previously-driven agent rolling on its last input
   }
@@ -1340,65 +1341,72 @@ renderer.domElement.addEventListener('wheel', (e) => {
   if (drive.agent) {
     e.preventDefault();
     drive.distance = Math.max(3, Math.min(150, drive.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
-  } else if (busFollow.id) {
+  } else if (follow.id != null) {
     e.preventDefault();
-    busFollow.distance = Math.max(8, Math.min(220, busFollow.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+    follow.distance = Math.max(5, Math.min(220, follow.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
   }
 }, { passive: false });
 
-// ------------------------------------------------ bus follow (3rd person) ---
-// Click a bus (in the panel list or in the scene) to enter a chase view that
-// tracks it. Mirrors the agent drive chase cam, but the bus drives itself — we
-// only follow, reading its live position/heading from window.__twin.transit.
-const busFollow = { id: null, distance: 34 };
+// ----------------------------------------------- 3rd-person follow camera ---
+// Click a bus OR a shared-world agent (in a panel list or in the scene) to enter a
+// chase view that tracks it. Mirrors the agent drive chase cam, but the target
+// drives itself — we only follow, reading its live position/heading each frame.
+// `kind` is 'bus' (window.__twin.transit) or 'net' (the twin server, netagents.js).
+const follow = { kind: null, id: null, distance: 34 };
 const _bfPos = new THREE.Vector3(), _bfTgt = new THREE.Vector3();
 
-function enterBusFollow(id) {
-  if (!state.transit) return;
-  const v = state.transit.transit.getVehicle(id);
-  if (!v) return;
+function followTarget() {
+  if (!follow.kind || follow.id == null) return null;
+  if (follow.kind === 'bus') {
+    const v = state.transit && state.transit.transit.getVehicle(follow.id);
+    return v ? { position: v.position, heading: v.heading, label: 'bus ' + v.label } : null;
+  }
+  if (follow.kind === 'net') {
+    const a = state.netagents && state.netagents.get(follow.id);
+    return a ? { position: a.position, heading: a.heading, label: `${a.type} #${a.id}` } : null;
+  }
+  return null;
+}
+function enterFollow(kind, id, distance) {
+  follow.kind = kind; follow.id = String(id);
+  if (!followTarget()) { follow.kind = null; follow.id = null; return; }  // no such target
   if (drive.agent) exitDrive();          // release any agent drive first
-  busFollow.id = String(id);
+  follow.distance = distance || 34;
   controls.enabled = false;              // we own the camera while following
   keys.clear();
-  updateBusFollowCamera(0, true);        // snap behind the bus now
-  updateBusFollowHint();
-  refreshBusList();                      // highlight the followed row
+  updateFollowCamera(0, true);           // snap behind the target now
+  updateFollowHint();
+  refreshBusList(); refreshNetAgentList();
 }
-function exitBusFollow() {
-  const had = busFollow.id;
-  busFollow.id = null;
+function exitFollow() {
+  const t = followTarget();
+  follow.kind = null; follow.id = null;
   controls.enabled = true;
-  if (had && state.transit) {
-    const v = state.transit.transit.getVehicle(had);
-    if (v) controls.target.set(v.position[0], v.position[1], v.position[2]);
-  }
+  if (t) controls.target.set(t.position[0], t.position[1], t.position[2]);
   controls.update();
-  updateBusFollowHint();
-  refreshBusList();
+  updateFollowHint();
+  refreshBusList(); refreshNetAgentList();
 }
-function updateBusFollowCamera(dt, snap) {
-  if (!busFollow.id || !state.transit) return;
-  const v = state.transit.transit.getVehicle(busFollow.id);
-  if (!v) { exitBusFollow(); return; }   // bus left service / out of feed
-  const p = v.position, yaw = (v.heading || 0) * Math.PI / 180;
-  const fx = Math.cos(yaw), fz = -Math.sin(yaw);   // bus forward = (cos,0,-sin)
-  const d = busFollow.distance;
+function updateFollowCamera(dt, snap) {
+  const t = followTarget();
+  if (!t) { if (follow.id != null) exitFollow(); return; }   // target left the world
+  const p = t.position, yaw = (t.heading || 0) * Math.PI / 180;
+  const fx = Math.cos(yaw), fz = -Math.sin(yaw);             // forward = (cos,0,-sin)
+  const d = follow.distance;
   _bfPos.set(p[0] - fx * d, p[1] + d * 0.45, p[2] - fz * d);
-  if (_bfPos.y < p[1] + 4) _bfPos.y = p[1] + 4;    // keep the cam above the bus
+  if (_bfPos.y < p[1] + 4) _bfPos.y = p[1] + 4;              // keep the cam above it
   _bfTgt.set(p[0], p[1] + 3, p[2]);
   const k = snap ? 1 : 1 - Math.exp(-6 * dt);
   camera.position.lerp(_bfPos, k);
   controls.target.lerp(_bfTgt, k);
   camera.lookAt(controls.target);
 }
-function updateBusFollowHint() {
+function updateFollowHint() {
   const node = $('drive-hint');
   if (!node) return;
-  if (busFollow.id) {
-    const v = state.transit && state.transit.transit.getVehicle(busFollow.id);
-    node.innerHTML = `Following bus <b>${v ? v.label : busFollow.id}</b>` +
-      ` &middot; wheel = zoom &middot; <b>Esc</b> release`;
+  const t = followTarget();
+  if (follow.id != null && t) {
+    node.innerHTML = `Following <b>${t.label}</b> &middot; wheel = zoom &middot; <b>Esc</b> release`;
     node.classList.remove('hidden');
   } else if (!drive.agent) {
     node.classList.add('hidden');
@@ -1406,6 +1414,7 @@ function updateBusFollowHint() {
 }
 
 // Populate the live-bus list in the panel (called ~1 Hz from updateTransitStatus).
+let _busSig = '';
 function refreshBusList() {
   const node = $('transit-bus-list');
   if (!node) return;
@@ -1413,6 +1422,11 @@ function refreshBusList() {
   const buses = state.transit.transit.getVehicles().slice().sort((a, b) =>
     String(a.label).localeCompare(String(b.label), undefined, { numeric: true }) ||
     String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+  // only rebuild when the membership/labels/selection change (not every position tick)
+  const sig = buses.map((v) => `${v.id}:${v.label}:${v.occupancy || ''}`).join('|') +
+    '#' + (follow.kind === 'bus' ? follow.id : '');
+  if (sig === _busSig) return;
+  _busSig = sig;
   node.textContent = '';
   if (!buses.length) {
     const d = document.createElement('div');
@@ -1423,7 +1437,7 @@ function refreshBusList() {
   }
   for (const v of buses) {
     const row = document.createElement('div');
-    row.className = 'bus-row' + (String(v.id) === busFollow.id ? ' active' : '');
+    row.className = 'bus-row' + (follow.kind === 'bus' && String(v.id) === follow.id ? ' active' : '');
     const badge = document.createElement('span');
     badge.className = 'bus-badge';
     badge.style.background = v.route && v.route.color ? '#' + v.route.color : '#3b82c4';
@@ -1431,12 +1445,51 @@ function refreshBusList() {
     const info = document.createElement('span');
     info.textContent = '#' + v.id + (v.occupancy ? ' · ' + v.occupancy.replace(/_/g, ' ') : '');
     row.appendChild(badge); row.appendChild(info);
-    row.addEventListener('click', () => enterBusFollow(v.id));
+    row.addEventListener('click', () => enterFollow('bus', v.id));
     node.appendChild(row);
   }
 }
 
-// Click a bus in the 3D scene to follow it (distinguish a click from an orbit drag).
+// Populate the shared-world agent list (Shared world panel) — click a row to enter
+// a 3rd-person chase behind that agent. Refreshed ~1 Hz from updateTransitStatus.
+let _netSig = '';
+function refreshNetAgentList() {
+  const node = $('netagents-list');
+  if (!node) return;
+  if (!state.netagents) { node.textContent = '—'; return; }
+  const list = state.netagents.list();
+  // only rebuild when the membership/selection changes, so rows aren't detached
+  // from under a click every second (positions don't affect the list).
+  const sig = list.map((a) => `${a.id}:${a.type}:${a.owner}`).join('|') +
+    '#' + (follow.kind === 'net' ? follow.id : '');
+  if (sig === _netSig) return;
+  _netSig = sig;
+  node.textContent = '';
+  if (!list.length) {
+    const d = document.createElement('div');
+    d.className = 'hint'; d.style.margin = '2px 0';
+    d.textContent = 'no agents — spawn from a script (client/twin.py)';
+    node.appendChild(d);
+    return;
+  }
+  for (const a of list) {
+    const row = document.createElement('div');
+    row.className = 'bus-row' + (follow.kind === 'net' && String(a.id) === follow.id ? ' active' : '');
+    const badge = document.createElement('span');
+    badge.className = 'bus-badge';
+    badge.style.background = a.color != null
+      ? '#' + (a.color & 0xffffff).toString(16).padStart(6, '0') : '#4aa05a';
+    badge.textContent = a.type.slice(0, 4);
+    const info = document.createElement('span');
+    info.textContent = `#${a.id}` + (a.owner ? ' ' + a.owner : '');
+    row.appendChild(badge); row.appendChild(info);
+    row.addEventListener('click', () => enterFollow('net', a.id, 18));   // closer (agents are small)
+    node.appendChild(row);
+  }
+}
+
+// Click a bus or a shared-world agent in the 3D scene to follow it (distinguish a
+// click from an orbit drag).
 let _clickX = 0, _clickY = 0, _clickT = 0;
 renderer.domElement.addEventListener('pointerdown', (e) => {
   _clickX = e.clientX; _clickY = e.clientY; _clickT = performance.now();
@@ -1444,15 +1497,20 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 renderer.domElement.addEventListener('pointerup', (e) => {
   if (Math.hypot(e.clientX - _clickX, e.clientY - _clickY) > 6) return;  // was a drag
   if (performance.now() - _clickT > 500) return;                         // long press
-  if (!state.transit || !state.transit.layers.buses.children.length) return;
+  const targets = [];
+  if (state.transit) targets.push(...state.transit.layers.buses.children);
+  if (state.netagents) targets.push(...state.netagents.group.children);
+  if (!targets.length) return;
   mouseNdc.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouseNdc.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouseNdc, camera);
-  const hits = raycaster.intersectObjects(state.transit.layers.buses.children, true);
+  const hits = raycaster.intersectObjects(targets, true);
   if (!hits.length) return;
   let o = hits[0].object;
-  while (o && !(o.name && o.name.startsWith('bus-'))) o = o.parent;
-  if (o && o.name) enterBusFollow(o.name.slice(4));
+  while (o && !(o.name && (o.name.startsWith('bus-') || o.name.startsWith('net-')))) o = o.parent;
+  if (!o || !o.name) return;
+  if (o.name.startsWith('bus-')) enterFollow('bus', o.name.slice(4));
+  else enterFollow('net', o.name.slice(4), 18);
 });
 
 // -------------------------------------------------- cursor world readout ---
@@ -1518,8 +1576,8 @@ function animate() {
   if (drive.agent && !drive.agent.alive) exitDrive(); // driven agent was despawned
   if (drive.agent) {
     applyAgentDrive();          // WASD -> agent controls
-  } else if (busFollow.id) {
-    /* camera follows the bus (updateBusFollowCamera below); no free-fly / orbit */
+  } else if (follow.id != null) {
+    /* camera follows the target (updateFollowCamera below); no free-fly / orbit */
   } else {
     applyFly(dt);               // WASD -> free camera fly
     controls.update();          // (skip while chasing: updateChaseCamera owns the camera)
@@ -1531,7 +1589,7 @@ function animate() {
   if (state.roadnet && state.roadnet.signals) state.roadnet.signals.tick(dt);
   if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
   if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame
-  if (busFollow.id) updateBusFollowCamera(dt); // follow AFTER the bus moved this frame
+  if (follow.id != null) updateFollowCamera(dt); // follow AFTER the target moved this frame
   if (state.labels) state.labels.tick(camera); // distance-cull street labels (camera final)
   renderer.render(scene, camera);
 
@@ -1555,4 +1613,4 @@ animate();
 // debug hook (handy for screenshots / console poking; harmless in production)
 window.__viewer = { THREE, scene, camera, controls, state, resetView,
                     get agents() { return state.agents; },
-                    get busFollow() { return busFollow; } };
+                    get follow() { return follow; } };
