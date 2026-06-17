@@ -13,6 +13,7 @@ import { createRoadNetwork } from './roads.js';
 import { createAgentSystem } from './agents.js';
 import { createTransitSystem } from './transit.js';
 import { createCitySystem } from './city.js';
+import { createStreetLabels } from './labels.js';
 
 // ---------------------------------------------------------------- config ---
 
@@ -32,6 +33,8 @@ const state = {
   buildings: { tiles: [], group: null, loaded: 0, failed: 0, packed: null, boxes: null },
   roadnet: null,       // real road network + props from roads.json (roads.js)
   city: null,          // city-wide OSM ground plane + streets (city.js)
+  cityRoads: null,     // raw city.json roads (for street labels)
+  labels: null,        // street-name labels (labels.js)
   transit: null,       // live Lextran transit layer (transit.js)
   agents: null,        // autonomous-agent simulation layer (agents.js)
   helpers: null,
@@ -819,6 +822,7 @@ async function loadCity() {
     return 285;
   }
   state.city = createCitySystem(data, { scene });
+  state.cityRoads = data.roads || [];   // kept for street-name labels
   scene.add(state.city.group);
   onRealData();
   const s = state.city.stats;
@@ -875,6 +879,15 @@ async function loadRoads() {
   });
   scene.add(state.transit.group);
   startTransitStatusPolling();
+
+  // Street-name labels (campus streets + major city arterials), one per unique
+  // name, distance-culled each frame so only nearby ones draw.
+  state.labels = createStreetLabels(
+    { roads: data.roads || [], cityRoads: state.cityRoads || [], cityY: cityGroundY },
+    { far: 480, maxLabels: 220 });
+  const lblCb = $('labels-visible');
+  state.labels.group.visible = lblCb ? lblCb.checked : true;
+  scene.add(state.labels.group);
 
   // Autonomous-agent simulation layer (cars/trucks/robots/drones with camera,
   // position, collision-detection, and ground/surface sensors). Created
@@ -980,6 +993,14 @@ for (const key of ['roads', 'markings', 'crosswalks', 'trees', 'cars', 'signals'
   if (cb) cb.addEventListener('change', (e) => {
     if (state.roadnet) state.roadnet.layers[key].visible = e.target.checked;
   });
+}
+$('labels-visible')?.addEventListener('change', (e) => {
+  if (state.labels) state.labels.setVisible(e.target.checked);
+});
+
+// Collapsible panel sections — click a section's legend to fold/unfold it.
+for (const lg of document.querySelectorAll('#panel fieldset legend')) {
+  lg.addEventListener('click', () => lg.parentElement.classList.toggle('collapsed'));
 }
 
 // ------------------------------------------------------------------ city ---
@@ -1489,6 +1510,7 @@ function animate() {
   if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
   if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame
   if (busFollow.id) updateBusFollowCamera(dt); // follow AFTER the bus moved this frame
+  if (state.labels) state.labels.tick(camera); // distance-cull street labels (camera final)
   renderer.render(scene, camera);
 
   frames++;

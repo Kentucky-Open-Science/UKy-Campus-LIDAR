@@ -52,7 +52,19 @@ html, body {
   padding: 0 4px;
   font-weight: 600;
   color: #9fc2e8;
+  cursor: pointer;          /* click to collapse/expand the section */
 }
+#panel legend::before {
+  content: '▾';
+  display: inline-block;
+  width: 11px;
+  margin-right: 1px;
+  font-size: 9px;
+  color: #7d97b3;
+}
+#panel fieldset.collapsed legend::before { content: '▸'; }
+#panel fieldset.collapsed > *:not(legend) { display: none; }
+#panel fieldset.collapsed { padding-bottom: 3px; }
 
 .row {
   display: flex;

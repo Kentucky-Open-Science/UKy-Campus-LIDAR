@@ -30,7 +30,7 @@ import * as THREE from 'three';
 // ---- module-level scratch (no per-frame allocation; roads.js idiom) ----
 const D2R = Math.PI / 180;
 const BUS_LIFT = 0.35;          // wheels sit just above the road ribbon (LIFT 0.30)
-const ROUTE_LIFT = 1.2;         // float route lines above the asphalt
+const ROUTE_LIFT = 1.6;         // float route lines clear of the asphalt (draping differs slightly)
 const STOP_LIFT = 0.3;
 
 // bearing (deg CW from north) -> three yaw, where forward = (cos yaw, 0, -sin yaw).
@@ -182,12 +182,19 @@ export function createTransitSystem(deps = {}) {
     geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
     geo.setIndex(index);
     geo.computeBoundingSphere();
+    // Overlay semantics so the colours don't z-fight: many Lextran routes share a
+    // street, so their ribbons are coplanar. Drawing them as a transparent overlay
+    // (after the opaque road/terrain) with depthWrite OFF means coplanar routes no
+    // longer fight — the last one in the buffer wins crisply — and a polygon offset
+    // lets the ribbon win the depth test against the road surface it sits just above.
     const mat = new THREE.MeshBasicMaterial({
-      vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.85,
+      vertexColors: true, side: THREE.DoubleSide,
+      transparent: true, opacity: 0.95, depthWrite: false,
       polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4,
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.name = 'route-ribbons';
+    mesh.renderOrder = 2;   // after opaque geometry (roads / terrain / buildings)
     layers.routes.add(mesh);
   }
 
