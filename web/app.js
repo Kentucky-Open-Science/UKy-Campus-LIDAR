@@ -14,6 +14,7 @@ import { createAgentSystem } from './agents.js';
 import { createTransitSystem } from './transit.js';
 import { createCitySystem } from './city.js';
 import { createStreetLabels } from './labels.js';
+import { createNetAgents } from './netagents.js';
 
 // ---------------------------------------------------------------- config ---
 
@@ -35,6 +36,7 @@ const state = {
   city: null,          // city-wide OSM ground plane + streets (city.js)
   cityRoads: null,     // raw city.json roads (for street labels)
   labels: null,        // street-name labels (labels.js)
+  netagents: null,     // shared-world agents from the twin server (netagents.js)
   transit: null,       // live Lextran transit layer (transit.js)
   agents: null,        // autonomous-agent simulation layer (agents.js)
   helpers: null,
@@ -889,6 +891,14 @@ async function loadRoads() {
   state.labels.group.visible = lblCb ? lblCb.checked : true;
   scene.add(state.labels.group);
 
+  // Shared-world agents from the authoritative twin server (tools/twin_server.py):
+  // renders every agent in the shared world, including ones spawned by other clients'
+  // scripts. Backs off to nothing when the page isn't served by the twin server.
+  state.netagents = createNetAgents({ scene, base: '', pollMs: 120 });
+  const naCb = $('netagents-visible');
+  state.netagents.group.visible = naCb ? naCb.checked : true;
+  scene.add(state.netagents.group);
+
   // Autonomous-agent simulation layer (cars/trucks/robots/drones with camera,
   // position, collision-detection, and ground/surface sensors). Created
   // unconditionally — it works with or without signals.json. Terrain/buildings
@@ -997,6 +1007,9 @@ for (const key of ['roads', 'markings', 'crosswalks', 'trees', 'cars', 'signals'
 $('labels-visible')?.addEventListener('change', (e) => {
   if (state.labels) state.labels.setVisible(e.target.checked);
 });
+$('netagents-visible')?.addEventListener('change', (e) => {
+  if (state.netagents) state.netagents.setVisible(e.target.checked);
+});
 
 // Collapsible panel sections — click a section's legend to fold/unfold it.
 for (const lg of document.querySelectorAll('#panel fieldset legend')) {
@@ -1056,6 +1069,14 @@ function updateTransitStatus() {
     }
   }
   refreshBusList();
+  const naNode = $('netagents-status');
+  if (naNode && state.netagents) {
+    const ns = state.netagents.status();
+    setStatus(naNode, ns.server === 'ok'
+      ? `shared world: ${ns.count} agent(s) live`
+      : 'shared world: no twin server (run python -m tools.twin_server)',
+      ns.server === 'ok' ? 'ok' : null);
+  }
 }
 
 $('buildings-visible').addEventListener('change', (e) => {
@@ -1506,6 +1527,7 @@ function animate() {
   updateCursorReadout();
   // transit first so its interpolated bus positions are fresh when agents sense them
   if (state.transit) state.transit.transit.tick(dt);
+  if (state.netagents) state.netagents.tick(dt); // interpolate shared-world agents
   if (state.roadnet && state.roadnet.signals) state.roadnet.signals.tick(dt);
   if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
   if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame

@@ -40,6 +40,7 @@ CAMPUS/
 │   ├── osm_city.py           # OpenStreetMap → city-wide streets + ground plane (city.json)
 │   ├── lextran_gtfs.py       # Lextran static GTFS → routes + stops (transit.json)
 │   ├── serve.py              # static server + live GTFS-Realtime proxy (/api/transit/*)
+│   ├── twin_server.py        # authoritative shared-world server + agent API (/api/world/*)
 │   ├── pack_buildings.py     # merge 3,109 building meshes → one buffer (fast load)
 │   ├── transit_common.py     # shared lon/lat → scene projection (georef)
 │   ├── extract_roads.py      # aerial-texture road detector (alt. road source)
@@ -55,7 +56,8 @@ CAMPUS/
 │   ├── roads.js              # road ribbons + signals/crosswalks + live signal controller
 │   ├── city.js               # city-wide OSM ground plane + streets (city.json)
 │   ├── transit.js            # live Lextran buses + routes/stops/arrivals/alerts
-│   ├── agents.js             # autonomous agents (car/truck/robot/drone) + sensors
+│   ├── agents.js             # autonomous agents (car/truck/robot/drone) + sensors (local)
+│   ├── netagents.js          # renders the twin_server shared world (agents from any client)
 │   ├── style.css
 │   ├── lib/                  # Vendored Three.js 0.160 + OrbitControls
 │   └── data/                 # Generated extraction output
@@ -69,6 +71,8 @@ CAMPUS/
 │       ├── signals.json      # machine-readable signal model (autonomous agents)
 │       ├── city.json         # city-wide OSM streets + ground plane
 │       └── transit.json      # Lextran routes + stops (live buses via tools/serve.py)
+├── client/                  # twin.py — dependency-free Python client for the world API
+├── examples/                # drone_demo.py — spawn/fly/collide via the twin server
 └── extracted/                # Per-domain manifests + reports
 ```
 
@@ -150,3 +154,46 @@ agent can yield to or wait for a real campus bus. Because the network spans far 
 the campus tiles, `tools/osm_city.py` lays down the rest of Lexington (OSM streets +
 a ground plane) so every route has ground beneath it. Smoke-test the live layer with
 `python tools/verify_transit.py`.
+
+## Multiplayer twin server — shared world over an API
+
+`window.__twin.agents` is private to one browser tab. For a **shared** world — where
+the twin runs on its own server and many scripts/users drive agents that everyone
+sees — run the authoritative server:
+
+```sh
+python -m tools.twin_server        # serves the viewer + the world API on :8000
+```
+
+It holds every agent in one place, ticks the physics (the same ackermann / differential
+/ holonomic-drone kinematics as `agents.js`, with ground from the terrain heightmap and
+collisions from the baked building AABBs), and exposes a small REST API. Agents spawned
+by ANY client are visible to ALL of them — other scripts and any browser open on the
+server (`web/netagents.js` renders the shared world in the **Shared world (server)**
+panel section).
+
+Drive it from Python with the dependency-free client (`client/twin.py`):
+
+```python
+from twin import Twin
+twin  = Twin("http://twin-host:8000", owner="alice")
+drone = twin.spawn("drone", position=[0, None, 0])
+drone.set_controls(move=[5, 1, 0])          # fly +X and climb
+print(drone.state()["position"], drone.collisions())
+for other in twin.agents():                 # every agent in the shared world
+    print(other["owner"], other["type"], other["position"])
+drone.stop(); drone.despawn()
+```
+
+The REST surface (all JSON, CORS-open): `GET /api/world/state` (everyone's agents),
+`GET /api/world/agents/<id>`, `POST /api/world/spawn`, `POST /api/world/agents/<id>/{controls,driveTo,stop}`,
+`DELETE /api/world/agents/<id>`, plus `GET /api/world/{meta,nearest_building}`.
+
+A runnable example — spawn a drone, fly a circuit, fly into a building until the
+collision sensor fires, then stop — is in `examples/drone_demo.py`:
+
+```sh
+python -m tools.twin_server &                 # the twin
+python examples/drone_demo.py --url http://localhost:8000   # a client script
+# open http://localhost:8000/ in a browser to watch it in 3-D
+```
