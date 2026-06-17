@@ -130,5 +130,19 @@ export function createNetAgents(deps = {}) {
     status: () => ({ ...status }),
     get count() { return agents.size; },
     stop() { stopped = true; clearTimeout(pollTimer); },
+    // shared-world agents for the panel list + follow camera
+    list() {
+      return [...agents.values()].map((o) => ({
+        id: o.data.id, type: o.data.type, owner: o.data.owner, color: o.data.color,
+        position: [o.object.position.x, o.object.position.y, o.object.position.z],
+      })).sort((a, b) => a.id - b.id);
+    },
+    get(id) {
+      const o = agents.get(Number(id)) || agents.get(id);
+      if (!o) return null;
+      const p = o.object.position;
+      return { id: o.data.id, type: o.data.type, owner: o.data.owner,
+               position: [p.x, p.y, p.z], heading: ((o.yaw * 180 / Math.PI) % 360 + 360) % 360 };
+    },
   };
 }

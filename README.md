@@ -165,6 +165,18 @@ sees — run the authoritative server:
 python -m tools.twin_server        # serves the viewer + the world API on :8000
 ```
 
+Run it **as a module from the repo root** (`python -m tools.twin_server`), not
+`python tools/twin_server.py` — it imports the `tools` package, and running it as a
+loose file breaks that import. It serves the viewer *and* the API on the same port.
+
+> **`404 File not found` on `/api/world/...`?** Something else is answering on `:8000`
+> — usually a plain `python -m http.server` or `tools/serve.py` (the transit/bus
+> server) left running. Those serve the viewer's files but have no world API. Stop it
+> and run `tools/twin_server` instead. They're different servers: `twin_server` has the
+> **world** API (`/api/world/*`), `serve.py` has the **transit** proxy (`/api/transit/*`);
+> they can't share a port. To run both, put the twin on another port:
+> `python -m tools.twin_server --port 8001` and point clients/browser at `:8001`.
+
 It holds every agent in one place, ticks the physics (the same ackermann / differential
 / holonomic-drone kinematics as `agents.js`, with ground from the terrain heightmap and
 collisions from the baked building AABBs), and exposes a small REST API. Agents spawned

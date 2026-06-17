@@ -189,6 +189,10 @@ def main():
         # --- drive mode: UI spawn -> third-person chase cam + WASD on the agent ---
         drive = {"ok": True, "notes": []}
         try:
+            # panel sections start collapsed; expand "Agents" so its button is clickable
+            page.evaluate("() => { for (const f of document.querySelectorAll('#panel fieldset')) "
+                          "{ if (f.querySelector('legend') && f.querySelector('legend').textContent.trim()"
+                          ".startsWith('Agents')) f.classList.remove('collapsed'); } }")
             page.click("#agent-spawn")           # spawns a car and enters drive mode
             page.wait_for_timeout(300)
             before = page.evaluate(
