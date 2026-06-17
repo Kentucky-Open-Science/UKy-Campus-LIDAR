@@ -28,9 +28,6 @@
 import * as THREE from 'three';
 
 // ---- module-level scratch (no per-frame allocation; roads.js idiom) ----
-const _ray = new THREE.Raycaster();
-const _down = Object.freeze(new THREE.Vector3(0, -1, 0));
-const _o = new THREE.Vector3();
 const D2R = Math.PI / 180;
 const BUS_LIFT = 0.35;          // wheels sit just above the road ribbon (LIFT 0.30)
 const ROUTE_LIFT = 1.2;         // float route lines above the asphalt
@@ -85,22 +82,50 @@ export function createTransitSystem(deps = {}) {
   const stopPoleMat = new THREE.MeshStandardMaterial({ color: 0x9aa3ad, roughness: 0.6, metalness: 0.5 });
   const stopSignMat = new THREE.MeshStandardMaterial({ color: 0x1f6fb2, roughness: 0.6, emissive: 0x0a2030, emissiveIntensity: 0.4 });
 
-  // candidate meshes for the downward ground ray (road ribbons win over terrain)
-  function groundCandidates() {
-    const out = [];
-    const rr = groups.roadRibbons && groups.roadRibbons();
-    if (rr) out.push(rr);
-    if (groups.terrain) out.push(groups.terrain);
-    return out;
+  // Terrain elevation under (x,z) via a coarse heightmap built ONCE from the terrain
+  // geometry — an O(1) grid lookup instead of a per-frame raycast against ~200k-tri
+  // tiles (which cost ~9 ms each; dozens of buses × every frame was the framerate
+  // killer). Returns null off the campus footprint, where buses ride the flat city
+  // plane. Rebuilt only when the terrain tile count changes (they stream in).
+  const CELL = 8;                                   // heightmap cell size (m)
+  let _hm = null, _hmTiles = -1;
+  function heightmap() {
+    const terr = groups.terrain;
+    const n = terr ? terr.children.length : 0;
+    if (n === _hmTiles) return _hm;                 // unchanged -> reuse (O(1))
+    _hmTiles = n;
+    if (!n) { _hm = null; return null; }
+    let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+    for (const m of terr.children) {
+      const bb = m.geometry && m.geometry.boundingBox;
+      if (!bb) continue;
+      minX = Math.min(minX, bb.min.x); minZ = Math.min(minZ, bb.min.z);
+      maxX = Math.max(maxX, bb.max.x); maxZ = Math.max(maxZ, bb.max.z);
+    }
+    if (!isFinite(minX)) { _hm = null; return null; }
+    const cols = Math.ceil((maxX - minX) / CELL) + 1, rows = Math.ceil((maxZ - minZ) / CELL) + 1;
+    const y = new Float32Array(cols * rows).fill(NaN);   // max terrain y per cell
+    for (const m of terr.children) {
+      const pos = m.geometry && m.geometry.getAttribute('position');
+      if (!pos) continue;
+      const a = pos.array;
+      for (let i = 0; i < a.length; i += 3) {
+        const cx = ((a[i] - minX) / CELL) | 0, cz = ((a[i + 2] - minZ) / CELL) | 0;
+        if (cx < 0 || cz < 0 || cx >= cols || cz >= rows) continue;
+        const idx = cz * cols + cx;
+        if (Number.isNaN(y[idx]) || a[i + 1] > y[idx]) y[idx] = a[i + 1];
+      }
+    }
+    _hm = { minX, minZ, cols, rows, y };
+    return _hm;
   }
-  // topmost surface (road ribbon or terrain) under (x,z); null if off the campus
-  // footprint (the agency runs all over Lexington — buses outside our tiles hide).
   function groundY(x, z) {
-    const cands = groundCandidates();
-    if (!cands.length) return null;
-    _ray.set(_o.set(x, 800, z), _down); _ray.far = 4000;
-    const hits = _ray.intersectObjects(cands, true);
-    return hits.length ? hits[0].point.y : null;
+    const hm = heightmap();
+    if (!hm) return null;
+    const cx = ((x - hm.minX) / CELL) | 0, cz = ((z - hm.minZ) / CELL) | 0;
+    if (cx < 0 || cz < 0 || cx >= hm.cols || cz >= hm.rows) return null;
+    const v = hm.y[cz * hm.cols + cx];
+    return Number.isNaN(v) ? null : v;
   }
 
   // ---------------------------------------------------------- static load ---
@@ -198,16 +223,30 @@ export function createTransitSystem(deps = {}) {
     return v.routeId || '?';
   }
 
+  // Sprite materials are shared per (label,colour): buses on the same route reuse
+  // one canvas texture + material instead of one each. Cached for the session, so
+  // retiring a bus must NOT dispose them.
+  const _spriteMat = new Map();
+  function spriteMaterial(text, color) {
+    const label = String(text).slice(0, 4);
+    const key = label + '|' + color.getHexString();
+    let mat = _spriteMat.get(key);
+    if (!mat) {
+      const c = document.createElement('canvas'); c.width = 128; c.height = 64;
+      const g = c.getContext('2d');
+      g.fillStyle = '#' + color.getHexString(); g.strokeStyle = 'rgba(0,0,0,0.55)'; g.lineWidth = 6;
+      roundRect(g, 8, 8, 112, 48, 12); g.fill(); g.stroke();
+      g.fillStyle = '#ffffff'; g.font = 'bold 38px system-ui, sans-serif';
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(label, 64, 33);
+      const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4;
+      mat = new THREE.SpriteMaterial({ map: tex, depthTest: true });
+      _spriteMat.set(key, mat);
+    }
+    return mat;
+  }
   function makeSprite(text, color) {
-    const c = document.createElement('canvas'); c.width = 128; c.height = 64;
-    const g = c.getContext('2d');
-    g.fillStyle = '#' + color.getHexString(); g.strokeStyle = 'rgba(0,0,0,0.55)'; g.lineWidth = 6;
-    roundRect(g, 8, 8, 112, 48, 12); g.fill(); g.stroke();
-    g.fillStyle = '#ffffff'; g.font = 'bold 38px system-ui, sans-serif';
-    g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillText(String(text).slice(0, 4), 64, 33);
-    const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4;
-    const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: true }));
+    const spr = new THREE.Sprite(spriteMaterial(text, color));
     spr.scale.set(7, 3.5, 1);
     return spr;
   }
@@ -246,7 +285,7 @@ export function createTransitSystem(deps = {}) {
     if (lbl !== bus.label) {                 // route changed -> recolour + relabel
       bus.label = lbl; const col = busColor(v);
       bus.bodyMat.color.copy(col);
-      bus.object.remove(bus.sprite); bus.sprite.material.map.dispose(); bus.sprite.material.dispose();
+      bus.object.remove(bus.sprite);          // sprite materials are shared/cached — don't dispose
       bus.sprite = makeSprite(lbl, col); bus.sprite.position.set(0, 5.2, 0); bus.object.add(bus.sprite);
     }
   }
@@ -264,7 +303,7 @@ export function createTransitSystem(deps = {}) {
     for (const [id, bus] of buses) {
       if (!seen.has(id) && now - bus.lastSeen > Math.max(20000, pollMs * 3)) {
         layers.buses.remove(bus.object);
-        bus.bodyMat.dispose(); bus.sprite.material.map.dispose(); bus.sprite.material.dispose();
+        bus.bodyMat.dispose();                 // sprite material is shared/cached — leave it
         buses.delete(id);
       }
     }
@@ -320,11 +359,9 @@ export function createTransitSystem(deps = {}) {
     for (const bus of buses.values()) {
       bus.cur.x += (bus.tgt.x - bus.cur.x) * k;
       bus.cur.z += (bus.tgt.z - bus.cur.z) * k;
-      // Buses stay visible everywhere — the agency runs all over Lexington, so a
-      // bus can sit beyond our terrain tiles. Drape on the campus surface when we
-      // have one under it; otherwise ride at its last known elevation (or the
-      // campus reference), so off-footprint buses float at street level rather
-      // than dropping to y=0.
+      // O(1) heightmap lookup -> drape every frame for free. Off-campus buses (no
+      // terrain under them) ride the flat city plane / their last known elevation,
+      // so they stay visible at street level instead of dropping to y=0.
       const gy = groundY(bus.cur.x, bus.cur.z);
       if (gy != null) { bus.lastGroundY = gy; refGroundY = gy; }
       const y = (gy != null ? gy : (bus.lastGroundY != null ? bus.lastGroundY : refGroundY)) + BUS_LIFT;

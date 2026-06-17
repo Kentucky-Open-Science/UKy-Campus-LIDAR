@@ -258,9 +258,12 @@ async function loadManifest() {
     if (total > 0) {
       const slider = $('point-budget');
       slider.max = Math.max(1, Math.ceil(total / 1e6));
-      slider.value = slider.max;  // show all points by default
-      $('point-budget-val').textContent = parseFloat(slider.max).toFixed(1);
-      state.lidar.budget = total;
+      // Default to a lighter budget for framerate (the full ~12M point cloud is
+      // brutal on integrated GPUs); the slider still reaches the full cloud.
+      const defM = Math.min(slider.max, 5);
+      slider.value = defM;
+      $('point-budget-val').textContent = defM.toFixed(1);
+      state.lidar.budget = defM * 1e6;
     }
     lidarPump();
   } else {
