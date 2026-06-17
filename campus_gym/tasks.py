@@ -18,8 +18,9 @@ import os
 
 import gymnasium as gym
 
-from tools.twin_server import World, DATA
-from .env import CampusEnv, GOAL_RADIUS, build_observation, free_point
+from tools.twin_server import DATA
+from tools.roadnet import shared_graph
+from .env import CampusEnv, build_observation, free_point
 
 _TEMPLATES = ["drive to {name}", "navigate to {name}", "go to {name}", "head over to {name}"]
 
@@ -110,7 +111,7 @@ class CampusNavEnv(CampusEnv):
         self.goal_name = place["name"]
         self.instruction = self._goals.instruction(place, self.np_random)
         self.region = (gx, gz, self.spawn_radius)
-        self.world = World(ground=self.ground, buildings=self.buildings)
+        self.world = self._make_world()
         for _ in range(12):
             sx, sz = free_point(self.world, self.np_random, self.region, min_from=(gx, gz, 40.0))
             heading = float(self.np_random.uniform(0, 360))
@@ -123,4 +124,6 @@ class CampusNavEnv(CampusEnv):
         self.goal = (gx, gz)
         self._prev_d = math.hypot(gx - self.agent.x, gz - self.agent.z)
         self._begin_episode()
+        # SPL optimal = shortest navigable route over the road graph (not straight line)
+        _, self._opt_dist = shared_graph().route((self.agent.x, self.agent.z), (gx, gz))
         return build_observation(self.agent, self.world, self.goal), self._info()

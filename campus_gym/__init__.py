@@ -37,3 +37,8 @@ for _t in ("car", "truck", "robot", "drone"):
              max_episode_steps=1000, kwargs={"agent_type": _t})
     register(id=f"CampusNav{_t.capitalize()}-v0", entry_point="campus_gym.tasks:CampusNavEnv",
              max_episode_steps=1500, kwargs={"agent_type": _t})
+# traffic variants: NPC cars on the real roads + deterministic signals to sense/yield to
+register(id="CampusTraffic-v0", entry_point="campus_gym.env:CampusEnv", max_episode_steps=1500,
+         kwargs={"agent_type": "car", "npc_traffic": 12, "signals": True})
+register(id="CampusNavTraffic-v0", entry_point="campus_gym.tasks:CampusNavEnv", max_episode_steps=1500,
+         kwargs={"agent_type": "car", "npc_traffic": 12})
