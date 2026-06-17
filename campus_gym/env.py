@@ -102,31 +102,45 @@ def build_observation(agent, world, goal):
                      odx, odz, odist, gdx, gdz, gdist], dtype=np.float32)
 
 
-def reward_done(agent, goal, prev_goal_dist, steps, max_steps):
-    """Return (reward, terminated, truncated, new_goal_dist, info)."""
+# default reward as named, weighted terms (override per-env with reward_weights=...)
+DEFAULT_REWARD = {
+    "progress": 1.0,      # per metre of progress toward the goal
+    "goal_bonus": 10.0,   # one-off on reaching the goal (terminal)
+    "collision": -5.0,    # on hitting a building (terminal)
+    "offmap": -5.0,       # on leaving the map (terminal)
+    "time": -0.01,        # per step
+    "speed": 0.05,        # per m/s (only used when there is no goal)
+}
+
+
+def reward_done(agent, goal, prev_goal_dist, steps, max_steps, weights=None,
+                goal_radius=GOAL_RADIUS):
+    """Return (reward, terminated, truncated, new_goal_dist, info). The reward is a
+    sum of named terms (info['reward_terms']) so shaping is transparent + ablatable."""
+    w = DEFAULT_REWARD if weights is None else {**DEFAULT_REWARD, **weights}
     crashed = any(c["with"] == "building" for c in agent.contacts)
     offmap = agent.surface == "none"
-    reward = -0.01                       # small per-step time cost
-    terminated = False
-    reached = False
+    reached = terminated = False
     new_d = prev_goal_dist
+    terms = {"time": w["time"]}
 
     if goal is not None:
         new_d = math.hypot(goal[0] - agent.x, goal[1] - agent.z)
-        reward += (prev_goal_dist - new_d)            # progress toward the goal
-        if new_d < GOAL_RADIUS:
-            reward += 10.0; terminated = True; reached = True
+        terms["progress"] = w["progress"] * (prev_goal_dist - new_d)
+        if new_d < goal_radius:
+            terms["goal_bonus"] = w["goal_bonus"]; terminated = reached = True
     else:
-        reward += 0.05 * agent.speed                  # no goal: just encourage motion
+        terms["speed"] = w["speed"] * agent.speed
 
     if crashed:
-        reward -= 5.0; terminated = True
+        terms["collision"] = w["collision"]; terminated = True
     if offmap:
-        reward -= 5.0; terminated = True
+        terms["offmap"] = w["offmap"]; terminated = True
 
+    reward = float(sum(terms.values()))
     truncated = (steps >= max_steps) and not terminated
-    return reward, terminated, truncated, new_d, \
-        {"reached_goal": reached, "crashed": crashed, "offmap": offmap}
+    return reward, terminated, truncated, new_d, {
+        "reached_goal": reached, "crashed": crashed, "offmap": offmap, "reward_terms": terms}
 
 
 def _inside_building(world, x, z, margin=3.0):
@@ -156,7 +170,8 @@ class CampusEnv(gym.Env):
     metadata = {"render_modes": [], "render_fps": 50}
 
     def __init__(self, agent_type="car", max_episode_steps=1000, dt=None,
-                 region=(0.0, 0.0, 200.0), goal=True, render_mode=None):
+                 region=(0.0, 0.0, 200.0), goal=True, reward_weights=None,
+                 goal_radius=GOAL_RADIUS, render_mode=None):
         super().__init__()
         if agent_type not in DEFS:
             raise ValueError(f"unknown agent_type '{agent_type}'; valid: {', '.join(DEFS)}")
@@ -165,13 +180,17 @@ class CampusEnv(gym.Env):
         self.dt = dt if dt else 1.0 / 50
         self.region = region
         self.use_goal = goal
+        self.reward_weights = reward_weights
+        self.goal_radius = goal_radius
         self.render_mode = render_mode
         self.ground, self.buildings = shared_world_data()
         self.observation_space = obs_space()
         self.action_space = action_space(agent_type)
         self.world = self.agent = self.goal = None
+        self.instruction = self.goal_name = None      # set by the named-goal subclass
         self._steps = 0
-        self._prev_d = 0.0
+        self._prev_d = self._opt_dist = self._path_len = 0.0
+        self._last_xz = (0.0, 0.0)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)          # seeds self.np_random
@@ -193,15 +212,25 @@ class CampusEnv(gym.Env):
                                 min_from=(self.agent.x, self.agent.z, 60.0))
             self.goal = (gx, gz)
             self._prev_d = math.hypot(gx - self.agent.x, gz - self.agent.z)
-        self._steps = 0
+        self._begin_episode()
         return build_observation(self.agent, self.world, self.goal), self._info()
+
+    def _begin_episode(self):
+        """Reset the per-episode bookkeeping (path length, optimal distance for SPL)."""
+        self._steps = 0
+        self._opt_dist = self._prev_d
+        self._path_len = 0.0
+        self._last_xz = (self.agent.x, self.agent.z)
 
     def step(self, action):
         apply_action(self.agent, action)
         self.world.tick(self.dt)
         self._steps += 1
+        self._path_len += math.hypot(self.agent.x - self._last_xz[0], self.agent.z - self._last_xz[1])
+        self._last_xz = (self.agent.x, self.agent.z)
         reward, terminated, truncated, new_d, einfo = reward_done(
-            self.agent, self.goal, self._prev_d, self._steps, self.max_episode_steps)
+            self.agent, self.goal, self._prev_d, self._steps, self.max_episode_steps,
+            weights=self.reward_weights, goal_radius=self.goal_radius)
         self._prev_d = new_d
         info = self._info(); info.update(einfo)
         return build_observation(self.agent, self.world, self.goal), reward, terminated, truncated, info
@@ -209,7 +238,9 @@ class CampusEnv(gym.Env):
     def _info(self):
         return {"position": [round(self.agent.x, 2), round(self.agent.y, 2), round(self.agent.z, 2)],
                 "goal": self.goal, "steps": self._steps,
-                "goal_dist": round(self._prev_d, 2) if self.goal else None}
+                "goal_dist": round(self._prev_d, 2) if self.goal else None,
+                "path_len": round(self._path_len, 2), "optimal_dist": round(self._opt_dist, 2),
+                "instruction": self.instruction, "goal_name": self.goal_name}
 
     def render(self):
         # headless by design; first-person pixels are available from the live server

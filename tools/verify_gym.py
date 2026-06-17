@@ -107,6 +107,49 @@ def main():
     check(steps > 0, f"parallel rollout ran {steps} steps, {len(penv.agents)} agents still active")
     penv.close()
 
+    print("=== Tier 1: vectorization (SyncVectorEnv) ===")
+    try:
+        from gymnasium.vector import SyncVectorEnv
+        venv = SyncVectorEnv([lambda: gym.make("Campus-v0") for _ in range(3)])
+        o, _ = venv.reset(seed=0)
+        o, r, term, trunc, vinfo = venv.step(venv.action_space.sample())
+        check(o.shape[0] == 3 and r.shape[0] == 3, f"SyncVectorEnv(3): batched obs {o.shape}, reward {r.shape}")
+        venv.close()
+    except Exception as e:  # noqa: BLE001
+        check(False, f"vectorization failed: {e}")
+
+    print("=== Tier 3: named / language-conditioned goals ===")
+    from campus_gym import CampusNavEnv
+    nav = CampusNavEnv("car", max_episode_steps=400)
+    o1, i1 = nav.reset(seed=4)
+    check(bool(i1.get("instruction")) and bool(i1.get("goal_name")),
+          f"named goal -> instruction {i1.get('instruction')!r}")
+    check("reward_terms" in nav.step(nav.action_space.sample())[4], "step info has per-term reward breakdown")
+    o2, i2 = CampusNavEnv("car").reset(seed=4)
+    check(i1["instruction"] == i2["instruction"] and np.allclose(o1, o2),
+          "named-goal determinism: same seed -> same instruction + obs")
+    nav.close()
+
+    print("=== Tier 2/3: eval harness + SPL ===")
+    from campus_gym.eval import evaluate, greedy_goal_policy
+    e = CampusNavEnv("car", max_episode_steps=600)
+    agg, rows = evaluate(e, greedy_goal_policy(e), episodes=8)
+    check(0.0 <= agg["spl"] <= 1.0 and 0.0 <= agg["success_rate"] <= 1.0 and len(rows) == 8,
+          f"eval(8 eps): success={agg['success_rate']:.2f} spl={agg['spl']:.2f} "
+          f"collisions={agg['collision_rate']:.2f} return={agg['mean_return']:.1f}")
+    e.close()
+
+    print("=== Tier 3: record + deterministic replay ===")
+    import tempfile
+    from campus_gym.record import record_episode, replay
+    e = CampusNavEnv("car", max_episode_steps=300)
+    path = os.path.join(tempfile.gettempdir(), "campus_ep.jsonl")
+    meta = record_episode(e, greedy_goal_policy(e), seed=2, path=path)
+    rep = replay(e, path)
+    check(rep["ok"] and rep["mismatches"] == 0,
+          f"recorded {meta['steps']} steps; deterministic replay ok (mismatches={rep['mismatches']})")
+    e.close()
+
     print("\n".join("  " + n for n in notes))
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

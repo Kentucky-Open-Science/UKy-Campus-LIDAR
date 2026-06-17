@@ -21,7 +21,8 @@ class CampusParallelEnv(ParallelEnv):
     metadata = {"name": "campus_parallel_v0", "render_modes": []}
 
     def __init__(self, agent_types=("car", "car", "drone"), max_episode_steps=1000,
-                 dt=None, region=(0.0, 0.0, 200.0), goal=True, render_mode=None):
+                 dt=None, region=(0.0, 0.0, 200.0), goal=True, reward_weights=None,
+                 render_mode=None):
         for t in agent_types:
             if t not in DEFS:
                 raise ValueError(f"unknown agent_type '{t}'; valid: {', '.join(DEFS)}")
@@ -32,6 +33,7 @@ class CampusParallelEnv(ParallelEnv):
         self.dt = dt if dt else 1.0 / 50
         self.region = region
         self.use_goal = goal
+        self.reward_weights = reward_weights
         self.render_mode = render_mode
         self.ground, self.buildings = shared_world_data()
         self._np = None
@@ -95,7 +97,8 @@ class CampusParallelEnv(ParallelEnv):
         for name in self.agents:
             a = self._handle[name]
             r, term, trunc, new_d, einfo = reward_done(
-                a, self._goal[name], self._prev[name], self._steps, self.max_episode_steps)
+                a, self._goal[name], self._prev[name], self._steps, self.max_episode_steps,
+                weights=self.reward_weights)
             self._prev[name] = new_d
             obs[name] = build_observation(a, self.world, self._goal[name])
             rewards[name], terms[name], truncs[name], infos[name] = r, term, trunc, einfo
