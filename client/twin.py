@@ -137,3 +137,27 @@ class Agent:
 
     def despawn(self):
         return self.twin.despawn(self.id)
+
+    # ---- first-person camera (server started with --render) ----
+    def camera(self, w=320, h=240):
+        """First-person JPEG frame as bytes. Needs the server started with --render."""
+        url = f"{self.twin.base}/api/world/agents/{self.id}/camera?w={int(w)}&h={int(h)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "twin-client"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.twin.timeout) as r:
+                data = r.read()
+                if (r.headers.get("Content-Type") or "").startswith("image"):
+                    return data
+                raise TwinError(json.loads(data).get("error", "camera error"))
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read()).get("error", str(e))
+            except Exception:
+                msg = str(e)
+            raise TwinError(f"camera: {msg}") from None
+
+    def camera_image(self, w=320, h=240):
+        """First-person frame as a PIL.Image (RGB) — handy to feed a vision model."""
+        from io import BytesIO
+        from PIL import Image
+        return Image.open(BytesIO(self.camera(w, h))).convert("RGB")

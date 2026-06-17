@@ -1,0 +1,4 @@
+# Extra deps for the vision examples (car_demo / truck_demo / robot_demo).
+# The core client (client/twin.py) and drone_demo need nothing beyond the stdlib.
+ultralytics>=8.0     # smallest model is yolov8n (~6 MB, auto-downloads); pulls in torch (CPU is fine)
+pillow>=10.0         # decode the JPEG camera frames (already a project dep)

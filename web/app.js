@@ -1614,3 +1614,66 @@ animate();
 window.__viewer = { THREE, scene, camera, controls, state, resetView,
                     get agents() { return state.agents; },
                     get follow() { return follow; } };
+
+// ---------------------------------------------- first-person POV rendering ---
+// Render an agent's first-person view of the shared scene to a JPEG data URL. The
+// twin server (tools/twin_server.py --render) drives a headless browser and calls
+// this for /api/world/agents/<id>/camera, so scripts get a real FPV video feed (for
+// a vision model). The server passes the camera's exact eye position + look
+// direction (computed from the authoritative pose); we hide that agent's own mesh
+// so it doesn't photograph itself, render the whole scene, and read back pixels.
+const _povCam = new THREE.PerspectiveCamera(72, 4 / 3, 0.3, 8000);
+let _povRT = null, _povCanvas = null, _povCtx = null, _povBuf = null;
+const _prevClear = new THREE.Color();
+window.__renderPOV = function (id, ex, ey, ez, fx, fy, fz, w, h) {
+  w = Math.max(16, Math.min(1024, w | 0 || 320));
+  h = Math.max(16, Math.min(1024, h | 0 || 240));
+  if (!_povRT || _povRT.width !== w || _povRT.height !== h) {
+    if (_povRT) _povRT.dispose();
+    _povRT = new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: true });
+  }
+  _povCam.aspect = w / h; _povCam.updateProjectionMatrix();
+  _povCam.position.set(ex, ey, ez);
+  _povCam.lookAt(ex + fx, ey + fy, ez + fz);
+
+  // hide the rendering agent's own body, the street-name labels, and every floating
+  // agent label sprite — all of which would billboard into the frame as clutter
+  // (and confuse a vision model). Bodies of OTHER agents stay visible.
+  const own = state.netagents && state.netagents.group.getObjectByName('net-' + id);
+  const ownVis = own ? own.visible : false; if (own) own.visible = false;
+  const labelsVis = state.labels ? state.labels.group.visible : false;
+  if (state.labels) state.labels.group.visible = false;
+  const hiddenSprites = [];
+  if (state.netagents) state.netagents.group.traverse((o) => {
+    if (o.isSprite && o.visible) { o.visible = false; hiddenSprites.push(o); }
+  });
+
+  const prevRT = renderer.getRenderTarget();
+  renderer.getClearColor(_prevClear); const prevAlpha = renderer.getClearAlpha();
+  try {
+    renderer.setClearColor(0x9ec4e8, 1);           // sky, so frames aren't transparent
+    renderer.setRenderTarget(_povRT);
+    renderer.clear();
+    renderer.render(scene, _povCam);
+    if (!_povBuf || _povBuf.length < w * h * 4) _povBuf = new Uint8Array(w * h * 4);
+    renderer.readRenderTargetPixels(_povRT, 0, 0, w, h, _povBuf);
+  } finally {
+    renderer.setRenderTarget(prevRT);
+    renderer.setClearColor(_prevClear, prevAlpha);
+    if (own) own.visible = ownVis;
+    if (state.labels) state.labels.group.visible = labelsVis;
+    for (const s of hiddenSprites) s.visible = true;
+  }
+
+  if (!_povCanvas) { _povCanvas = document.createElement('canvas'); _povCtx = _povCanvas.getContext('2d'); }
+  if (_povCanvas.width !== w) _povCanvas.width = w;
+  if (_povCanvas.height !== h) _povCanvas.height = h;
+  const img = _povCtx.createImageData(w, h), row = w * 4;
+  for (let y = 0; y < h; y++) {            // GL readback is bottom-up; flip to top-left
+    const src = (h - 1 - y) * row, dst = y * row;
+    for (let i = 0; i < row; i++) img.data[dst + i] = _povBuf[src + i];
+  }
+  _povCtx.putImageData(img, 0, 0);
+  return _povCanvas.toDataURL('image/jpeg', 0.72);
+};

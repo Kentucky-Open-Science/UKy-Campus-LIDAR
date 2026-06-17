@@ -28,11 +28,13 @@ API (JSON, CORS-open; see client/twin.py for a Python wrapper):
 Run:  python -m tools.twin_server [--port 8000] [--hz 50]
 """
 import argparse
+import base64
 import functools
 import http.server
 import json
 import math
 import os
+import queue
 import threading
 import time
 from urllib.parse import urlparse, parse_qs
@@ -56,6 +58,9 @@ DEFS = {
                   maxSpeed=15, maxAccel=10, maxClimb=6, maxYawRateDeg=120, minClearance=0.5),
 }
 DEFAULT_COLORS = {"car": 0x3577c9, "truck": 0xc7702a, "robot": 0x4aa05a, "drone": 0x9b59b6}
+# first-person camera mount per type: eye height above the agent (m) + downward pitch (deg)
+CAM_EYE = {"car": 1.4, "truck": 2.6, "robot": 0.5, "drone": 0.0}
+CAM_PITCH = {"car": 6.0, "truck": 6.0, "robot": 4.0, "drone": 22.0}
 
 D2R = math.pi / 180.0
 R2D = 180.0 / math.pi
@@ -406,6 +411,14 @@ class Agent:
                               "normal": [nx, 0, nz], "penetration": round(pen, 3),
                               "relativeSpeed": round(rel, 3)})
 
+    def camera_pose(self):
+        """First-person camera eye position + forward unit vector (scene metres)."""
+        eh = CAM_EYE.get(self.type, 1.4)
+        pd = CAM_PITCH.get(self.type, 6.0) * D2R
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        cp, sp = math.cos(pd), math.sin(pd)
+        return ((self.x, self.y + eh, self.z), (cy * cp, -sp, -sy * cp))
+
     def state(self):
         return {
             "id": self.id, "name": self.name, "type": self.type, "owner": self.owner,
@@ -510,7 +523,75 @@ class World:
                 nxt = time.time()
 
 
-WORLD = None  # set in main()
+WORLD = None   # set in main()
+RENDER = None  # RenderService when --render is on
+
+
+class RenderService:
+    """Headless-browser render service for first-person agent cameras.
+
+    The server has no renderer, so we drive a headless Chromium that loads our own
+    viewer (which already renders terrain imagery + buildings + the shared agents)
+    and call window.__renderPOV() per request. Playwright's sync API is bound to one
+    thread, so all renders are serialised through a queue to a single render thread;
+    HTTP handlers submit a job and block on its result. Optional (only with --render).
+    """
+
+    def __init__(self, port):
+        self.port = port
+        self.q = queue.Queue()
+        self.ready = threading.Event()
+        self.error = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.error = ("playwright not installed — pip install playwright && "
+                          "playwright install chromium")
+            print("[render] " + self.error)
+            return
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True,
+                                            args=["--use-gl=angle", "--ignore-gpu-blocklist"])
+                page = browser.new_page(viewport={"width": 640, "height": 480})
+                page.goto(f"http://127.0.0.1:{self.port}/")
+                page.wait_for_function(
+                    "() => window.__renderPOV && window.__viewer && "
+                    "window.__viewer.state.terrain.tiles.some(t => t.status === 'loaded')",
+                    timeout=60000)
+                page.wait_for_timeout(1500)   # let buildings + a few tiles stream in
+                self.ready.set()
+                print("[render] first-person camera service ready")
+                while True:
+                    job = self.q.get()
+                    if job is None:
+                        break
+                    args, fut = job
+                    try:
+                        fut["data"] = page.evaluate(
+                            "(a) => window.__renderPOV(a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],a[8])", args)
+                    except Exception as e:  # noqa: BLE001
+                        fut["err"] = str(e)
+                    fut["event"].set()
+        except Exception as e:  # noqa: BLE001
+            self.error = f"render service failed: {e}"
+            print("[render] " + self.error)
+
+    def render(self, args, timeout=8.0):
+        if self.error:
+            return None, self.error
+        if not self.ready.is_set() and not self.ready.wait(timeout=timeout):
+            return None, self.error or "render service still starting"
+        fut = {"event": threading.Event()}
+        self.q.put((args, fut))
+        if not fut["event"].wait(timeout=timeout):
+            return None, "render timeout"
+        if fut.get("err"):
+            return None, fut["err"]
+        return fut.get("data"), None
 
 
 # =====================================================================
@@ -564,15 +645,42 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json({
                 "types": list(DEFS), "hz": WORLD.hz, "maxAgents": WORLD.max_agents,
                 "ground": WORLD.ground.ok, "buildings": len(WORLD.buildings.items),
+                "camera": RENDER is not None and RENDER.error is None,
+                "cameraReady": RENDER is not None and RENDER.ready.is_set(),
                 "georef": {"A": WORLD.ground.A, "B": WORLD.ground.B, "zone": "16N"} if WORLD.ground.ok else None,
             })
         if path.startswith("/api/world/agents"):
-            aid, _ = self._agent_id(path)
+            aid, action = self._agent_id(path)
             a = WORLD.get(aid) if aid is not None else None
-            return self._json(a.state() if a else {"error": "no such agent"}, 200 if a else 404)
+            if not a:
+                return self._json({"error": "no such agent"}, 404)
+            if action == "camera":
+                return self._send_camera(a)
+            return self._json(a.state())
         if path.startswith("/api/world"):
             return self._json({"error": "unknown endpoint", "path": self.path}, 404)
         return super().do_GET()
+
+    def _send_camera(self, a):
+        if RENDER is None:
+            return self._json({"error": "camera feed off — start the server with --render"}, 503)
+        q = parse_qs(urlparse(self.path).query)
+        w = int(float(q.get("w", [320])[0])); h = int(float(q.get("h", [240])[0]))
+        (ex, ey, ez), (fx, fy, fz) = a.camera_pose()
+        data, err = RENDER.render([a.id, ex, ey, ez, fx, fy, fz, w, h])
+        if err or not data:
+            return self._json({"error": err or "no frame"}, 503)
+        try:
+            img = base64.b64decode(data.split(",", 1)[1])
+        except Exception:
+            return self._json({"error": "bad frame data"}, 502)
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(img)))
+        self.end_headers()
+        self.wfile.write(img)
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
@@ -608,10 +716,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 def main():
-    global WORLD
+    global WORLD, RENDER
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--hz", type=int, default=50, help="simulation tick rate")
+    ap.add_argument("--render", action="store_true",
+                    help="enable first-person agent cameras (drives a headless browser; needs playwright)")
     args = ap.parse_args()
 
     print("loading world (terrain heightmap + building boxes) ...")
@@ -620,13 +730,19 @@ def main():
     threading.Thread(target=WORLD.run, args=(stop_evt,), daemon=True).start()
 
     handler = functools.partial(Handler, directory=WEB)
+    # the listen socket is open after construction, so the render browser can connect
+    # before serve_forever() starts accepting.
     httpd = http.server.ThreadingHTTPServer(("0.0.0.0", args.port), handler)
     httpd.daemon_threads = True
+    if args.render:
+        RENDER = RenderService(args.port)
+
     print(f"\nUKy campus twin server — authoritative shared world")
     print(f"  viewer:  http://localhost:{args.port}/")
     print(f"  API:     http://localhost:{args.port}/api/world/(state|meta|spawn|agents/<id>/...)")
     print(f"  sim:     {args.hz} Hz   ground:{'on' if WORLD.ground.ok else 'flat'}   "
           f"buildings:{len(WORLD.buildings.items)}")
+    print(f"  camera:  {'ON (first-person /agents/<id>/camera; starting headless renderer…)' if args.render else 'off (use --render)'}")
     print("  Ctrl-C to stop")
     try:
         httpd.serve_forever()
