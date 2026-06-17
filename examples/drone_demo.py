@@ -72,7 +72,8 @@ def main():
         print("shared world is empty — your drone will be the first agent in it.")
 
     # 1. spawn -------------------------------------------------------------
-    drone = twin.spawn("drone", position=[0, None, 0], color=0xff3344)
+    # x,z on the map; None height auto-snaps onto the terrain (drone then lifts to hover)
+    drone = twin.spawn("drone", position=[-127.0, None, 1224.1], color=0xff3344)
     s = drone.state()
     sx, sy, sz = s["position"]
     utm = s.get("utm")

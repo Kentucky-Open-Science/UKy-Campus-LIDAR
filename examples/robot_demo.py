@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from twin import Twin, TwinError           # noqa: E402
 from yolo_drive import load_model, navigate  # noqa: E402
 
-TYPE, COLOR, START = "robot", 0x4aa05a, [-40, None, 30]
+TYPE, COLOR, START = "robot", 0x4aa05a, [-127.0, None, 1224.1]  # x,z on the map; None height auto-snaps onto the terrain
 
 
 def main():
