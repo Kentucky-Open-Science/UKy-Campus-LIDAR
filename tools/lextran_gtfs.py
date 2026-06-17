@@ -4,7 +4,7 @@
 This is the *static* half of the transit integration: the route line geometry and
 the bus stops, which never move and so are baked offline (the *live* half — moving
 buses, predicted arrivals, and service alerts — is proxied at runtime by
-`tools/serve.py`). We fetch Lextran's published GTFS zip, keep only what overlaps
+`tools/twin_server.py`). We fetch Lextran's published GTFS zip, keep only what overlaps
 the campus viewport, project every shape point and stop from lon/lat through the
 SAME UTM-16N -> scene map the road network uses (`tools/transit_common.Projector`,
 i.e. `tools/osm_roads.py`'s transform), drape them onto the terrain heightmap, clip
@@ -268,7 +268,7 @@ def main():
         "note": "Lextran static GTFS (routes + stops), projected UTM16N->scene metres; "
                 "points are [x,y,z] scene metres, draped on campus terrain where it "
                 "exists and on the flat city ground plane (city.json) elsewhere. Live "
-                "buses/arrivals/alerts come from tools/serve.py at runtime. (c) Lextran.",
+                "buses/arrivals/alerts come from tools/twin_server.py at runtime. (c) Lextran.",
         "source": "lextran-gtfs-static",
         "scope": "campus" if args.campus_only else "full-network",
         "georef": {"A": A, "B": B, "epsg": 32616, "utmZone": "16N"},

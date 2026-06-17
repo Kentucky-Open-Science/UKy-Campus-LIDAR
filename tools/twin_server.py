@@ -14,6 +14,12 @@ collision detection) is ported from web/agents.js. Ground elevation comes from t
 campus terrain heightmap (and the flat city plane beyond it); collisions use the
 baked per-building AABBs (web/data/buildings.pack.json) plus agent-vs-agent.
 
+This single server also carries the **live Lextran transit proxy** (folded in from the
+old tools/serve.py): it fetches the agency's GTFS-Realtime feeds, projects each bus into
+scene metres with the same georef the world uses, and re-serves them same-origin. So one
+`python -m tools.twin_server` gives the viewer BOTH the shared agents and the moving buses
+— including the headless `--render` browser, whose first-person frames then show traffic.
+
 API (JSON, CORS-open; see client/twin.py for a Python wrapper):
     GET    /api/world/state                  -> { t, agents:[ ... ] }   (everyone's agents)
     GET    /api/world/agents/<id>            -> one agent's full sensor state
@@ -23,9 +29,17 @@ API (JSON, CORS-open; see client/twin.py for a Python wrapper):
     POST   /api/world/agents/<id>/driveTo    { x, z, y?, speed?, arriveRadius?, stop? }
     POST   /api/world/agents/<id>/stop
     DELETE /api/world/agents/<id>
+    GET    /api/transit/vehicles             -> live bus positions, projected to scene [x,_,z]
+    GET    /api/transit/trips                -> predicted arrivals, indexed by stop and trip
+    GET    /api/transit/alerts               -> service alerts (decoded cause/effect)
+    GET    /api/transit/meta                 -> transit proxy status (mode, cache ages, georef)
     (anything else) -> served as a static file from web/
 
-Run:  python -m tools.twin_server [--port 8000] [--hz 50]
+Run:  python -m tools.twin_server [--port 8000] [--hz 50] [--render]
+      python -m tools.twin_server --mock        # replay tools/_transit_samples (offline buses)
+      python -m tools.twin_server --no-transit   # world only, no bus proxy
+
+Transit data (c) Lextran (Transit Authority of Lexington).
 """
 import argparse
 import base64
@@ -37,11 +51,15 @@ import os
 import queue
 import threading
 import time
+import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 import numpy as np
 
 from tools.extract_roads import DATA, load_mesh, build_heightmap
+from tools.transit_common import Projector
+
+SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_transit_samples")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.abspath(os.path.join(_HERE, "..", "web"))
@@ -530,6 +548,7 @@ class World:
 
 WORLD = None   # set in main()
 RENDER = None  # RenderService when --render is on
+PROXY = None   # TransitProxy when the live bus proxy is on (default; --no-transit disables)
 
 
 class RenderService:
@@ -600,6 +619,219 @@ class RenderService:
 
 
 # =====================================================================
+# Live Lextran transit proxy (folded in from the former tools/serve.py).
+# The upstream feed is plain HTTP with no CORS, so a browser on localhost can't read
+# it directly; we fetch the GTFS-Realtime "debug" feeds (which serialise as JSON — no
+# protobuf runtime needed), project every vehicle into scene metres with the same
+# georef the road network uses, join each bus to its route colour/name from the baked
+# web/data/transit.json, and re-serve it as compact same-origin JSON with a short cache.
+FEED_BASE = "http://mystop.lextran.com/InfoPoint/GTFS-Realtime.ashx"
+FEED_QUERY = {
+    "vehicles": "?&Type=VehiclePosition&serverid=0&debug=true",
+    "trips": "?&Type=TripUpdate&debug=true",
+    "alerts": "?&Type=Alert&debug=true",
+}
+FIXTURE = {"vehicles": "VehiclePosition.json", "trips": "TripUpdate.json", "alerts": "Alert.json"}
+UA = {"User-Agent": "uky-campus-viewer/1.0 (+transit proxy)"}
+
+# GTFS-Realtime enums -> readable strings
+VEHICLE_STATUS = {0: "incoming_at", 1: "stopped_at", 2: "in_transit_to"}
+OCCUPANCY = {0: "empty", 1: "many_seats", 2: "few_seats", 3: "standing_room",
+             4: "crushed_standing", 5: "full", 6: "not_accepting"}
+ALERT_CAUSE = {1: "unknown", 2: "other", 3: "technical_problem", 4: "strike",
+               5: "demonstration", 6: "accident", 7: "holiday", 8: "weather",
+               9: "maintenance", 10: "construction", 11: "police_activity",
+               12: "medical_emergency"}
+ALERT_EFFECT = {1: "no_service", 2: "reduced_service", 3: "significant_delays",
+                4: "detour", 5: "additional_service", 6: "modified_service",
+                7: "other", 8: "unknown", 9: "stop_moved", 10: "no_effect",
+                11: "accessibility_issue"}
+
+
+class TransitProxy:
+    """Fetches, caches, and projects the three GTFS-Realtime feeds. Never raises into
+    the viewer — on upstream failure it serves the last good payload (flagged stale)."""
+
+    def __init__(self, projector, route_map, mock=False, cache_seconds=5.0):
+        self.proj = projector
+        self.routes = route_map            # routeId -> {shortName,color,longName}
+        self.mock = mock
+        self.cache_seconds = cache_seconds
+        self._cache = {}                   # kind -> (fetched_at, payload)
+        self._lock = threading.Lock()
+        self._t0 = time.time()
+
+    def _raw(self, kind):
+        if self.mock:
+            with open(os.path.join(SAMPLES, FIXTURE[kind]), "rb") as f:
+                return json.loads(f.read())
+        req = urllib.request.Request(FEED_BASE + FEED_QUERY[kind], headers=UA)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    def get(self, kind):
+        now = time.time()
+        with self._lock:
+            hit = self._cache.get(kind)
+            if hit and now - hit[0] < self.cache_seconds:
+                return hit[1]
+        try:
+            raw = self._raw(kind)
+            payload = getattr(self, "_build_" + kind)(raw)
+            payload["mode"] = "mock" if self.mock else "live"
+        except Exception as e:  # noqa: BLE001 — never let the proxy 500 the viewer
+            with self._lock:
+                stale = self._cache.get(kind)
+            payload = (stale[1] if stale else {kind: [], "count": 0}).copy()
+            payload["error"] = str(e)
+            payload["stale"] = bool(stale)
+            return payload
+        with self._lock:
+            self._cache[kind] = (now, payload)
+        return payload
+
+    def _route_of(self, route_id):
+        r = self.routes.get(str(route_id)) if route_id is not None else None
+        if not r:
+            return None
+        return {"id": r["id"], "shortName": r["shortName"], "color": r["color"], "name": r["longName"]}
+
+    def _mock_nudge(self, lat, lon, bearing, speed):
+        """In mock mode, crawl each bus along its bearing so motion is visible (live mode
+        uses real GTFS positions as-is). Parked campus buses report ~0.45 m/s, so floor
+        the crawl speed to keep the offline demo/test lively and deterministic."""
+        if not self.mock:
+            return lat, lon
+        eff = max(abs(speed or 0.0), 4.0)
+        d = (eff * (time.time() - self._t0)) % 150.0
+        th = math.radians(bearing or 0.0)
+        lat2 = lat + (d * math.cos(th)) / 111320.0
+        lon2 = lon + (d * math.sin(th)) / (111320.0 * max(0.2, math.cos(math.radians(lat))))
+        return lat2, lon2
+
+    def _build_vehicles(self, raw):
+        out, header = [], raw.get("Header") or {}
+        for e in raw.get("Entities") or []:
+            v = e.get("Vehicle")
+            if not v:
+                continue
+            pos = v.get("Position") or {}
+            lat, lon = pos.get("Latitude"), pos.get("Longitude")
+            if lat is None or lon is None:
+                continue
+            bearing, speed = pos.get("Bearing"), pos.get("Speed")
+            lat, lon = self._mock_nudge(lat, lon, bearing, speed)
+            x, z = self.proj(lon, lat)
+            trip = v.get("Trip") or {}
+            veh = v.get("Vehicle") or {}
+            rid = trip.get("RouteId")
+            out.append({
+                "id": str(veh.get("Id") or e.get("Id") or ""),
+                "label": veh.get("Label"),
+                "routeId": str(rid) if rid is not None else None,
+                "route": self._route_of(rid),
+                "tripId": trip.get("TripId"),
+                "stopId": str(v.get("StopId")) if v.get("StopId") is not None else None,
+                "seq": v.get("CurrentStopSequence"),
+                "status": VEHICLE_STATUS.get(v.get("CurrentStatus")),
+                "occupancy": OCCUPANCY.get(v.get("occupancy_status")),
+                "lat": round(lat, 6), "lon": round(lon, 6),
+                "bearing": bearing, "speed": speed,
+                "x": round(x, 2), "z": round(z, 2),
+                "vts": v.get("Timestamp"),
+            })
+        return {"ts": header.get("Timestamp") or int(time.time()), "count": len(out), "vehicles": out}
+
+    def _build_trips(self, raw):
+        by_stop, by_trip, header = {}, {}, raw.get("Header") or {}
+        for e in raw.get("Entities") or []:
+            tu = e.get("TripUpdate")
+            if not tu:
+                continue
+            trip = tu.get("Trip") or {}
+            rid, tid = trip.get("RouteId"), trip.get("TripId")
+            row_trip = []
+            for stu in tu.get("StopTimeUpdates") or []:
+                arr = stu.get("Arrival") or {}
+                dep = stu.get("Departure") or {}
+                sid = str(stu.get("StopId")) if stu.get("StopId") is not None else None
+                rec = {"routeId": str(rid) if rid is not None else None, "tripId": tid,
+                       "stopId": sid, "seq": stu.get("StopSequence"),
+                       "arrival": arr.get("Time"), "departure": dep.get("Time"),
+                       "delay": arr.get("Delay") if arr.get("Delay") is not None else dep.get("Delay")}
+                row_trip.append(rec)
+                if sid is not None:
+                    by_stop.setdefault(sid, []).append(rec)
+            if tid:
+                by_trip[tid] = row_trip
+        for sid in by_stop:
+            by_stop[sid].sort(key=lambda r: (r["arrival"] is None, r["arrival"] or 0))
+        return {"ts": header.get("Timestamp") or int(time.time()),
+                "count": len(by_trip), "byStop": by_stop, "byTrip": by_trip}
+
+    def _build_alerts(self, raw):
+        out, header = [], raw.get("Header") or {}
+        for e in raw.get("Entities") or []:
+            al = e.get("Alert")
+            if not al:
+                continue
+
+            def _txt(block):
+                tr = (block or {}).get("Translations") or []
+                for t in tr:
+                    if (t.get("Language") or "en").startswith("en"):
+                        return t.get("Text")
+                return tr[0].get("Text") if tr else None
+
+            ents = al.get("InformedEntities") or []
+            periods = al.get("ActivePeriods") or [{}]
+            out.append({
+                "id": str(e.get("Id") or ""),
+                "header": _txt(al.get("HeaderText")),
+                "description": _txt(al.get("DescriptionText")),
+                "cause": ALERT_CAUSE.get(al.get("cause")),
+                "effect": ALERT_EFFECT.get(al.get("effect")),
+                "routes": sorted({str(x.get("RouteId")) for x in ents if x.get("RouteId") is not None}),
+                "stops": sorted({str(x.get("StopId")) for x in ents if x.get("StopId") is not None}),
+                "start": periods[0].get("Start"), "end": periods[0].get("End"),
+                "url": (_txt(al.get("Url")) if isinstance(al.get("Url"), dict) else al.get("Url")),
+            })
+        return {"ts": header.get("Timestamp") or int(time.time()), "count": len(out), "alerts": out}
+
+    def meta(self):
+        with self._lock:
+            ages = {k: round(time.time() - v[0], 1) for k, v in self._cache.items()}
+        return {"mode": "mock" if self.mock else "live", "feedBase": FEED_BASE,
+                "cacheSeconds": self.cache_seconds, "cacheAges": ages,
+                "routesKnown": len(self.routes),
+                "georef": {"A": self.proj.A, "B": self.proj.B, "utmZone": "16N"},
+                "endpoints": ["/api/transit/vehicles", "/api/transit/trips",
+                              "/api/transit/alerts", "/api/transit/meta"]}
+
+
+def load_route_map(data_dir=DATA):
+    """routeId -> {id,shortName,color,longName} from the baked transit.json."""
+    path = os.path.join(data_dir, "transit.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        t = json.load(open(path))
+    except Exception:  # noqa: BLE001
+        return {}
+    return {r["id"]: {"id": r["id"], "shortName": r.get("shortName") or r["id"],
+                      "color": r.get("color") or "3b82c4", "longName": r.get("longName") or ""}
+            for r in t.get("routes", [])}
+
+
+def build_proxy(mock=False, cache_seconds=None):
+    # short cache in mock so the synthetic crawl is continuous; a real feed only updates
+    # every ~15-30 s, so a 5 s cache there is plenty and spares the agency.
+    if cache_seconds is None:
+        cache_seconds = 0.5 if mock else 5.0
+    return TransitProxy(Projector(), load_route_map(), mock=mock, cache_seconds=cache_seconds)
+
+
+# =====================================================================
 class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -638,31 +870,46 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except (IndexError, ValueError):
             return None, None
 
+    def _transit(self, path):
+        if PROXY is None:
+            return self._json({"error": "transit proxy off (started with --no-transit)"}, 503)
+        if path in ("/api/transit", "/api/transit/meta"):
+            return self._json(PROXY.meta())
+        for kind in ("vehicles", "trips", "alerts"):
+            if path == "/api/transit/" + kind:
+                return self._json(PROXY.get(kind))
+        return self._json({"error": "unknown endpoint", "path": self.path}, 404)
+
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
-        if path == "/api/world/state":
-            return self._json(WORLD.snapshot())
-        if path == "/api/world/nearest_building":
-            q = parse_qs(urlparse(self.path).query)
-            x = float(q.get("x", [0])[0]); z = float(q.get("z", [0])[0])
-            return self._json(WORLD.buildings.nearest(x, z) or {})
-        if path == "/api/world/meta":
-            return self._json({
-                "types": list(DEFS), "hz": WORLD.hz, "maxAgents": WORLD.max_agents,
-                "ground": WORLD.ground.ok, "buildings": len(WORLD.buildings.items),
-                "camera": RENDER is not None and RENDER.error is None,
-                "cameraReady": RENDER is not None and RENDER.ready.is_set(),
-                "georef": {"A": WORLD.ground.A, "B": WORLD.ground.B, "zone": "16N"} if WORLD.ground.ok else None,
-            })
-        if path.startswith("/api/world/agents"):
-            aid, action = self._agent_id(path)
-            a = WORLD.get(aid) if aid is not None else None
-            if not a:
-                return self._json({"error": "no such agent"}, 404)
-            if action == "camera":
-                return self._send_camera(a)
-            return self._json(a.state())
+        if path.startswith("/api/transit"):
+            return self._transit(path)
         if path.startswith("/api/world"):
+            if WORLD is None:
+                return self._json({"error": "world not running"}, 503)
+            if path == "/api/world/state":
+                return self._json(WORLD.snapshot())
+            if path == "/api/world/nearest_building":
+                q = parse_qs(urlparse(self.path).query)
+                x = float(q.get("x", [0])[0]); z = float(q.get("z", [0])[0])
+                return self._json(WORLD.buildings.nearest(x, z) or {})
+            if path == "/api/world/meta":
+                return self._json({
+                    "types": list(DEFS), "hz": WORLD.hz, "maxAgents": WORLD.max_agents,
+                    "ground": WORLD.ground.ok, "buildings": len(WORLD.buildings.items),
+                    "camera": RENDER is not None and RENDER.error is None,
+                    "cameraReady": RENDER is not None and RENDER.ready.is_set(),
+                    "transit": ("mock" if PROXY.mock else "live") if PROXY else None,
+                    "georef": {"A": WORLD.ground.A, "B": WORLD.ground.B, "zone": "16N"} if WORLD.ground.ok else None,
+                })
+            if path.startswith("/api/world/agents"):
+                aid, action = self._agent_id(path)
+                a = WORLD.get(aid) if aid is not None else None
+                if not a:
+                    return self._json({"error": "no such agent"}, 404)
+                if action == "camera":
+                    return self._send_camera(a)
+                return self._json(a.state())
             return self._json({"error": "unknown endpoint", "path": self.path}, 404)
         return super().do_GET()
 
@@ -689,6 +936,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
+        if WORLD is None and path.startswith("/api/world"):
+            return self._json({"error": "world not running"}, 503)
         if path == "/api/world/spawn":
             try:
                 a = WORLD.spawn(self._body())
@@ -714,19 +963,44 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         path = self.path.split("?", 1)[0].rstrip("/")
+        if WORLD is None and path.startswith("/api/world"):
+            return self._json({"error": "world not running"}, 503)
         if path.startswith("/api/world/agents"):
             aid, _ = self._agent_id(path)
             return self._json({"ok": WORLD.despawn(aid) if aid is not None else False})
         return self._json({"error": "unknown endpoint"}, 404)
 
+    def copyfile(self, source, outputfile):
+        # the viewer drops connections mid-stream while tiles/chunks stream in; swallow
+        # the reset rather than dumping a traceback (same as the old serve.py).
+        try:
+            super().copyfile(source, outputfile)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
+
+
+def make_server(port, directory=WEB):
+    """ThreadingHTTPServer on `port` with the combined world+transit+static Handler.
+    The listen socket is open on return, so a --render browser can connect before
+    serve_forever() starts accepting. Shared by main() and tools/verify_transit.py."""
+    handler = functools.partial(Handler, directory=directory)
+    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+    httpd.daemon_threads = True
+    return httpd
+
 
 def main():
-    global WORLD, RENDER
+    global WORLD, RENDER, PROXY
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--hz", type=int, default=50, help="simulation tick rate")
     ap.add_argument("--render", action="store_true",
                     help="enable first-person agent cameras (drives a headless browser; needs playwright)")
+    ap.add_argument("--mock", action="store_true",
+                    help="replay tools/_transit_samples instead of the live Lextran feed (offline buses)")
+    ap.add_argument("--no-transit", action="store_true", help="disable the live bus proxy")
+    ap.add_argument("--transit-cache-seconds", type=float, default=None,
+                    help="seconds to cache each transit feed (default 5 s live / 0.5 s mock)")
     args = ap.parse_args()
 
     print("loading world (terrain heightmap + building boxes) ...")
@@ -734,17 +1008,20 @@ def main():
     stop_evt = threading.Event()
     threading.Thread(target=WORLD.run, args=(stop_evt,), daemon=True).start()
 
-    handler = functools.partial(Handler, directory=WEB)
-    # the listen socket is open after construction, so the render browser can connect
-    # before serve_forever() starts accepting.
-    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", args.port), handler)
-    httpd.daemon_threads = True
+    if not args.no_transit:
+        PROXY = build_proxy(mock=args.mock, cache_seconds=args.transit_cache_seconds)
+
+    httpd = make_server(args.port)
     if args.render:
         RENDER = RenderService(args.port)
 
-    print(f"\nUKy campus twin server — authoritative shared world")
+    transit = ("off (--no-transit)" if args.no_transit else
+               f"{'MOCK (fixtures)' if args.mock else 'LIVE (mystop.lextran.com)'}"
+               "  ->  /api/transit/(vehicles|trips|alerts|meta)")
+    print(f"\nUKy campus twin server — authoritative shared world + live transit")
     print(f"  viewer:  http://localhost:{args.port}/")
-    print(f"  API:     http://localhost:{args.port}/api/world/(state|meta|spawn|agents/<id>/...)")
+    print(f"  world:   http://localhost:{args.port}/api/world/(state|meta|spawn|agents/<id>/...)")
+    print(f"  transit: {transit}")
     print(f"  sim:     {args.hz} Hz   ground:{'on' if WORLD.ground.ok else 'flat'}   "
           f"buildings:{len(WORLD.buildings.items)}")
     print(f"  camera:  {'ON (first-person /agents/<id>/camera; starting headless renderer…)' if args.render else 'off (use --render)'}")

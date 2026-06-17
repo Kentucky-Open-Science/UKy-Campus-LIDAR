@@ -421,18 +421,20 @@ half (route lines + stops, baked once) and a **live** half (moving buses, predic
 arrivals, service alerts) proxied at runtime — because the upstream GTFS-Realtime
 feed is plain HTTP with no CORS, a browser can't read it directly.
 
-**Run it with the proxy** (drop-in for `python -m http.server`):
+**Run it with the proxy** — the combined `tools/twin_server.py` serves the viewer and
+the live feed (and the shared-world API) together:
 
 ```sh
-python -m tools.serve                 # static files + live feed, http://localhost:8000/
-python -m tools.serve --mock          # replay tools/_transit_samples (offline demo/CI)
-python -m tools.serve --selftest      # hit every endpoint and exit 0/1
+python -m tools.twin_server           # viewer + live buses + world API, http://localhost:8000/
+python -m tools.twin_server --mock    # replay tools/_transit_samples (offline demo/CI)
+python -m tools.twin_server --no-transit   # skip the bus proxy
 ```
 
 Plain `http.server` still works — you just get routes + stops, no live buses (the
-viewer probes the proxy once, then backs off, so there's no 404 spam).
+viewer probes the proxy once, then backs off, so there's no 404 spam). Smoke-test the
+live layer headlessly with `python tools/verify_transit.py`.
 
-`tools/serve.py` projects each bus's lon/lat into scene metres with the same georef
+`tools/twin_server.py` projects each bus's lon/lat into scene metres with the same georef
 the roads use (`tools/transit_common.Projector`) and re-serves same-origin JSON:
 
 ```

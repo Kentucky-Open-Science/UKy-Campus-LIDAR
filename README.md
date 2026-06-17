@@ -7,15 +7,16 @@ imagery into open formats and view them in an interactive Three.js web viewer
 ## Quick start
 
 ```sh
-python -m tools.serve          # static files + LIVE Lextran bus feed, on :8000
+python -m tools.twin_server     # viewer + LIVE Lextran buses + shared-world API, on :8000
 # Open http://localhost:8000/
 ```
 
-`tools/serve.py` is a drop-in for `python -m http.server` that also proxies the
-live Lexington (Lextran) GTFS-Realtime feed so you get **moving buses** on the map.
-No buses needed? Plain `cd web && python -m http.server 8000` still works (routes +
-stops render; live buses just stay off). Add `python -m tools.serve --mock` to
-replay a recorded feed offline.
+`tools/twin_server.py` is one server that serves the static viewer, proxies the live
+Lexington (Lextran) GTFS-Realtime feed so you get **moving buses** on the map, and runs the
+authoritative shared-world agent API (`/api/world/*`). Add `--render` for first-person agent
+cameras, `--mock` to replay a recorded bus feed offline, or `--no-transit` to skip the bus
+proxy. No buses or agents needed at all? Plain `cd web && python -m http.server 8000` still
+works — routes + stops render, live buses just stay off.
 
 The viewer loads `web/data/manifest.json` and streams terrain tiles + LiDAR
 point chunks. All data is pre-extracted — the server just serves static files.
@@ -39,8 +40,8 @@ CAMPUS/
 │   ├── osm_roads.py          # OpenStreetMap → campus road network (roads.json)
 │   ├── osm_city.py           # OpenStreetMap → city-wide streets + ground plane (city.json)
 │   ├── lextran_gtfs.py       # Lextran static GTFS → routes + stops (transit.json)
-│   ├── serve.py              # static server + live GTFS-Realtime proxy (/api/transit/*)
-│   ├── twin_server.py        # authoritative shared-world server + agent API (/api/world/*)
+│   ├── twin_server.py        # one server: static viewer + shared-world API (/api/world/*)
+│   │                         #   + live GTFS-Realtime bus proxy (/api/transit/*) + --render cams
 │   ├── pack_buildings.py     # merge 3,109 building meshes → one buffer (fast load)
 │   ├── transit_common.py     # shared lon/lat → scene projection (georef)
 │   ├── roadnet.py            # road graph (routing) from roads.json
@@ -73,7 +74,7 @@ CAMPUS/
 │       ├── roads.json        # smoothed road centrelines + real intersections
 │       ├── signals.json      # machine-readable signal model (autonomous agents)
 │       ├── city.json         # city-wide OSM streets + ground plane
-│       └── transit.json      # Lextran routes + stops (live buses via tools/serve.py)
+│       └── transit.json      # Lextran routes + stops (live buses via tools/twin_server.py)
 ├── campus_gym/              # Gymnasium (single) + PettingZoo (multi) env over the sim core
 ├── client/                  # twin.py — dependency-free Python client for the world API
 ├── examples/                # drone_demo.py + car/truck/robot vision demos (YOLO via the camera feed)
@@ -128,7 +129,7 @@ wireframe mode, camera reset.
   (8,481 ways) on a flat ground plane, so the whole bus network has streets + ground
   beyond the campus tiles. Regenerate with `python -m tools.osm_city`.
 - Transit: 27 Lextran routes + 878 stops (`transit.json`), plus live buses /
-  arrivals / alerts via the `tools/serve.py` proxy. Regenerate with
+  arrivals / alerts via the `tools/twin_server.py` proxy. Regenerate with
   `python -m tools.lextran_gtfs`.
 
 ## Digital twin — controllable signals + autonomous agents
@@ -149,7 +150,7 @@ that keeps ground vehicles on the road or terrain and tells you which one they'r
 on. Full API + schemas for both in [web/README.md](web/README.md); smoke-test the
 agent sensors with `python tools/verify_agents.py`.
 
-The twin also carries the **real Lexington bus network**. `tools/serve.py` proxies
+The twin also carries the **real Lexington bus network**. `tools/twin_server.py` proxies
 the live Lextran GTFS-Realtime feed and the viewer animates the actual buses on the
 map — with route lines, stops, predicted arrivals, and service alerts — all reachable
 at `window.__twin.transit` (`getVehicles` / `getNearestVehicle` / `getArrivals` / …).
@@ -166,20 +167,20 @@ the twin runs on its own server and many scripts/users drive agents that everyon
 sees — run the authoritative server:
 
 ```sh
-python -m tools.twin_server        # serves the viewer + the world API on :8000
+python -m tools.twin_server        # viewer + world API + live buses on :8000
 ```
 
 Run it **as a module from the repo root** (`python -m tools.twin_server`), not
 `python tools/twin_server.py` — it imports the `tools` package, and running it as a
-loose file breaks that import. It serves the viewer *and* the API on the same port.
+loose file breaks that import. One server now does it all on a single port: the viewer,
+the world API (`/api/world/*`), the live bus proxy (`/api/transit/*`), and — with
+`--render` — first-person agent cameras.
 
-> **`404 File not found` on `/api/world/...`?** Something else is answering on `:8000`
-> — usually a plain `python -m http.server` or `tools/serve.py` (the transit/bus
-> server) left running. Those serve the viewer's files but have no world API. Stop it
-> and run `tools/twin_server` instead. They're different servers: `twin_server` has the
-> **world** API (`/api/world/*`), `serve.py` has the **transit** proxy (`/api/transit/*`);
-> they can't share a port. To run both, put the twin on another port:
-> `python -m tools.twin_server --port 8001` and point clients/browser at `:8001`.
+> **`404`/`503` on `/api/world/...`?** Something else is answering on `:8000` — usually a
+> plain `python -m http.server` left running, which serves the viewer's files but has no
+> world API. Stop it and run `python -m tools.twin_server` instead. To run a second server
+> on the same machine, give the twin another port: `python -m tools.twin_server --port 8001`
+> and point clients/browser at `:8001`.
 
 It holds every agent in one place, ticks the physics (the same ackermann / differential
 / holonomic-drone kinematics as `agents.js`, with ground from the terrain heightmap and

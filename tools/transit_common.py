@@ -2,7 +2,7 @@
 """Shared georeference + WGS84->scene projection for the Lextran transit tools.
 
 Both the offline baker (`tools/lextran_gtfs.py`, which bakes route/stop geometry
-into `web/data/transit.json`) and the live proxy (`tools/serve.py`, which projects
+into `web/data/transit.json`) and the live proxy (`tools/twin_server.py`, which projects
 GTFS-Realtime vehicle positions on the fly) need the SAME map from longitude/
 latitude to the viewer's scene metres. That map is the one the road pipeline
 already uses and verified (see `tools/osm_roads.py`): the scene is georeferenced to
