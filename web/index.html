@@ -33,7 +33,7 @@
 
   <fieldset>
     <legend>LiDAR</legend>
-    <label class="row"><input type="checkbox" id="lidar-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="lidar-visible"> visible</label>
     <label class="row">point size
       <input type="range" id="point-size" min="0.02" max="3" step="0.02" value="0.4">
       <span id="point-size-val">0.40</span>
@@ -86,6 +86,8 @@
     <label class="row"><input type="checkbox" id="transit-buses" checked> live buses</label>
     <div id="transit-status" class="status">transit: loading&hellip;</div>
     <div id="transit-alerts" class="status">&nbsp;</div>
+    <div class="bus-list-label">live buses — click to follow</div>
+    <div id="transit-bus-list" class="bus-list">&mdash;</div>
     <div class="hint">Live buses need the proxy: <code>python -m tools.serve</code><br>
       Query from the console: <code>window.__twin.transit</code></div>
   </fieldset>

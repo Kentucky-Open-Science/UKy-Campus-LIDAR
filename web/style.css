@@ -123,6 +123,22 @@ button:hover { background: #3a5e80; }
 #agent-list, #agent-surface { white-space: pre; }
 code { color: #ffcf5e; }
 
+/* live-bus list (Transit fieldset) — click a row to follow that bus */
+.bus-list-label { font-size: 10.5px; color: #8d99a6; margin: 6px 0 3px; }
+.bus-list { max-height: 150px; overflow-y: auto; margin-bottom: 2px; }
+.bus-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 4px; border-radius: 4px; cursor: pointer;
+  font-size: 11px; color: #c6d0da; line-height: 1.6;
+}
+.bus-row:hover { background: rgba(255, 255, 255, 0.09); }
+.bus-row.active { background: rgba(159, 194, 232, 0.28); color: #fff; }
+.bus-badge {
+  display: inline-block; min-width: 18px; padding: 0 5px;
+  border-radius: 3px; text-align: center; font-weight: 700;
+  font-size: 10px; color: #fff; text-shadow: 0 1px 1px rgba(0,0,0,0.5);
+}
+
 /* "Now driving …" banner shown while WASD is bound to a third-person agent */
 #drive-hint {
   position: fixed;

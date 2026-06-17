@@ -85,6 +85,7 @@ state.terrain.group = new THREE.Group();
 state.lidar.group = new THREE.Group();
 state.buildings.group = new THREE.Group();
 scene.add(state.terrain.group, state.lidar.group, state.buildings.group);
+state.lidar.group.visible = false;   // LiDAR off by default (heavy on the GPU); lazy-loaded when enabled
 
 // Lights — terrain uses unlit MeshBasic so it is unaffected, but buildings and
 // the procedural city use MeshStandard and need light to shade (and show up).
@@ -265,7 +266,10 @@ async function loadManifest() {
       $('point-budget-val').textContent = defM.toFixed(1);
       state.lidar.budget = defM * 1e6;
     }
-    lidarPump();
+    // Don't stream the point cloud until the user enables it (off by default for
+    // framerate); toggling 'visible' lazy-loads it (see the lidar-visible handler).
+    if ($('lidar-visible').checked) lidarPump();
+    else setStatus(el.lidarStatus, 'lidar: off — tick “visible” to load the point cloud');
   } else {
     setStatus(el.lidarStatus, 'lidar: not in manifest', 'error');
   }
@@ -939,6 +943,7 @@ $('terrain-visible').addEventListener('change', (e) => {
 });
 $('lidar-visible').addEventListener('change', (e) => {
   state.lidar.group.visible = e.target.checked;
+  if (e.target.checked) lidarPump();   // lazy-load the cloud the first time it's enabled
 });
 $('terrain-opacity').addEventListener('input', (e) => {
   state.terrain.opacity = parseFloat(e.target.value);
@@ -965,7 +970,7 @@ $('point-budget').addEventListener('input', (e) => {
   updateLidarStatus();
   lidarPump(); // load more if budget grew
 });
-$('camera-reset').addEventListener('click', () => resetView());
+$('camera-reset').addEventListener('click', () => { exitDrive(); exitBusFollow(); resetView(); });
 
 $('road-visible').addEventListener('change', (e) => {
   if (state.roadnet) state.roadnet.group.visible = e.target.checked;
@@ -1029,6 +1034,7 @@ function updateTransitStatus() {
       alertsNode.textContent = 'no active service alerts';
     }
   }
+  refreshBusList();
 }
 
 $('buildings-visible').addEventListener('change', (e) => {
@@ -1123,6 +1129,9 @@ $('agent-pip').addEventListener('change', applyPiP);
 $('agent-pip-select').addEventListener('change', applyPiP);
 
 function resetView() {
+  // Don't steal the camera from an active follow/drive — loaders call resetView()
+  // as terrain/tiles stream in, which would otherwise yank you off the bus/agent.
+  if (busFollow.id || drive.agent) return;
   const box = new THREE.Box3();
   if (state.terrain.group.children.length && state.terrain.group.visible) {
     box.expandByObject(state.terrain.group);
@@ -1155,6 +1164,7 @@ const keys = new Set();
 window.addEventListener('keydown', (e) => {
   if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
   if (e.code === 'Escape' && drive.agent) { exitDrive(); return; } // release the driven agent
+  if (e.code === 'Escape' && busFollow.id) { exitBusFollow(); return; } // release the followed bus
   keys.add(e.code);
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
@@ -1198,6 +1208,7 @@ const _chasePos = new THREE.Vector3(), _chaseTgt = new THREE.Vector3();
 
 function enterDrive(agent) {
   if (!agent || !agent.alive) return;
+  if (busFollow.id) exitBusFollow();   // can't follow a bus and drive an agent at once
   if (drive.agent && drive.agent !== agent && drive.agent.alive && drive.agent.stop) {
     drive.agent.stop(); // don't leave the previously-driven agent rolling on its last input
   }
@@ -1281,12 +1292,126 @@ function updateChaseCamera(dt, snap) {
   camera.lookAt(controls.target);
 }
 
-// mouse wheel adjusts chase distance while driving (OrbitControls handles zoom otherwise)
+// mouse wheel adjusts chase distance while driving an agent or following a bus
+// (OrbitControls handles zoom otherwise)
 renderer.domElement.addEventListener('wheel', (e) => {
-  if (!drive.agent) return;
-  e.preventDefault();
-  drive.distance = Math.max(3, Math.min(150, drive.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+  if (drive.agent) {
+    e.preventDefault();
+    drive.distance = Math.max(3, Math.min(150, drive.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+  } else if (busFollow.id) {
+    e.preventDefault();
+    busFollow.distance = Math.max(8, Math.min(220, busFollow.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+  }
 }, { passive: false });
+
+// ------------------------------------------------ bus follow (3rd person) ---
+// Click a bus (in the panel list or in the scene) to enter a chase view that
+// tracks it. Mirrors the agent drive chase cam, but the bus drives itself — we
+// only follow, reading its live position/heading from window.__twin.transit.
+const busFollow = { id: null, distance: 34 };
+const _bfPos = new THREE.Vector3(), _bfTgt = new THREE.Vector3();
+
+function enterBusFollow(id) {
+  if (!state.transit) return;
+  const v = state.transit.transit.getVehicle(id);
+  if (!v) return;
+  if (drive.agent) exitDrive();          // release any agent drive first
+  busFollow.id = String(id);
+  controls.enabled = false;              // we own the camera while following
+  keys.clear();
+  updateBusFollowCamera(0, true);        // snap behind the bus now
+  updateBusFollowHint();
+  refreshBusList();                      // highlight the followed row
+}
+function exitBusFollow() {
+  const had = busFollow.id;
+  busFollow.id = null;
+  controls.enabled = true;
+  if (had && state.transit) {
+    const v = state.transit.transit.getVehicle(had);
+    if (v) controls.target.set(v.position[0], v.position[1], v.position[2]);
+  }
+  controls.update();
+  updateBusFollowHint();
+  refreshBusList();
+}
+function updateBusFollowCamera(dt, snap) {
+  if (!busFollow.id || !state.transit) return;
+  const v = state.transit.transit.getVehicle(busFollow.id);
+  if (!v) { exitBusFollow(); return; }   // bus left service / out of feed
+  const p = v.position, yaw = (v.heading || 0) * Math.PI / 180;
+  const fx = Math.cos(yaw), fz = -Math.sin(yaw);   // bus forward = (cos,0,-sin)
+  const d = busFollow.distance;
+  _bfPos.set(p[0] - fx * d, p[1] + d * 0.45, p[2] - fz * d);
+  if (_bfPos.y < p[1] + 4) _bfPos.y = p[1] + 4;    // keep the cam above the bus
+  _bfTgt.set(p[0], p[1] + 3, p[2]);
+  const k = snap ? 1 : 1 - Math.exp(-6 * dt);
+  camera.position.lerp(_bfPos, k);
+  controls.target.lerp(_bfTgt, k);
+  camera.lookAt(controls.target);
+}
+function updateBusFollowHint() {
+  const node = $('drive-hint');
+  if (!node) return;
+  if (busFollow.id) {
+    const v = state.transit && state.transit.transit.getVehicle(busFollow.id);
+    node.innerHTML = `Following bus <b>${v ? v.label : busFollow.id}</b>` +
+      ` &middot; wheel = zoom &middot; <b>Esc</b> release`;
+    node.classList.remove('hidden');
+  } else if (!drive.agent) {
+    node.classList.add('hidden');
+  }
+}
+
+// Populate the live-bus list in the panel (called ~1 Hz from updateTransitStatus).
+function refreshBusList() {
+  const node = $('transit-bus-list');
+  if (!node) return;
+  if (!state.transit) { node.textContent = '—'; return; }
+  const buses = state.transit.transit.getVehicles().slice().sort((a, b) =>
+    String(a.label).localeCompare(String(b.label), undefined, { numeric: true }) ||
+    String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+  node.textContent = '';
+  if (!buses.length) {
+    const d = document.createElement('div');
+    d.className = 'hint'; d.style.margin = '2px 0';
+    d.textContent = 'no live buses — run python -m tools.serve';
+    node.appendChild(d);
+    return;
+  }
+  for (const v of buses) {
+    const row = document.createElement('div');
+    row.className = 'bus-row' + (String(v.id) === busFollow.id ? ' active' : '');
+    const badge = document.createElement('span');
+    badge.className = 'bus-badge';
+    badge.style.background = v.route && v.route.color ? '#' + v.route.color : '#3b82c4';
+    badge.textContent = String(v.label).slice(0, 4);
+    const info = document.createElement('span');
+    info.textContent = '#' + v.id + (v.occupancy ? ' · ' + v.occupancy.replace(/_/g, ' ') : '');
+    row.appendChild(badge); row.appendChild(info);
+    row.addEventListener('click', () => enterBusFollow(v.id));
+    node.appendChild(row);
+  }
+}
+
+// Click a bus in the 3D scene to follow it (distinguish a click from an orbit drag).
+let _clickX = 0, _clickY = 0, _clickT = 0;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  _clickX = e.clientX; _clickY = e.clientY; _clickT = performance.now();
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (Math.hypot(e.clientX - _clickX, e.clientY - _clickY) > 6) return;  // was a drag
+  if (performance.now() - _clickT > 500) return;                         // long press
+  if (!state.transit || !state.transit.layers.buses.children.length) return;
+  mouseNdc.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseNdc.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouseNdc, camera);
+  const hits = raycaster.intersectObjects(state.transit.layers.buses.children, true);
+  if (!hits.length) return;
+  let o = hits[0].object;
+  while (o && !(o.name && o.name.startsWith('bus-'))) o = o.parent;
+  if (o && o.name) enterBusFollow(o.name.slice(4));
+});
 
 // -------------------------------------------------- cursor world readout ---
 
@@ -1351,6 +1476,8 @@ function animate() {
   if (drive.agent && !drive.agent.alive) exitDrive(); // driven agent was despawned
   if (drive.agent) {
     applyAgentDrive();          // WASD -> agent controls
+  } else if (busFollow.id) {
+    /* camera follows the bus (updateBusFollowCamera below); no free-fly / orbit */
   } else {
     applyFly(dt);               // WASD -> free camera fly
     controls.update();          // (skip while chasing: updateChaseCamera owns the camera)
@@ -1361,6 +1488,7 @@ function animate() {
   if (state.roadnet && state.roadnet.signals) state.roadnet.signals.tick(dt);
   if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
   if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame
+  if (busFollow.id) updateBusFollowCamera(dt); // follow AFTER the bus moved this frame
   renderer.render(scene, camera);
 
   frames++;
@@ -1382,4 +1510,5 @@ animate();
 
 // debug hook (handy for screenshots / console poking; harmless in production)
 window.__viewer = { THREE, scene, camera, controls, state, resetView,
-                    get agents() { return state.agents; } };
+                    get agents() { return state.agents; },
+                    get busFollow() { return busFollow; } };
