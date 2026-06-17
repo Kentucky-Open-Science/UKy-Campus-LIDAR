@@ -27,3 +27,6 @@ web/node_modules/
 .vscode/
 Thumbs.db
 .DS_Store
+
+# Local scratch (not part of the project)
+CLAUDE-FABLE-5.md
