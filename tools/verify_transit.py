@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless runtime check of the live transit layer (web/transit.js + tools/serve.py).
+"""Headless runtime check of the live transit layer (web/transit.js + the tools/twin_server.py transit proxy).
 
 Starts the transit proxy in MOCK mode (deterministic, offline — replays
 tools/_transit_samples), opens the viewer in headless Chromium, waits for the
@@ -24,12 +24,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 SHOTS = os.path.join(ROOT, "extracted")
 
-# tools/inspect.py shadows the stdlib; drop our own dir before importing playwright
-# (same guard as verify_agents.py). Import tools.serve via the package first.
+# tools/inspect.py shadows the stdlib `inspect` when tools/ is on sys.path, breaking
+# numpy's import; drop our own dir BEFORE importing twin_server (it imports numpy) and
+# playwright. `tools` stays importable as a package via ROOT.
 sys.path.insert(0, ROOT)
-from tools import serve as serve_mod  # noqa: E402
-
 sys.path = [p for p in sys.path if os.path.abspath(p or ".") != _HERE]
+from tools import twin_server as twin_mod  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 
@@ -118,8 +118,8 @@ async () => {
 
 
 def main():
-    serve_mod.CTX["proxy"] = serve_mod.build_proxy(mock=True)
-    httpd = serve_mod.make_server(0)
+    twin_mod.PROXY = twin_mod.build_proxy(mock=True)
+    httpd = twin_mod.make_server(0)   # world stays None: only the transit proxy + static
     port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     os.makedirs(SHOTS, exist_ok=True)

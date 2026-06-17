@@ -867,7 +867,7 @@ async function loadRoads() {
   const cityGroundY = await loadCity();
 
   // Live Lextran transit layer: baked route lines + stops (data/transit.json) plus
-  // moving buses / arrivals / alerts proxied at runtime by tools/serve.py
+  // moving buses / arrivals / alerts proxied at runtime by tools/twin_server.py
   // (/api/transit/*). Created unconditionally — it renders routes+stops with no
   // proxy and live buses with no transit.json, and never throws into the loop.
   // Drapes buses on the campus road ribbons + terrain, and on the city plane
@@ -1059,7 +1059,7 @@ function updateTransitStatus() {
   if (alertsNode) {
     const alerts = state.transit.transit.getAlerts();
     if (s.proxy === 'offline') {
-      alertsNode.textContent = 'run  python -m tools.serve  for live buses';
+      alertsNode.textContent = 'run  python -m tools.twin_server  for live buses';
     } else if (alerts.length) {
       const a = alerts[0];
       alertsNode.textContent = `⚠ ${alerts.length} alert${alerts.length > 1 ? 's' : ''}: ` +
@@ -1431,7 +1431,7 @@ function refreshBusList() {
   if (!buses.length) {
     const d = document.createElement('div');
     d.className = 'hint'; d.style.margin = '2px 0';
-    d.textContent = 'no live buses — run python -m tools.serve';
+    d.textContent = 'no live buses — run python -m tools.twin_server';
     node.appendChild(d);
     return;
   }

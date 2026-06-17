@@ -7,7 +7,7 @@
 //             into data/transit.json (already projected to scene metres + draped),
 //             drawn once as colored route lines and instanced stop markers.
 //   LIVE    — moving buses, predicted arrivals, and service alerts, polled from the
-//             same-origin proxy tools/serve.py (/api/transit/*). The proxy projects
+//             same-origin proxy tools/twin_server.py (/api/transit/*). The proxy projects
 //             each bus's lon/lat into scene metres for us, so this file never needs
 //             a map projection; it interpolates buses between polls, drapes them on
 //             the road/terrain with a downward ray (same trick as agents.js ground
@@ -338,7 +338,7 @@ export function createTransitSystem(deps = {}) {
       okProxy = true;
     } catch (e) {
       status.proxy = 'offline';
-      status.error = 'live feed offline — run: python -m tools.serve';
+      status.error = 'live feed offline — run: python -m tools.twin_server';
     } finally {
       if (!stopped) {
         // Fast cadence only once the proxy answers; otherwise probe slowly so a
