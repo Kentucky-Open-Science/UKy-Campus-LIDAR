@@ -20,7 +20,7 @@
   <h1>UKy Campus</h1>
   <div id="manifest-status" class="status">manifest: loading&hellip;</div>
 
-  <fieldset>
+  <fieldset class="collapsed">
     <legend>Terrain</legend>
     <label class="row"><input type="checkbox" id="terrain-visible" checked> visible</label>
     <label class="row">opacity
@@ -31,9 +31,9 @@
     <div id="terrain-status" class="status">terrain: waiting for manifest</div>
   </fieldset>
 
-  <fieldset>
+  <fieldset class="collapsed">
     <legend>LiDAR</legend>
-    <label class="row"><input type="checkbox" id="lidar-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="lidar-visible"> visible</label>
     <label class="row">point size
       <input type="range" id="point-size" min="0.02" max="3" step="0.02" value="0.4">
       <span id="point-size-val">0.40</span>
@@ -45,7 +45,7 @@
     <div id="lidar-status" class="status">lidar: waiting for manifest</div>
   </fieldset>
 
-  <fieldset>
+  <fieldset class="collapsed">
     <legend>Buildings</legend>
     <label class="row"><input type="checkbox" id="buildings-visible" checked> visible</label>
     <label class="row">color
@@ -58,7 +58,7 @@
     <div id="buildings-status" class="status">buildings: waiting for manifest</div>
   </fieldset>
 
-  <fieldset>
+  <fieldset class="collapsed">
     <legend>Roads &amp; props</legend>
     <label class="row"><input type="checkbox" id="road-visible" checked> visible</label>
     <label class="row"><input type="checkbox" id="road-roads" checked> road surface</label>
@@ -67,17 +67,40 @@
     <label class="row"><input type="checkbox" id="road-trees"> trees</label>
     <label class="row"><input type="checkbox" id="road-cars"> cars</label>
     <label class="row"><input type="checkbox" id="road-signals" checked> traffic &amp; pedestrian signals</label>
+    <label class="row"><input type="checkbox" id="labels-visible" checked> street name labels</label>
     <div id="road-status" class="status">roads: loading&hellip;</div>
   </fieldset>
 
-  <fieldset>
+  <fieldset class="collapsed">
+    <legend>City (OSM)</legend>
+    <label class="row"><input type="checkbox" id="city-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="city-ground" checked> ground plane</label>
+    <label class="row"><input type="checkbox" id="city-streets" checked> streets</label>
+    <div id="city-status" class="status">city: loading&hellip;</div>
+  </fieldset>
+
+  <fieldset class="collapsed">
+    <legend>Transit (Lextran)</legend>
+    <label class="row"><input type="checkbox" id="transit-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="transit-routes" checked> route lines</label>
+    <label class="row"><input type="checkbox" id="transit-stops" checked> bus stops</label>
+    <label class="row"><input type="checkbox" id="transit-buses" checked> live buses</label>
+    <div id="transit-status" class="status">transit: loading&hellip;</div>
+    <div id="transit-alerts" class="status">&nbsp;</div>
+    <div class="bus-list-label">live buses — click to follow</div>
+    <div id="transit-bus-list" class="bus-list">&mdash;</div>
+    <div class="hint">Live buses need the proxy: <code>python -m tools.serve</code><br>
+      Query from the console: <code>window.__twin.transit</code></div>
+  </fieldset>
+
+  <fieldset class="collapsed">
     <legend>Camera</legend>
     <button id="camera-reset">Reset view</button>
     <div class="hint">LMB orbit &middot; RMB pan &middot; wheel zoom<br>
       WASD move &middot; Q/E down/up &middot; Shift = fast</div>
   </fieldset>
 
-  <fieldset>
+  <fieldset class="collapsed">
     <legend>Agents</legend>
     <label class="row">type
       <select id="agent-type">

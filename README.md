@@ -7,10 +7,15 @@ imagery into open formats and view them in an interactive Three.js web viewer
 ## Quick start
 
 ```sh
-cd web
-python -m http.server 8000
+python -m tools.serve          # static files + LIVE Lextran bus feed, on :8000
 # Open http://localhost:8000/
 ```
+
+`tools/serve.py` is a drop-in for `python -m http.server` that also proxies the
+live Lexington (Lextran) GTFS-Realtime feed so you get **moving buses** on the map.
+No buses needed? Plain `cd web && python -m http.server 8000` still works (routes +
+stops render; live buses just stay off). Add `python -m tools.serve --mock` to
+replay a recorded feed offline.
 
 The viewer loads `web/data/manifest.json` and streams terrain tiles + LiDAR
 point chunks. All data is pre-extracted — the server just serves static files.
@@ -31,7 +36,12 @@ CAMPUS/
 │   ├── extract_buildings.py  # LiDAR building-class → 3D mesh (legacy, DBSCAN)
 │   ├── extract_buildings_hybrid.py  # OSM footprints split LiDAR + give height
 │   ├── verify_buildings_osm.py      # verify footprints vs OSM ground truth
-│   ├── osm_roads.py          # OpenStreetMap → road network (roads.json)
+│   ├── osm_roads.py          # OpenStreetMap → campus road network (roads.json)
+│   ├── osm_city.py           # OpenStreetMap → city-wide streets + ground plane (city.json)
+│   ├── lextran_gtfs.py       # Lextran static GTFS → routes + stops (transit.json)
+│   ├── serve.py              # static server + live GTFS-Realtime proxy (/api/transit/*)
+│   ├── pack_buildings.py     # merge 3,109 building meshes → one buffer (fast load)
+│   ├── transit_common.py     # shared lon/lat → scene projection (georef)
 │   ├── extract_roads.py      # aerial-texture road detector (alt. road source)
 │   ├── fetch_lfucg_signals.py # download LFUCG real traffic-signal locations
 │   ├── smooth_roads.py       # smooth roads + signalise junctions → signals.json
@@ -43,6 +53,8 @@ CAMPUS/
 │   ├── index.html
 │   ├── app.js
 │   ├── roads.js              # road ribbons + signals/crosswalks + live signal controller
+│   ├── city.js               # city-wide OSM ground plane + streets (city.json)
+│   ├── transit.js            # live Lextran buses + routes/stops/arrivals/alerts
 │   ├── agents.js             # autonomous agents (car/truck/robot/drone) + sensors
 │   ├── style.css
 │   ├── lib/                  # Vendored Three.js 0.160 + OrbitControls
@@ -51,9 +63,12 @@ CAMPUS/
 │       ├── meshes/*.bin      # 16 terrain tiles (verts, UVs, indices)
 │       ├── textures/*.jpg    # 18 aerial imagery textures
 │       ├── lidar/chunk_*.bin # 64 decimated point-cloud chunks
-│       ├── buildings/*.bin   # ~890 extracted building meshes
+│       ├── buildings/*.bin   # per-building meshes (legacy / fallback)
+│       ├── buildings.pack.bin + .json  # all buildings in ONE buffer (fast load)
 │       ├── roads.json        # smoothed road centrelines + real intersections
-│       └── signals.json      # machine-readable signal model (autonomous agents)
+│       ├── signals.json      # machine-readable signal model (autonomous agents)
+│       ├── city.json         # city-wide OSM streets + ground plane
+│       └── transit.json      # Lextran routes + stops (live buses via tools/serve.py)
 └── extracted/                # Per-domain manifests + reports
 ```
 
@@ -98,6 +113,15 @@ wireframe mode, camera reset.
 - All 3,109 buildings dropped onto the terrain (no floaters; 4 road-spanning bridges
   left elevated) — `python -m tools.ground_buildings`.
 - Viewport: ~1.8 km x 3.4 km area centered on UKy Lexington campus
+- 3,109 buildings packed into ONE buffer (`buildings.pack.bin`, ~3.9 MB): the
+  viewer makes 1 request + 1 draw call instead of ~3,100 — all buildings ready in
+  ~2 s. Regenerate with `python -m tools.pack_buildings`.
+- City context: full Lextran service area (~18 x 16 km) of OpenStreetMap streets
+  (8,481 ways) on a flat ground plane, so the whole bus network has streets + ground
+  beyond the campus tiles. Regenerate with `python -m tools.osm_city`.
+- Transit: 27 Lextran routes + 878 stops (`transit.json`), plus live buses /
+  arrivals / alerts via the `tools/serve.py` proxy. Regenerate with
+  `python -m tools.lextran_gtfs`.
 
 ## Digital twin — controllable signals + autonomous agents
 
@@ -116,3 +140,13 @@ back a POV **camera**, live **position** (scene m / UE cm / UTM-16N), object
 that keeps ground vehicles on the road or terrain and tells you which one they're
 on. Full API + schemas for both in [web/README.md](web/README.md); smoke-test the
 agent sensors with `python tools/verify_agents.py`.
+
+The twin also carries the **real Lexington bus network**. `tools/serve.py` proxies
+the live Lextran GTFS-Realtime feed and the viewer animates the actual buses on the
+map — with route lines, stops, predicted arrivals, and service alerts — all reachable
+at `window.__twin.transit` (`getVehicles` / `getNearestVehicle` / `getArrivals` / …).
+Buses are wired into the agent sensor bus too (`sensors.transit`), so an autonomous
+agent can yield to or wait for a real campus bus. Because the network spans far past
+the campus tiles, `tools/osm_city.py` lays down the rest of Lexington (OSM streets +
+a ground plane) so every route has ground beneath it. Smoke-test the live layer with
+`python tools/verify_transit.py`.

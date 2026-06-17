@@ -13,6 +13,12 @@ web/data/
 extracted/
 *.log
 
+# Transit/OSM build caches (large, regenerable). The small realtime JSON fixtures
+# (VehiclePosition/TripUpdate/Alert) are kept — tools/serve.py --mock and
+# tools/verify_transit.py replay them offline.
+tools/_transit_samples/*.zip
+tools/_transit_samples/osm_city.json
+
 # Node (web viewer dev server)
 node_modules/
 web/node_modules/

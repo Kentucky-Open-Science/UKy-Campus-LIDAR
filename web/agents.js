@@ -71,7 +71,7 @@ const DEFAULT_COLORS = { car: 0x3577c9, truck: 0xc7702a, robot: 0x4aa05a, drone:
 
 // =====================================================================
 export function createAgentSystem(deps) {
-  const { THREE: _T, scene, renderer, viewerCamera, controls, groups, coords, signals } = deps;
+  const { THREE: _T, scene, renderer, viewerCamera, controls, groups, coords, signals, transit } = deps;
   // (we use the imported THREE for scratch; deps.THREE is the same module instance.)
 
   const group = new THREE.Group(); group.name = 'agents';
@@ -104,7 +104,7 @@ export function createAgentSystem(deps) {
     setPiP(a) { this._pip = resolve(a); },
 
     // internal hooks used by Agent methods
-    renderer, scene, coords, signals, groups, controls,
+    renderer, scene, coords, signals, transit, groups, controls,
     _getRT: getRT, _nearbyBuildings: nearbyBuildings, _groundCandidates: groundCandidates,
     _rebuildGridIfNeeded: rebuildGridIfNeeded,
   };
@@ -200,7 +200,25 @@ export function createAgentSystem(deps) {
   // Buildings stream in one-per-frame over several seconds (app.js loadBuildings).
   // Bin only the NEWLY-added meshes each frame (append-only fast path) instead of
   // re-walking all ~3109 every tick; full rebuild only if meshes were removed.
+  function addBoxToGrid(b) {
+    const item = { mesh: null, min: b.min, max: b.max, cx: b.cx, cz: b.cz, name: b.name, id: b.id };
+    grid.items.push(item);
+    const gx = Math.floor(item.cx / grid.cell), gz = Math.floor(item.cz / grid.cell);
+    const k = gx + ',' + gz;
+    let cell = grid.map.get(k); if (!cell) grid.map.set(k, cell = []);
+    cell.push(item);
+  }
   function rebuildGridIfNeeded() {
+    // packed buildings: one merged render mesh, but per-building AABBs are provided
+    // here, so the broad-phase grid is built from boxes (no per-mesh children).
+    const boxes = groups.buildingBoxes && groups.buildingBoxes();
+    if (boxes) {
+      if (boxes.length === grid.count) return;
+      grid.map.clear(); grid.items.length = 0;
+      for (let i = 0; i < boxes.length; i++) addBoxToGrid(boxes[i]);
+      grid.count = grid.builtCount = boxes.length;
+      return;
+    }
     const bg = groups.buildings;
     const n = bg ? bg.children.length : 0;
     if (n === grid.count) return;
@@ -236,7 +254,12 @@ export function createAgentSystem(deps) {
         m.userData.surfaceClass = 'terrain'; out.push(m);
       }
     }
-    for (const it of nearbyBuildings(x, z)) { it.mesh.userData.surfaceClass = 'building'; out.push(it.mesh); }
+    // packed-building boxes have no per-building mesh to raycast (the merged mesh
+    // would mean ~580k tris per probe); buildings just aren't a ground surface then.
+    for (const it of nearbyBuildings(x, z)) {
+      if (!it.mesh) continue;
+      it.mesh.userData.surfaceClass = 'building'; out.push(it.mesh);
+    }
     return out;
   }
 
@@ -483,6 +506,10 @@ class Agent {
     s.frame = this.sys.frame; s.dt = dt; s.t = this.sys.t;
     s.collisions = this.contacts;          // last frame's contacts (this frame refilled in pass 2)
     s.signals = this.sys.signals ? this.sys.signals() : null;
+    // live Lextran transit (window.__twin.transit): query/avoid/await campus buses.
+    // Buses aren't collidable bodies, so a controller senses them here and reacts —
+    // e.g. s.transit.getNearestVehicle(this.getState().position) to yield to a bus.
+    s.transit = this.sys.transit ? this.sys.transit() : null;
     s.camera = {
       read: (o) => a.camera.read(o),
       pose: () => a.camera.pose(),

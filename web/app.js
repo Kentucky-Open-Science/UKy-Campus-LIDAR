@@ -11,6 +11,9 @@ import * as THREE from 'three';
 import { OrbitControls } from './lib/OrbitControls.js';
 import { createRoadNetwork } from './roads.js';
 import { createAgentSystem } from './agents.js';
+import { createTransitSystem } from './transit.js';
+import { createCitySystem } from './city.js';
+import { createStreetLabels } from './labels.js';
 
 // ---------------------------------------------------------------- config ---
 
@@ -27,8 +30,12 @@ const state = {
     offsetCm: [0, 0, 0], originalCoordinates: null,
     budget: 6_000_000, pumping: false,
   },
-  buildings: { tiles: [], group: null, loaded: 0, failed: 0 },
+  buildings: { tiles: [], group: null, loaded: 0, failed: 0, packed: null, boxes: null },
   roadnet: null,       // real road network + props from roads.json (roads.js)
+  city: null,          // city-wide OSM ground plane + streets (city.js)
+  cityRoads: null,     // raw city.json roads (for street labels)
+  labels: null,        // street-name labels (labels.js)
+  transit: null,       // live Lextran transit layer (transit.js)
   agents: null,        // autonomous-agent simulation layer (agents.js)
   helpers: null,
   hasRealData: false,
@@ -81,6 +88,7 @@ state.terrain.group = new THREE.Group();
 state.lidar.group = new THREE.Group();
 state.buildings.group = new THREE.Group();
 scene.add(state.terrain.group, state.lidar.group, state.buildings.group);
+state.lidar.group.visible = false;   // LiDAR off by default (heavy on the GPU); lazy-loaded when enabled
 
 // Lights — terrain uses unlit MeshBasic so it is unaffected, but buildings and
 // the procedural city use MeshStandard and need light to shade (and show up).
@@ -254,11 +262,17 @@ async function loadManifest() {
     if (total > 0) {
       const slider = $('point-budget');
       slider.max = Math.max(1, Math.ceil(total / 1e6));
-      slider.value = slider.max;  // show all points by default
-      $('point-budget-val').textContent = parseFloat(slider.max).toFixed(1);
-      state.lidar.budget = total;
+      // Default to a lighter budget for framerate (the full ~12M point cloud is
+      // brutal on integrated GPUs); the slider still reaches the full cloud.
+      const defM = Math.min(slider.max, 5);
+      slider.value = defM;
+      $('point-budget-val').textContent = defM.toFixed(1);
+      state.lidar.budget = defM * 1e6;
     }
-    lidarPump();
+    // Don't stream the point cloud until the user enables it (off by default for
+    // framerate); toggling 'visible' lazy-loads it (see the lidar-visible handler).
+    if ($('lidar-visible').checked) lidarPump();
+    else setStatus(el.lidarStatus, 'lidar: off — tick “visible” to load the point cloud');
   } else {
     setStatus(el.lidarStatus, 'lidar: not in manifest', 'error');
   }
@@ -673,7 +687,82 @@ function updateBuildingsStatus() {
     failed.length === tiles.length ? 'error' : (loaded ? 'ok' : null));
 }
 
+// Dispatcher: prefer the single packed buffer (tools/pack_buildings.py) — one
+// fetch + one draw call instead of ~3,100 — and fall back to the per-building
+// stream if the pack isn't present.
 async function loadBuildings(blds) {
+  state.buildings.tiles = blds || [];
+  try {
+    const r = await fetch(DATA_DIR + 'buildings.pack.json', { cache: 'no-cache' });
+    if (r.ok) { await loadBuildingsPacked(await r.json()); return; }
+  } catch (e) { /* no pack -> per-building fallback */ }
+  await loadBuildingsPerTile(blds);
+}
+
+// Fast path: one packed mesh. Positions are already final scene-space (axis-
+// swapped, origin-subtracted, ground-dropped by the packer), so we upload them
+// directly and compute normals once. Picking + colour-by-height are preserved via
+// the per-building ranges in the sidecar; agent collision uses the baked AABBs.
+async function loadBuildingsPacked(meta) {
+  showOverlay('buildings: loading packed mesh…');
+  let buf;
+  try {
+    const r = await fetch(DATA_DIR + (meta.bin || 'buildings.pack.bin'), { cache: 'no-cache' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    buf = await r.arrayBuffer();
+  } catch (e) {
+    hideOverlay();
+    console.warn('packed buildings failed, falling back per-tile:', e);
+    return loadBuildingsPerTile(state.buildings.tiles);
+  }
+  const dv = new DataView(buf);
+  // header: 'BPK1' (4) + u32 count, totalVerts, totalIndices
+  const count = dv.getUint32(4, true), tv = dv.getUint32(8, true), ti = dv.getUint32(12, true);
+  let off = 16;
+  const pos = new Float32Array(buf, off, tv * 3); off += tv * 12;
+  const idx = new Uint32Array(buf, off, ti);
+
+  const blds = meta.buildings || [];
+  const heights = blds.map((b) => b.heightM);
+  const minH = Math.min(...heights), maxH = Math.max(...heights);
+  const mode = $('buildings-color-mode').value;
+  const col = new Float32Array(tv * 3);
+  const c = new THREE.Color();
+  for (const b of blds) {
+    if (mode === 'grey') c.setHex(0x8899aa);
+    else c.copy(buildingHeightColor(b.heightM, minH, maxH));
+    for (let v = b.vStart; v < b.vStart + b.vCount; v++) {
+      col[v * 3] = c.r; col[v * 3 + 1] = c.g; col[v * 3 + 2] = c.b;
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeVertexNormals();
+  geo.computeBoundingBox(); geo.computeBoundingSphere();
+  const material = new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 0.8, metalness: 0.1, side: THREE.DoubleSide,
+  });
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.name = 'buildings-packed';
+  mesh.userData = { packed: true, buildings: blds };
+  state.buildings.group.add(mesh);
+  state.buildings.packed = { mesh, meta, minH, maxH };
+  // per-building scene AABBs for the agent collision broad-phase (no un-merging)
+  state.buildings.boxes = blds.map((b, i) => ({
+    id: i, name: b.name, min: b.min, max: b.max,
+    cx: (b.min[0] + b.max[0]) / 2, cz: (b.min[2] + b.max[2]) / 2,
+  }));
+
+  hideOverlay();
+  onRealData();
+  setStatus($('buildings-status'),
+    `buildings: ${count} packed (1 fetch, 1 draw call)`, 'ok');
+}
+
+async function loadBuildingsPerTile(blds) {
   state.buildings.tiles = blds;
   updateBuildingsStatus();
   if (!blds.length) return;
@@ -702,6 +791,47 @@ async function loadBuildings(blds) {
   hideOverlay();
 }
 
+// faceIndex (into the packed index buffer) -> owning building, via the sorted
+// per-building index ranges (binary search).
+function buildingAtFace(blds, faceIndex) {
+  const ii = faceIndex * 3;
+  let lo = 0, hi = blds.length - 1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1, b = blds[m];
+    if (ii < b.iStart) hi = m - 1;
+    else if (ii >= b.iStart + b.iCount) lo = m + 1;
+    else return b;
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------ city ---
+
+// Load the city-wide OSM context (ground plane + streets) from data/city.json.
+// Returns the city ground elevation (used by the transit layer for off-campus
+// buses); resolves to a sane default if the file isn't present.
+async function loadCity() {
+  let data;
+  try {
+    const r = await fetch(DATA_DIR + 'city.json', { cache: 'no-cache' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    data = await r.json();
+  } catch (e) {
+    setStatus($('city-status'),
+      `city: ${DATA_DIR}city.json not found — run tools/osm_city.py`, null);
+    return 285;
+  }
+  state.city = createCitySystem(data, { scene });
+  state.cityRoads = data.roads || [];   // kept for street-name labels
+  scene.add(state.city.group);
+  onRealData();
+  const s = state.city.stats;
+  setStatus($('city-status'),
+    `city: ${s.streets} streets (${Math.round(s.segments / 1000)}k segments)\n` +
+    `ground plane @ ${s.groundY.toFixed(0)} m`, 'ok');
+  return state.city.groundY;
+}
+
 // ----------------------------------------------------------------- roads ---
 
 // Load the road network extracted from the aerial textures (already draped on
@@ -728,6 +858,37 @@ async function loadRoads() {
   state.roadnet = createRoadNetwork(data, { trees: false, cars: false, signalModel });
   scene.add(state.roadnet.group);
 
+  // City-wide OSM context (flat ground plane + the full street network) so the
+  // entire Lextran service area has ground + streets beyond the ~2x3 km campus
+  // tiles. Optional (data/city.json from tools/osm_city.py); campus works without
+  // it. Its ground elevation is where off-campus buses ride.
+  const cityGroundY = await loadCity();
+
+  // Live Lextran transit layer: baked route lines + stops (data/transit.json) plus
+  // moving buses / arrivals / alerts proxied at runtime by tools/serve.py
+  // (/api/transit/*). Created unconditionally — it renders routes+stops with no
+  // proxy and live buses with no transit.json, and never throws into the loop.
+  // Drapes buses on the campus road ribbons + terrain, and on the city plane
+  // (cityGroundY) once they roam past the campus tiles.
+  state.transit = createTransitSystem({
+    scene, dataDir: DATA_DIR, proxyBase: '', groundY: cityGroundY,
+    groups: {
+      terrain: state.terrain.group,
+      roadRibbons: () => state.roadnet && state.roadnet.layers.roads,
+    },
+  });
+  scene.add(state.transit.group);
+  startTransitStatusPolling();
+
+  // Street-name labels (campus streets + major city arterials), one per unique
+  // name, distance-culled each frame so only nearby ones draw.
+  state.labels = createStreetLabels(
+    { roads: data.roads || [], cityRoads: state.cityRoads || [], cityY: cityGroundY },
+    { far: 480, maxLabels: 220 });
+  const lblCb = $('labels-visible');
+  state.labels.group.visible = lblCb ? lblCb.checked : true;
+  scene.add(state.labels.group);
+
   // Autonomous-agent simulation layer (cars/trucks/robots/drones with camera,
   // position, collision-detection, and ground/surface sensors). Created
   // unconditionally — it works with or without signals.json. Terrain/buildings
@@ -739,6 +900,9 @@ async function loadRoads() {
     groups: {
       terrain: state.terrain.group,
       buildings: state.buildings.group,
+      // packed buildings expose per-building AABBs here (one merged render mesh has
+      // no per-building children for the broad-phase to walk); null in legacy mode.
+      buildingBoxes: () => state.buildings.boxes,
       roadRibbons: () => state.roadnet && state.roadnet.layers.roads,
     },
     coords: {
@@ -747,6 +911,7 @@ async function loadRoads() {
       originalCoordinates: () => state.lidar.originalCoordinates,
     },
     signals: () => state.roadnet && state.roadnet.signals,
+    transit: () => state.transit && state.transit.transit,
   });
   scene.add(state.agents.group);
 
@@ -757,6 +922,7 @@ async function loadRoads() {
     signals: state.roadnet.signals || null,
     model: signalModel,
     agents: state.agents,
+    transit: state.transit.transit,
   });
 
   onRealData();
@@ -790,6 +956,7 @@ $('terrain-visible').addEventListener('change', (e) => {
 });
 $('lidar-visible').addEventListener('change', (e) => {
   state.lidar.group.visible = e.target.checked;
+  if (e.target.checked) lidarPump();   // lazy-load the cloud the first time it's enabled
 });
 $('terrain-opacity').addEventListener('input', (e) => {
   state.terrain.opacity = parseFloat(e.target.value);
@@ -816,7 +983,7 @@ $('point-budget').addEventListener('input', (e) => {
   updateLidarStatus();
   lidarPump(); // load more if budget grew
 });
-$('camera-reset').addEventListener('click', () => resetView());
+$('camera-reset').addEventListener('click', () => { exitDrive(); exitBusFollow(); resetView(); });
 
 $('road-visible').addEventListener('change', (e) => {
   if (state.roadnet) state.roadnet.group.visible = e.target.checked;
@@ -827,17 +994,96 @@ for (const key of ['roads', 'markings', 'crosswalks', 'trees', 'cars', 'signals'
     if (state.roadnet) state.roadnet.layers[key].visible = e.target.checked;
   });
 }
+$('labels-visible')?.addEventListener('change', (e) => {
+  if (state.labels) state.labels.setVisible(e.target.checked);
+});
+
+// Collapsible panel sections — click a section's legend to fold/unfold it.
+for (const lg of document.querySelectorAll('#panel fieldset legend')) {
+  lg.addEventListener('click', () => lg.parentElement.classList.toggle('collapsed'));
+}
+
+// ------------------------------------------------------------------ city ---
+$('city-visible')?.addEventListener('change', (e) => {
+  if (state.city) state.city.group.visible = e.target.checked;
+});
+$('city-ground')?.addEventListener('change', (e) => {
+  if (state.city) state.city.layers.ground.visible = e.target.checked;
+});
+$('city-streets')?.addEventListener('change', (e) => {
+  if (state.city) state.city.layers.streets.visible = e.target.checked;
+});
+
+// --------------------------------------------------------------- transit ---
+// Live Lextran layer (transit.js). Master + per-layer toggles null-guard on
+// state.transit (created after roads.json loads). Status is refreshed on a timer
+// from transit.status() as the proxy polls come in.
+$('transit-visible')?.addEventListener('change', (e) => {
+  if (state.transit) state.transit.group.visible = e.target.checked;
+});
+for (const key of ['routes', 'stops', 'buses']) {
+  const cb = $('transit-' + key);
+  if (cb) cb.addEventListener('change', (e) => {
+    if (state.transit) state.transit.layers[key].visible = e.target.checked;
+  });
+}
+
+let _transitStatusTimer = null;
+function startTransitStatusPolling() {
+  if (_transitStatusTimer) return;
+  _transitStatusTimer = setInterval(updateTransitStatus, 1000);
+  updateTransitStatus();
+}
+function updateTransitStatus() {
+  const node = $('transit-status');
+  if (!node || !state.transit) return;
+  const s = state.transit.transit.status();
+  const proxyTxt = { ok: 'live', mock: 'mock', offline: 'proxy offline', error: 'feed error',
+                     connecting: 'connecting…' }[s.mode === 'mock' ? 'mock' : s.proxy] || s.proxy;
+  let txt = `transit: ${s.routes} routes, ${s.stops} stops\n${s.buses} buses (${proxyTxt})`;
+  setStatus(node, txt, s.proxy === 'ok' ? 'ok' : (s.proxy === 'offline' ? 'error' : null));
+  const alertsNode = $('transit-alerts');
+  if (alertsNode) {
+    const alerts = state.transit.transit.getAlerts();
+    if (s.proxy === 'offline') {
+      alertsNode.textContent = 'run  python -m tools.serve  for live buses';
+    } else if (alerts.length) {
+      const a = alerts[0];
+      alertsNode.textContent = `⚠ ${alerts.length} alert${alerts.length > 1 ? 's' : ''}: ` +
+        (a.header || a.effect || '').slice(0, 80);
+    } else {
+      alertsNode.textContent = 'no active service alerts';
+    }
+  }
+  refreshBusList();
+}
 
 $('buildings-visible').addEventListener('change', (e) => {
   state.buildings.group.visible = e.target.checked;
 });
 $('buildings-wireframe').addEventListener('change', (e) => {
+  if (state.buildings.packed) {
+    state.buildings.packed.mesh.material.wireframe = e.target.checked;
+    return;
+  }
   for (const t of state.buildings.tiles) {
     if (t.object) t.object.material.wireframe = e.target.checked;
   }
 });
 $('buildings-color-mode').addEventListener('change', () => {
   const mode = $('buildings-color-mode').value;
+  if (state.buildings.packed) {
+    const { mesh, minH, maxH, meta } = state.buildings.packed;
+    const col = mesh.geometry.getAttribute('color');
+    const c = new THREE.Color();
+    for (const b of meta.buildings) {
+      if (mode === 'grey') c.setHex(0x8899aa);
+      else c.copy(buildingHeightColor(b.heightM, minH, maxH));
+      for (let v = b.vStart; v < b.vStart + b.vCount; v++) col.setXYZ(v, c.r, c.g, c.b);
+    }
+    col.needsUpdate = true;
+    return;
+  }
   const heights = state.buildings.tiles.map((b) => b.heightCm / 100);
   const minH = Math.min(...heights);
   const maxH = Math.max(...heights);
@@ -904,6 +1150,9 @@ $('agent-pip').addEventListener('change', applyPiP);
 $('agent-pip-select').addEventListener('change', applyPiP);
 
 function resetView() {
+  // Don't steal the camera from an active follow/drive — loaders call resetView()
+  // as terrain/tiles stream in, which would otherwise yank you off the bus/agent.
+  if (busFollow.id || drive.agent) return;
   const box = new THREE.Box3();
   if (state.terrain.group.children.length && state.terrain.group.visible) {
     box.expandByObject(state.terrain.group);
@@ -936,6 +1185,7 @@ const keys = new Set();
 window.addEventListener('keydown', (e) => {
   if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
   if (e.code === 'Escape' && drive.agent) { exitDrive(); return; } // release the driven agent
+  if (e.code === 'Escape' && busFollow.id) { exitBusFollow(); return; } // release the followed bus
   keys.add(e.code);
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
@@ -979,6 +1229,7 @@ const _chasePos = new THREE.Vector3(), _chaseTgt = new THREE.Vector3();
 
 function enterDrive(agent) {
   if (!agent || !agent.alive) return;
+  if (busFollow.id) exitBusFollow();   // can't follow a bus and drive an agent at once
   if (drive.agent && drive.agent !== agent && drive.agent.alive && drive.agent.stop) {
     drive.agent.stop(); // don't leave the previously-driven agent rolling on its last input
   }
@@ -1062,12 +1313,126 @@ function updateChaseCamera(dt, snap) {
   camera.lookAt(controls.target);
 }
 
-// mouse wheel adjusts chase distance while driving (OrbitControls handles zoom otherwise)
+// mouse wheel adjusts chase distance while driving an agent or following a bus
+// (OrbitControls handles zoom otherwise)
 renderer.domElement.addEventListener('wheel', (e) => {
-  if (!drive.agent) return;
-  e.preventDefault();
-  drive.distance = Math.max(3, Math.min(150, drive.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+  if (drive.agent) {
+    e.preventDefault();
+    drive.distance = Math.max(3, Math.min(150, drive.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+  } else if (busFollow.id) {
+    e.preventDefault();
+    busFollow.distance = Math.max(8, Math.min(220, busFollow.distance * (e.deltaY > 0 ? 1.1 : 0.9)));
+  }
 }, { passive: false });
+
+// ------------------------------------------------ bus follow (3rd person) ---
+// Click a bus (in the panel list or in the scene) to enter a chase view that
+// tracks it. Mirrors the agent drive chase cam, but the bus drives itself — we
+// only follow, reading its live position/heading from window.__twin.transit.
+const busFollow = { id: null, distance: 34 };
+const _bfPos = new THREE.Vector3(), _bfTgt = new THREE.Vector3();
+
+function enterBusFollow(id) {
+  if (!state.transit) return;
+  const v = state.transit.transit.getVehicle(id);
+  if (!v) return;
+  if (drive.agent) exitDrive();          // release any agent drive first
+  busFollow.id = String(id);
+  controls.enabled = false;              // we own the camera while following
+  keys.clear();
+  updateBusFollowCamera(0, true);        // snap behind the bus now
+  updateBusFollowHint();
+  refreshBusList();                      // highlight the followed row
+}
+function exitBusFollow() {
+  const had = busFollow.id;
+  busFollow.id = null;
+  controls.enabled = true;
+  if (had && state.transit) {
+    const v = state.transit.transit.getVehicle(had);
+    if (v) controls.target.set(v.position[0], v.position[1], v.position[2]);
+  }
+  controls.update();
+  updateBusFollowHint();
+  refreshBusList();
+}
+function updateBusFollowCamera(dt, snap) {
+  if (!busFollow.id || !state.transit) return;
+  const v = state.transit.transit.getVehicle(busFollow.id);
+  if (!v) { exitBusFollow(); return; }   // bus left service / out of feed
+  const p = v.position, yaw = (v.heading || 0) * Math.PI / 180;
+  const fx = Math.cos(yaw), fz = -Math.sin(yaw);   // bus forward = (cos,0,-sin)
+  const d = busFollow.distance;
+  _bfPos.set(p[0] - fx * d, p[1] + d * 0.45, p[2] - fz * d);
+  if (_bfPos.y < p[1] + 4) _bfPos.y = p[1] + 4;    // keep the cam above the bus
+  _bfTgt.set(p[0], p[1] + 3, p[2]);
+  const k = snap ? 1 : 1 - Math.exp(-6 * dt);
+  camera.position.lerp(_bfPos, k);
+  controls.target.lerp(_bfTgt, k);
+  camera.lookAt(controls.target);
+}
+function updateBusFollowHint() {
+  const node = $('drive-hint');
+  if (!node) return;
+  if (busFollow.id) {
+    const v = state.transit && state.transit.transit.getVehicle(busFollow.id);
+    node.innerHTML = `Following bus <b>${v ? v.label : busFollow.id}</b>` +
+      ` &middot; wheel = zoom &middot; <b>Esc</b> release`;
+    node.classList.remove('hidden');
+  } else if (!drive.agent) {
+    node.classList.add('hidden');
+  }
+}
+
+// Populate the live-bus list in the panel (called ~1 Hz from updateTransitStatus).
+function refreshBusList() {
+  const node = $('transit-bus-list');
+  if (!node) return;
+  if (!state.transit) { node.textContent = '—'; return; }
+  const buses = state.transit.transit.getVehicles().slice().sort((a, b) =>
+    String(a.label).localeCompare(String(b.label), undefined, { numeric: true }) ||
+    String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+  node.textContent = '';
+  if (!buses.length) {
+    const d = document.createElement('div');
+    d.className = 'hint'; d.style.margin = '2px 0';
+    d.textContent = 'no live buses — run python -m tools.serve';
+    node.appendChild(d);
+    return;
+  }
+  for (const v of buses) {
+    const row = document.createElement('div');
+    row.className = 'bus-row' + (String(v.id) === busFollow.id ? ' active' : '');
+    const badge = document.createElement('span');
+    badge.className = 'bus-badge';
+    badge.style.background = v.route && v.route.color ? '#' + v.route.color : '#3b82c4';
+    badge.textContent = String(v.label).slice(0, 4);
+    const info = document.createElement('span');
+    info.textContent = '#' + v.id + (v.occupancy ? ' · ' + v.occupancy.replace(/_/g, ' ') : '');
+    row.appendChild(badge); row.appendChild(info);
+    row.addEventListener('click', () => enterBusFollow(v.id));
+    node.appendChild(row);
+  }
+}
+
+// Click a bus in the 3D scene to follow it (distinguish a click from an orbit drag).
+let _clickX = 0, _clickY = 0, _clickT = 0;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  _clickX = e.clientX; _clickY = e.clientY; _clickT = performance.now();
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (Math.hypot(e.clientX - _clickX, e.clientY - _clickY) > 6) return;  // was a drag
+  if (performance.now() - _clickT > 500) return;                         // long press
+  if (!state.transit || !state.transit.layers.buses.children.length) return;
+  mouseNdc.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseNdc.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouseNdc, camera);
+  const hits = raycaster.intersectObjects(state.transit.layers.buses.children, true);
+  if (!hits.length) return;
+  let o = hits[0].object;
+  while (o && !(o.name && o.name.startsWith('bus-'))) o = o.parent;
+  if (o && o.name) enterBusFollow(o.name.slice(4));
+});
 
 // -------------------------------------------------- cursor world readout ---
 
@@ -1105,7 +1470,10 @@ function updateCursorReadout() {
   const ue = sceneToUeCm(p.x, p.y, p.z);
   let txt = `scene m: ${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)}\n` +
     `UE cm: ${fmt(ue[0], 0)}, ${fmt(ue[1], 0)}, ${fmt(ue[2], 0)}`;
-  if (obj.userData && obj.userData.buildingName) {
+  if (obj.userData && obj.userData.packed) {
+    const b = buildingAtFace(obj.userData.buildings, hits[0].faceIndex);
+    if (b) txt += `\nbuilding: ${b.name} (${b.heightM.toFixed(1)}m)`;
+  } else if (obj.userData && obj.userData.buildingName) {
     txt += `\nbuilding: ${obj.userData.buildingName}` +
       ` (${(obj.userData.heightCm / 100).toFixed(1)}m)`;
   }
@@ -1129,14 +1497,20 @@ function animate() {
   if (drive.agent && !drive.agent.alive) exitDrive(); // driven agent was despawned
   if (drive.agent) {
     applyAgentDrive();          // WASD -> agent controls
+  } else if (busFollow.id) {
+    /* camera follows the bus (updateBusFollowCamera below); no free-fly / orbit */
   } else {
     applyFly(dt);               // WASD -> free camera fly
     controls.update();          // (skip while chasing: updateChaseCamera owns the camera)
   }
   updateCursorReadout();
+  // transit first so its interpolated bus positions are fresh when agents sense them
+  if (state.transit) state.transit.transit.tick(dt);
   if (state.roadnet && state.roadnet.signals) state.roadnet.signals.tick(dt);
   if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
   if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame
+  if (busFollow.id) updateBusFollowCamera(dt); // follow AFTER the bus moved this frame
+  if (state.labels) state.labels.tick(camera); // distance-cull street labels (camera final)
   renderer.render(scene, camera);
 
   frames++;
@@ -1158,4 +1532,5 @@ animate();
 
 // debug hook (handy for screenshots / console poking; harmless in production)
 window.__viewer = { THREE, scene, camera, controls, state, resetView,
-                    get agents() { return state.agents; } };
+                    get agents() { return state.agents; },
+                    get busFollow() { return busFollow; } };
