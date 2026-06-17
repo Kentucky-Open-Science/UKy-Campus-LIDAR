@@ -120,7 +120,15 @@
     </label>
     <div id="agent-list" class="status mono">agents: none</div>
     <div id="agent-surface" class="status mono">surface: --</div>
-    <div class="hint">Drive from the console: <code>window.__twin.agents</code></div>
+    <div class="hint">These are LOCAL to this browser. For the shared world, see below.</div>
+  </fieldset>
+
+  <fieldset class="collapsed">
+    <legend>Shared world (server)</legend>
+    <label class="row"><input type="checkbox" id="netagents-visible" checked> visible</label>
+    <div id="netagents-status" class="status">shared world: connecting&hellip;</div>
+    <div class="hint">Agents spawned by scripts via <code>tools/twin_server.py</code> +
+      <code>client/twin.py</code> appear here for everyone connected.</div>
   </fieldset>
 
   <div id="fps" class="status">-- fps</div>
