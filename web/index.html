@@ -71,6 +71,26 @@
   </fieldset>
 
   <fieldset>
+    <legend>City (OSM)</legend>
+    <label class="row"><input type="checkbox" id="city-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="city-ground" checked> ground plane</label>
+    <label class="row"><input type="checkbox" id="city-streets" checked> streets</label>
+    <div id="city-status" class="status">city: loading&hellip;</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Transit (Lextran)</legend>
+    <label class="row"><input type="checkbox" id="transit-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="transit-routes" checked> route lines</label>
+    <label class="row"><input type="checkbox" id="transit-stops" checked> bus stops</label>
+    <label class="row"><input type="checkbox" id="transit-buses" checked> live buses</label>
+    <div id="transit-status" class="status">transit: loading&hellip;</div>
+    <div id="transit-alerts" class="status">&nbsp;</div>
+    <div class="hint">Live buses need the proxy: <code>python -m tools.serve</code><br>
+      Query from the console: <code>window.__twin.transit</code></div>
+  </fieldset>
+
+  <fieldset>
     <legend>Camera</legend>
     <button id="camera-reset">Reset view</button>
     <div class="hint">LMB orbit &middot; RMB pan &middot; wheel zoom<br>

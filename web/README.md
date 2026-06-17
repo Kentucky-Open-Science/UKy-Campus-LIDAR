@@ -336,8 +336,10 @@ others. A registered controller `fn(sensors, agent)` runs each tick and returns 
 `controls` object (return nothing to hold the last one); a throw is caught and the
 agent holds its last controls — it never aborts the render or the signals tick.
 `sensors` is `getState()` (below) plus `frame`, `dt`, `t`, `collisions` (this
-frame's contacts), `signals` (the live signal controller, or null), and
-`camera.read()/pose()` (lazy — rendering only happens if you call it).
+frame's contacts), `signals` (the live signal controller, or null), `transit`
+(the live Lextran controller `window.__twin.transit`, or null — so a controller
+can sense, yield to, or wait for a real campus bus), and `camera.read()/pose()`
+(lazy — rendering only happens if you call it).
 
 ```jsonc
 // agent.getState()  (also passed into the controller each tick)
@@ -411,3 +413,118 @@ frame, so anything you can do from a script you can also do from the keyboard.
 
 Headless smoke test (spawn + all four sensors + third-person drive):
 `python tools/verify_agents.py`.
+
+## Transit (Lextran) — live buses, arrivals, alerts
+
+`transit.js` adds the real Lexington bus network to the twin. It has a **static**
+half (route lines + stops, baked once) and a **live** half (moving buses, predicted
+arrivals, service alerts) proxied at runtime — because the upstream GTFS-Realtime
+feed is plain HTTP with no CORS, a browser can't read it directly.
+
+**Run it with the proxy** (drop-in for `python -m http.server`):
+
+```sh
+python -m tools.serve                 # static files + live feed, http://localhost:8000/
+python -m tools.serve --mock          # replay tools/_transit_samples (offline demo/CI)
+python -m tools.serve --selftest      # hit every endpoint and exit 0/1
+```
+
+Plain `http.server` still works — you just get routes + stops, no live buses (the
+viewer probes the proxy once, then backs off, so there's no 404 spam).
+
+`tools/serve.py` projects each bus's lon/lat into scene metres with the same georef
+the roads use (`tools/transit_common.Projector`) and re-serves same-origin JSON:
+
+```
+GET /api/transit/vehicles   { ts, count, vehicles:[{ id, routeId, route, tripId,
+                              stopId, status, occupancy, lat, lon, bearing, speed,
+                              x, z, vts }] }     # x,z = scene metres; viewer drapes y
+GET /api/transit/trips      { ts, byStop:{ stopId:[{routeId,tripId,arrival,delay}] }, byTrip }
+GET /api/transit/alerts     { ts, alerts:[{ header, cause, effect, routes, stops, start, end }] }
+GET /api/transit/meta       { mode, cacheAges, georef, endpoints }
+```
+
+### `data/transit.json` (static, baked by `tools/lextran_gtfs.py`)
+
+```jsonc
+{
+  "scope": "full-network",                 // whole Lextran network, not just campus
+  "georef": { "A": 719242.59, "B": 4212857.25, "epsg": 32616, "utmZone": "16N" },
+  "cityGroundY": 281.49,                    // off-campus draping plane (city.json)
+  "routes": [ { "id":"3", "shortName":"3", "longName":"Tates Creek Road",
+                "color":"173862", "textColor":"FFFFFF",
+                "shapes":[ [[x,y,z], ...], ... ] } ],   // scene metres, draped
+  "stops":  [ { "id":"100", "name":"West Main @ 707", "lat":.., "lon":..,
+                "pos":[x,y,z], "routes":["3","6"] } ]
+}
+```
+
+Routes drape on the campus terrain where it exists and on the flat city plane
+(`city.json`) elsewhere, so the whole network is visible. Bake with
+`python -m tools.lextran_gtfs` (add `--campus-only` for just the campus tiles).
+
+### Autonomous-agent transit API (`window.__twin.transit`)
+
+The viewer ticks the layer each frame (interpolating buses between polls and
+draping them on the road/terrain) and exposes the controller so an agent or the
+console can sense the network:
+
+```js
+const T = window.__twin.transit;
+T.getVehicles();                       // [{ id, routeId, route, position:[x,y,z], heading, speed, occupancy, ... }]
+T.getNearestVehicle([x, z], maxR);     // closest bus to a scene point (+ distance)
+T.getStops(); T.getNearestStop([x,z]); // stops + nearest (+ distance)
+T.getArrivals(stopId);                 // [{ routeId, etaMin, etaSec, arrival, delay }] from TripUpdates
+T.getAlerts();                         // decoded service alerts
+T.getRoutes(); T.status();             // route table; live status (proxy/mode/counts)
+```
+
+Because buses aren't collidable bodies, an agent controller reaches them through
+`sensors.transit` (see the agents section) — e.g. brake when
+`s.transit.getNearestVehicle(s.position, 30)` returns a closing bus.
+
+Headless smoke test (mock proxy → buses render + move, API works, an agent senses a
+bus): `python tools/verify_transit.py`.
+
+## City context (OSM) — completing the twin
+
+The LiDAR/terrain only covers the ~2×3 km campus, but the bus network spans ~18×16
+km of Lexington. `city.js` lays down the rest as context so every route, stop, and
+bus has ground + streets under it: one flat **ground plane** just below the campus
+terrain (which stays a raised, detailed island) and the full **OSM street network**
+as a single class-coloured `LineSegments`. Baked by `tools/osm_city.py` (Overpass)
+into `data/city.json`:
+
+```jsonc
+{ "groundY": 281.49, "bbox_scene": [xmin,zmin,xmax,zmax],
+  "roads": [ { "pts": [[x,z], ...], "class": "primary", "name": "..." } ] }  // flat at groundY
+```
+
+```sh
+python -m tools.osm_city          # fetch OSM for the transit bbox + write city.json
+```
+
+Off-campus buses ride this plane (`groundY` is passed to the transit layer). Run
+`osm_city` before `lextran_gtfs` so the transit baker reads the matching elevation.
+
+## Packed buildings (fast load)
+
+The per-building path fetches ~3,100 tiny `.bin` files (≈3,100 round-trips + draw
+calls). `tools/pack_buildings.py` bakes them all into **one** buffer — the viewer
+makes a single request and one draw call (buildings ready in ~2 s instead of a long
+stream). The packer applies the axis-swap, origin subtraction, ground-drop, and
+winding-flip the viewer used to do per vertex, so positions are final scene-space.
+
+```
+data/buildings.pack.bin :  'BPK1' u32 count, u32 totalVerts, u32 totalIndices,
+                           f32 positions[totalVerts*3], u32 indices[totalIndices]
+data/buildings.pack.json:  { count, buildings:[{ name, vStart,vCount, iStart,iCount,
+                             heightM, min:[x,y,z], max:[x,y,z] }] }
+```
+
+`app.js` auto-detects the pack (falling back to the per-building stream if absent).
+Picking still works (a raycast `faceIndex` maps to a building via the sorted index
+ranges) and so does colour-by-height (a per-vertex colour filled from each
+building's height). The per-building AABBs feed the agent collision broad-phase, so
+agents still bump into individual buildings even though they're one render mesh.
+Build with `python -m tools.pack_buildings` (or `tools/build_all.py`, step 6).

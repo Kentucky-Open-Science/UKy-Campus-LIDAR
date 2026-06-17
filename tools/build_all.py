@@ -26,7 +26,8 @@ class Args:
             setattr(self, k, v)
 
 
-def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings):
+def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
+                   skip_pack=False, with_city=False, with_transit=False):
     """Run extraction steps (these may be no-ops if data already exists)."""
     print('=' * 60)
     print(' UKy Campus — full data extraction pipeline')
@@ -62,6 +63,29 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings):
 
     print('\n--- Step 5: Merge manifests -> web/data/manifest.json ---')
     merge_manifests()
+
+    # Step 6: pack the per-building meshes into ONE buffer for fast loading
+    # (3,109 fetches + draw calls -> 1). Local, no network; runs whenever the
+    # buildings exist. See tools/pack_buildings.py.
+    if not skip_pack and not skip_buildings:
+        print('\n--- Step 6: Pack buildings (3,109 meshes -> one buffer) ---')
+        subprocess.run([sys.executable, '-m', 'tools.pack_buildings'], cwd=ROOT, check=True)
+
+    # Steps 7-8 (opt-in; need network): the city-wide OSM context + the Lextran
+    # transit layer. Best-effort — a network failure warns but never fails the build.
+    # Order matters: city first, so the transit baker reads its ground elevation.
+    if with_city:
+        print('\n--- Step 7: City-wide OSM streets + ground plane ---')
+        try:
+            subprocess.run([sys.executable, '-m', 'tools.osm_city'], cwd=ROOT, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f'  [warn] osm_city failed ({e}); skipping city layer')
+    if with_transit:
+        print('\n--- Step 8: Lextran static GTFS -> transit.json ---')
+        try:
+            subprocess.run([sys.executable, '-m', 'tools.lextran_gtfs'], cwd=ROOT, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f'  [warn] lextran_gtfs failed ({e}); skipping transit layer')
 
 
 def merge_manifests():
@@ -229,6 +253,12 @@ if __name__ == '__main__':
     ap.add_argument('--skip-meshes', action='store_true')
     ap.add_argument('--skip-lidar', action='store_true')
     ap.add_argument('--skip-buildings', action='store_true')
+    ap.add_argument('--skip-pack', action='store_true',
+                    help='skip packing buildings into one buffer (keep per-building .bins)')
+    ap.add_argument('--with-city', action='store_true',
+                    help='also build the city-wide OSM context (needs network)')
+    ap.add_argument('--with-transit', action='store_true',
+                    help='also bake the Lextran transit layer (needs network)')
     ap.add_argument('--verify', action='store_true',
                     help='Verify data integrity without extracting')
     args = ap.parse_args()
@@ -238,4 +268,4 @@ if __name__ == '__main__':
         sys.exit(0 if ok else 1)
 
     run_extraction(args.skip_textures, args.skip_meshes, args.skip_lidar,
-                   args.skip_buildings)
+                   args.skip_buildings, args.skip_pack, args.with_city, args.with_transit)
