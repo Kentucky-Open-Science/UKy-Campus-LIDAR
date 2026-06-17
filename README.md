@@ -32,7 +32,8 @@ CAMPUS/
 │   ├── inspect.py            # Export/property dumper
 │   ├── extract_texture.py    # Texture2D -> PNG -> JPEG
 │   ├── extract_mesh.py       # StaticMesh -> .bin (positions, UVs, indices)
-│   ├── extract_lidar.py      # LidarPointCloud -> decimated chunked .bin
+│   ├── extract_lidar.py      # LidarPointCloud -> decimated chunked .bin (campus only)
+│   ├── ky_lidar.py           # KyFromAbove/KYAPED LiDAR -> citywide point cloud + ground grid
 │   ├── extract_scene.py      # Blueprint scene assembly (transforms, materials)
 │   ├── extract_buildings.py  # LiDAR building-class → 3D mesh (legacy, DBSCAN)
 │   ├── extract_buildings_hybrid.py  # OSM footprints split LiDAR + give height
@@ -91,6 +92,29 @@ python tools/build_all.py
 # Or selectively:
 python tools/build_all.py --skip-textures --skip-meshes
 ```
+
+## Filling in Lexington — KyFromAbove LiDAR
+
+The campus point cloud started as a single UE asset (`POINT_CLOUD_2019`); the rest of
+Lexington is filled in from the authoritative statewide **KyFromAbove / KYAPED** LiDAR
+(2025, Phase 3), which **supersedes** the campus scan where they overlap. `tools/ky_lidar.py`
+queries the tile index, downloads the 5,000-ft `.copc.laz` tiles from S3, reprojects them
+from NAD83 Kentucky Single Zone (US ft) into the scene's UTM-16N frame, and writes the
+viewer's point chunks plus a citywide bare-ground elevation grid.
+
+```sh
+pip install "laspy[lazrs]" pyproj numpy pillow
+python -m tools.ky_lidar --list                 # 168 tiles over the city extent
+python -m tools.ky_lidar --download-aoi         # fetch every tile to extracted/ (~8 GB, resumable)
+python -m tools.ky_lidar --build --heightmap    # -> web/data/lidar/ky_*.bin + ground.f32 + manifest
+python -m tools.twin_server                     # serve viewer + world + buses on :8000
+```
+
+Then open http://localhost:8000/, expand the **LiDAR** panel, and tick **visible**. Agent
+ground-snapping (`tools/twin_server.Ground`) uses the new `ground.f32` grid as the primary
+elevation citywide, so cars/buses follow real terrain beyond the campus tiles. Everything
+lands under the gitignored `web/data/`; the previous campus manifest is backed up to
+`web/data/manifest.campus.bak.json`.
 
 ## Viewer controls
 

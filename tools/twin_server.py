@@ -117,6 +117,21 @@ class Ground:
             self.ok = True
         except Exception as e:  # noqa: BLE001 — degrade to a flat world
             print(f"[ground] no terrain heightmap ({e}); using a flat plane at {self.city_y} m")
+        self.kygrid = None
+        self._load_kygrid()
+
+    def _load_kygrid(self):
+        """Load the KyFromAbove city-wide bare-ground elevation grid (built by
+        tools/ky_lidar.py --heightmap). Used as the PRIMARY ground across Lexington;
+        the campus mesh heightmap + flat city plane remain fallbacks for any gaps."""
+        try:
+            gm = json.load(open(os.path.join(DATA, "ground.json")))
+            arr = np.fromfile(os.path.join(DATA, "ground.f32"), np.float32)
+            self.kygrid = (arr.reshape(gm["nz"], gm["nx"]), gm)
+            print(f"[ground] KYAPED ground grid {gm['nx']}x{gm['nz']} @ {gm['cell']} m "
+                  f"({100 * gm['filled'] / max(gm['total'], 1):.0f}% filled)")
+        except Exception:  # noqa: BLE001 — optional layer
+            self.kygrid = None
 
     def _georef(self, manifest):
         oc = manifest["lidar"]["original_coordinates"]
@@ -143,6 +158,13 @@ class Ground:
         self.szmin, self.szmax = -gz1 / 100, -gz0 / 100
 
     def height(self, sx, sz):
+        if self.kygrid is not None:                    # KYAPED city ground (primary)
+            arr, gm = self.kygrid
+            ix = int((sx - gm["x0"]) / gm["cell"]); iz = int((sz - gm["z0"]) / gm["cell"])
+            if 0 <= ix < gm["nx"] and 0 <= iz < gm["nz"]:
+                v = arr[iz, ix]
+                if v == v:                             # finite (not NaN) -> real ground
+                    return float(v), "terrain"
         if self.ok and self.sxmin <= sx <= self.sxmax and self.szmin <= sz <= self.szmax:
             return float(self._elev(sx * 100.0, -sz * 100.0)) / 100.0, "terrain"
         return self.city_y, "terrain"
