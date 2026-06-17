@@ -72,7 +72,7 @@ CAMPUS/
 │       ├── city.json         # city-wide OSM streets + ground plane
 │       └── transit.json      # Lextran routes + stops (live buses via tools/serve.py)
 ├── client/                  # twin.py — dependency-free Python client for the world API
-├── examples/                # drone_demo.py — spawn/fly/collide via the twin server
+├── examples/                # drone_demo.py + car/truck/robot vision demos (YOLO via the camera feed)
 └── extracted/                # Per-domain manifests + reports
 ```
 
@@ -209,3 +209,31 @@ python -m tools.twin_server &                 # the twin
 python examples/drone_demo.py --url http://localhost:8000   # a client script
 # open http://localhost:8000/ in a browser to watch it in 3-D
 ```
+
+### First-person cameras + vision navigation (YOLO)
+
+The server can also produce a **first-person video feed** for every agent, so a script
+can drive by what the agent *sees* instead of by ground-truth state. The server has no
+renderer of its own, so `--render` attaches a headless browser (the viewer) as an
+internal render service and serves JPEG frames:
+
+```sh
+python -m tools.twin_server --render          # adds /api/world/agents/<id>/camera
+```
+
+From a script, `agent.camera_image(w, h)` returns the frame as a PIL image. The
+`car` / `truck` / `robot` examples feed it to the **smallest YOLO model** (`yolov8n`)
+and steer to avoid what it detects — e.g. it flags the campus traffic-signal heads as
+COCO `traffic light` and vehicles in the aerial ground imagery as `car`:
+
+```sh
+pip install -r examples/requirements.txt      # ultralytics (smallest YOLO) + torch (CPU ok)
+python -m tools.twin_server --render &
+python examples/car_demo.py                    # or truck_demo.py / robot_demo.py
+# open http://localhost:8000/ to watch them drive themselves
+```
+
+All three spawn into the same shared world, so you can run them together (and watch in a
+browser) and they'll see and bump into each other. `client/twin.py` exposes the feed as
+`agent.camera()` (JPEG bytes) / `agent.camera_image()` (PIL); `examples/yolo_drive.py`
+holds the shared camera→YOLO→controls loop.
