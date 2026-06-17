@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from twin import Twin, TwinError           # noqa: E402
 from yolo_drive import load_model, navigate  # noqa: E402
 
-TYPE, COLOR, START = "car", 0xff5533, [0, None, 0]
+TYPE, COLOR, START = "car", 0xff5533, [-127.0, 303.6, 1224.1]
 
 
 def main():
