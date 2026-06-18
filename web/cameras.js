@@ -24,6 +24,7 @@
 // render loop.
 
 import * as THREE from 'three';
+import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 const MARK_LIFT = 0.3;          // housing sits this far above the post top
 const POLE_H = 6.0;             // camera mast height (m)
@@ -150,7 +151,8 @@ export function createCameraSystem(deps = {}) {
   function placeInstance(i, x, baseY, z, m, q, s, p) {
     // drape on the terrain heightmap when available, else the baked elevation / city plane
     const gy = groundY(x, z);
-    const ground = gy != null ? gy : (Number.isFinite(baseY) ? baseY : refGroundY);
+    const ground = FLAT_WORLD ? FLAT_Y
+      : (gy != null ? gy : (Number.isFinite(baseY) ? baseY : refGroundY));
     poles.setMatrixAt(i, m.compose(p.set(x, ground + POLE_H / 2, z), q, s));
     housings.setMatrixAt(i, m.compose(p.set(x, ground + POLE_H + MARK_LIFT, z), q, s));
   }
