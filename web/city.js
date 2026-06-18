@@ -29,7 +29,7 @@ const STREET_COLOR = {
 };
 const DEFAULT_STREET = 0x6c757f;
 const STREET_LIFT = 0.4;     // above the ground plane
-const GROUND_COLOR = 0x171c23;
+const GROUND_COLOR = 0x363d31;   // muted sage-grey ground plane (visible backdrop)
 
 export function createCitySystem(data, deps = {}) {
   const groundY = (data && typeof data.groundY === 'number') ? data.groundY : 285;

@@ -1497,20 +1497,40 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 renderer.domElement.addEventListener('pointerup', (e) => {
   if (Math.hypot(e.clientX - _clickX, e.clientY - _clickY) > 6) return;  // was a drag
   if (performance.now() - _clickT > 500) return;                         // long press
-  const targets = [];
-  if (state.transit) targets.push(...state.transit.layers.buses.children);
-  if (state.netagents) targets.push(...state.netagents.group.children);
-  if (!targets.length) return;
   mouseNdc.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouseNdc.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouseNdc, camera);
-  const hits = raycaster.intersectObjects(targets, true);
-  if (!hits.length) return;
-  let o = hits[0].object;
-  while (o && !(o.name && (o.name.startsWith('bus-') || o.name.startsWith('net-')))) o = o.parent;
-  if (!o || !o.name) return;
-  if (o.name.startsWith('bus-')) enterFollow('bus', o.name.slice(4));
-  else enterFollow('net', o.name.slice(4), 18);
+  // 1) a bus / shared-world agent -> follow it
+  const movers = [];
+  if (state.transit) movers.push(...state.transit.layers.buses.children);
+  if (state.netagents) movers.push(...state.netagents.group.children);
+  if (movers.length) {
+    const hits = raycaster.intersectObjects(movers, true);
+    if (hits.length) {
+      let o = hits[0].object;
+      while (o && !(o.name && (o.name.startsWith('bus-') || o.name.startsWith('net-')))) o = o.parent;
+      if (o && o.name) {
+        if (o.name.startsWith('bus-')) enterFollow('bus', o.name.slice(4));
+        else enterFollow('net', o.name.slice(4), 18);
+        return;
+      }
+    }
+  }
+  // 2) otherwise identify the building under the click (one-off raycast, NOT per-frame)
+  if (state.buildings.group.visible && state.buildings.group.children.length) {
+    const hits = raycaster.intersectObjects(state.buildings.group.children, false);
+    if (hits.length) {
+      const obj = hits[0].object;
+      let name = null, hM = null;
+      if (obj.userData && obj.userData.packed) {
+        const b = buildingAtFace(obj.userData.buildings, hits[0].faceIndex);
+        if (b) { name = b.name; hM = b.heightM; }
+      } else if (obj.userData && obj.userData.buildingName) {
+        name = obj.userData.buildingName; hM = obj.userData.heightCm / 100;
+      }
+      if (name) setStatus(el.cursor, `building: ${name} (${hM.toFixed(1)} m)`);
+    }
+  }
 });
 
 // -------------------------------------------------- cursor world readout ---
@@ -1518,6 +1538,12 @@ renderer.domElement.addEventListener('pointerup', (e) => {
 const raycaster = new THREE.Raycaster();
 const mouseNdc = new THREE.Vector2();
 let mouseMoved = false;
+// Cursor readout uses an analytic ray-vs-ground-plane intersection (O(1)) instead
+// of raycasting the merged 100k+ building mesh every mouse-move — the latter is a
+// brute-force ~2M-triangle test per frame that collapsed fps to single digits while
+// orbiting/panning. Building identity moved to click (pickBuildingAt).
+const _groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const _hitPt = new THREE.Vector3();
 renderer.domElement.addEventListener('pointermove', (e) => {
   mouseNdc.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouseNdc.y = -(e.clientY / window.innerHeight) * 2 + 1;
@@ -1529,33 +1555,19 @@ function fmt(v, d = 1) { return v.toFixed(d); }
 function updateCursorReadout() {
   if (!mouseMoved) return;
   mouseMoved = false;
-  const hasTerrain = state.terrain.group.children.length && state.terrain.group.visible;
-  const hasBuildings = state.buildings.group.children.length && state.buildings.group.visible;
-  if (!hasTerrain && !hasBuildings) {
-    setStatus(el.cursor, 'cursor: (no terrain or buildings to raycast)');
-    return;
-  }
   raycaster.setFromCamera(mouseNdc, camera);
-  const targets = [];
-  if (hasBuildings) targets.push(...state.buildings.group.children);
-  if (hasTerrain) targets.push(...state.terrain.group.children);
-  const hits = raycaster.intersectObjects(targets, false);
-  if (!hits.length) {
+  // intersect the flat ground plane analytically — no geometry traversal
+  const gy = (state.city && typeof state.city.groundY === 'number')
+    ? state.city.groundY : 0;
+  _groundPlane.constant = -gy;
+  if (!raycaster.ray.intersectPlane(_groundPlane, _hitPt)) {
     setStatus(el.cursor, 'cursor: --');
     return;
   }
-  const p = hits[0].point;
-  const obj = hits[0].object;
+  const p = _hitPt;
   const ue = sceneToUeCm(p.x, p.y, p.z);
   let txt = `scene m: ${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)}\n` +
     `UE cm: ${fmt(ue[0], 0)}, ${fmt(ue[1], 0)}, ${fmt(ue[2], 0)}`;
-  if (obj.userData && obj.userData.packed) {
-    const b = buildingAtFace(obj.userData.buildings, hits[0].faceIndex);
-    if (b) txt += `\nbuilding: ${b.name} (${b.heightM.toFixed(1)}m)`;
-  } else if (obj.userData && obj.userData.buildingName) {
-    txt += `\nbuilding: ${obj.userData.buildingName}` +
-      ` (${(obj.userData.heightCm / 100).toFixed(1)}m)`;
-  }
   const oc = state.lidar.originalCoordinates;
   if (oc && oc.length === 3) {
     txt += `\ngeo: ${fmt(oc[0] + ue[0], 0)}, ${fmt(oc[1] + ue[1], 0)}, ` +

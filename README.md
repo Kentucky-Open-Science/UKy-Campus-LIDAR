@@ -2,7 +2,29 @@
 
 Extract UE 4.24.3 UKy Campus LiDAR point cloud + DTM terrain tiles + aerial
 imagery into open formats and view them in an interactive Three.js web viewer
-— **no Unreal Engine required**.
+— **no Unreal Engine required**. The twin now extends past campus to the full
+Lexington / Lextran service area: ~114k OSM building footprints extruded to real
+KyFromAbove/KYAPED LiDAR roof heights, the citywide arterial road network with
+real LFUCG traffic signals + crosswalks, and the live Lextran bus feed — all in
+one draw call at 60 fps.
+
+## Gallery
+
+![Full-city aerial of Lexington](screenshots/lexington-overview.png)
+
+*The full Lextran service area — ~114k OSM building footprints extruded to real
+KYAPED LiDAR roof heights over the city ground plane, with the arterial road
+network, rendered in a single draw call at 60 fps.*
+
+![Following a live Lextran bus at street level](screenshots/lexington-transit.png)
+
+*Street level, following a live Route 7 bus — real lane markings, crosswalks, and
+signalized intersections derived from the LFUCG traffic-signal data.*
+
+![Downtown Lexington with 3D buildings, live signals, and an agent camera](screenshots/lexington-downtown.png)
+
+*Downtown — extruded 3D buildings, live traffic signals, street-name labels, and a
+first-person agent camera (inset).*
 
 ## Quick start
 
