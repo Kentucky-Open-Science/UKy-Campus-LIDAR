@@ -58,7 +58,8 @@ CAMPUS/
 │   ├── ky_lidar.py           # KyFromAbove/KYAPED LiDAR -> citywide point cloud + ground grid
 │   ├── extract_scene.py      # Blueprint scene assembly (transforms, materials)
 │   ├── extract_buildings.py  # LiDAR building-class → 3D mesh (legacy, DBSCAN)
-│   ├── extract_buildings_hybrid.py  # OSM footprints split LiDAR + give height
+│   ├── extract_buildings_hybrid.py  # OSM footprints split LiDAR + give height (campus, UE source)
+│   ├── build_city.py         # full-city 3D buildings: OSM footprints + KYAPED roof heights
 │   ├── verify_buildings_osm.py      # verify footprints vs OSM ground truth
 │   ├── osm_roads.py          # OpenStreetMap → campus road network (roads.json)
 │   ├── osm_city.py           # OpenStreetMap → city-wide streets + ground plane (city.json)
@@ -137,6 +138,45 @@ ground-snapping (`tools/twin_server.Ground`) uses the new `ground.f32` grid as t
 elevation citywide, so cars/buses follow real terrain beyond the campus tiles. Everything
 lands under the gitignored `web/data/`; the previous campus manifest is backed up to
 `web/data/manifest.campus.bak.json`.
+
+## Full-city buildings + roads
+
+The campus extract (`build_all.py`) needs the UE source assets, but the **rest of the
+city is built from open data only** — OpenStreetMap + the KyFromAbove LiDAR — so it
+reproduces from a clone without Unreal. Given the scene georef (`web/data/manifest.json`)
+plus the downloaded LiDAR and ground grid from the KyFromAbove step above:
+
+```sh
+pip install "laspy[lazrs]" pyproj shapely scikit-image numpy
+python -m tools.osm_city            # web/data/city.json (service-area bbox + flat ground plane)
+
+# 3-D buildings: OSM footprints extruded to real KYAPED roof heights, flat base on the
+# ground plane (~114k buildings over the full Lextran service area)
+python -m tools.build_city          # -> web/data/buildings/*.bin + merges the manifest
+python -m tools.pack_buildings      # -> buildings.pack.bin/.json (ONE fetch, ONE draw call)
+
+# roads + real traffic signals
+python -m tools.osm_roads           # -> roads.json (OSM highways draped on the plane)
+python -m tools.smooth_roads        # -> signals.json (gated against the LFUCG signal layer)
+```
+
+`tools/build_city.py` fetches OSM footprints (tiled + cached, resumable), streams the
+LiDAR one tile at a time so memory stays bounded over the whole city, and sets each
+building's height from the **85th-percentile elevation of the non-ground (class 1)
+returns inside its footprint** (KYAPED has no building class, so non-ground-over-a-
+footprint is the roof) minus the `ground.f32` ground elevation. Buildings sit flat on
+the city ground plane (`city.json` `groundY`); the true terrain still shows when the
+LiDAR layer is toggled on. Heights land where expected — median ~8 m, up to ~123 m
+downtown (Lexington's tallest tower). Tune with `--grid` / `--sample` / `--roof-pct`.
+
+**Performance:** the viewer renders all buildings as one packed buffer / one draw call,
+and `roads.js` renders ribbons + signal props with merged + instanced geometry, so the
+full city holds **60 fps** (LiDAR off by default). Detailing *every* residential street
+city-wide pushes the scene past ~13M triangles, so the shipped twin details the
+**arterial** road network (where the signals are) and leaves residential streets as the
+lightweight `city.json` lines — filter the OSM highway set to the major classes before
+`osm_roads` to reproduce that. The cursor read-out intersects the ground plane
+analytically (no per-frame mesh raycast), so orbit/pan stays smooth at city scale.
 
 ## Viewer controls
 
