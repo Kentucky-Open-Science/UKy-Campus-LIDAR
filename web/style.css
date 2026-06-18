@@ -164,15 +164,18 @@ code { color: #ffcf5e; }
 
 /* Live traffic-camera picture-in-picture (top-right, below the agent PiP slot).
    A resizable flex column: drag the title bar to move it, drag the bottom-right
-   corner to resize (the video fills whatever space is left). */
+   corner to resize (the video fills whatever space is left).
+   The city streams are 960x720 (4:3); the default panel gives a ~640x480 video so
+   you see close to the native resolution instead of a downscaled box. Drag the
+   corner larger (up to 92vw/90vh) to view it 1:1. */
 .cam-pip {
   position: fixed;
   right: 12px;
   top: 12px;
-  width: 360px;
-  height: 298px;
-  min-width: 220px;
-  min-height: 180px;
+  width: 640px;
+  height: 536px;
+  min-width: 260px;
+  min-height: 220px;
   max-width: 92vw;
   max-height: 90vh;
   display: flex;
