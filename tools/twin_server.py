@@ -33,6 +33,8 @@ API (JSON, CORS-open; see client/twin.py for a Python wrapper):
     GET    /api/transit/trips                -> predicted arrivals, indexed by stop and trip
     GET    /api/transit/alerts               -> service alerts (decoded cause/effect)
     GET    /api/transit/meta                 -> transit proxy status (mode, cache ages, georef)
+    GET    /api/cameras/streams             -> fresh tokenized HLS URLs per camera id
+    GET    /api/cameras/meta                -> camera proxy status (mode, cache age, count)
     (anything else) -> served as a static file from web/
 
 Run:  python -m tools.twin_server [--port 8000] [--hz 50] [--render]
@@ -571,6 +573,7 @@ class World:
 WORLD = None   # set in main()
 RENDER = None  # RenderService when --render is on
 PROXY = None   # TransitProxy when the live bus proxy is on (default; --no-transit disables)
+CAMERAS = None  # CameraProxy when the live traffic-camera proxy is on (default; --no-cameras disables)
 
 
 class RenderService:
@@ -854,6 +857,81 @@ def build_proxy(mock=False, cache_seconds=None):
 
 
 # =====================================================================
+# Live traffic-camera proxy.
+#
+# The static camera->intersection mapping is baked offline into web/data/cameras.json
+# (tools/lex_cameras.py); the ONE thing that can't be baked is the stream URL, because
+# the city re-signs every HLS playlist with a ~15-minute token. So, exactly like the
+# transit proxy hands the viewer fresh bus positions, this hands it fresh, un-expired
+# HLS URLs — scraped from the same public map, cached, and re-served same-origin. The
+# browser then plays them directly with hls.js (the Wowza origin sends
+# Access-Control-Allow-Origin:*, verified, so no segment proxying is needed).
+CAMERA_MAP_URL = "https://trafficvid.lexingtonky.gov/publicmap/"
+
+
+class CameraProxy:
+    """Scrapes the city traffic-camera map for fresh tokenized HLS URLs and re-serves
+    them same-origin. Never raises into the viewer — on a scrape failure it serves the
+    last good URLs (flagged stale); the tokens last ~15 min, far longer than the cache,
+    so a transient failure is invisible."""
+
+    def __init__(self, cache_seconds=60.0, url=CAMERA_MAP_URL):
+        self.url = url
+        self.cache_seconds = cache_seconds
+        self._lock = threading.Lock()
+        self._cache = None          # (fetched_at, payload)
+
+    def _scrape(self):
+        req = urllib.request.Request(self.url, headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html = r.read().decode("utf-8", "replace")
+        html = html.replace("'", '"')
+        sub = html[html.find("camMarker"):]
+        arr = sub[sub.find("["):sub.find("]")] + "]"
+        rows = json.loads(arr)
+        cams = {}
+        for c in rows:
+            cid = c.get("camera")
+            if not cid:
+                continue
+            cams[cid] = {"hls": c.get("hls"), "dash": c.get("dash"),
+                         "still": c.get("still"), "status": c.get("status"),
+                         "override": c.get("override")}
+        return cams
+
+    def get(self):
+        now = time.time()
+        with self._lock:
+            if self._cache and now - self._cache[0] < self.cache_seconds:
+                return self._cache[1]
+        try:
+            cams = self._scrape()
+            payload = {"ts": int(now), "count": len(cams), "mode": "live", "cams": cams}
+        except Exception as e:  # noqa: BLE001 — never 500 the viewer over a flaky scrape
+            with self._lock:
+                stale = self._cache[1] if self._cache else None
+            payload = dict(stale) if stale else {"count": 0, "cams": {}}
+            payload["error"] = str(e)
+            payload["stale"] = bool(stale)
+            return payload
+        with self._lock:
+            self._cache = (now, payload)
+        return payload
+
+    def meta(self):
+        with self._lock:
+            age = round(time.time() - self._cache[0], 1) if self._cache else None
+            n = self._cache[1]["count"] if self._cache else 0
+        return {"mode": "live", "mapUrl": self.url, "cacheSeconds": self.cache_seconds,
+                "cacheAge": age, "cameras": n,
+                "endpoints": ["/api/cameras/streams", "/api/cameras/meta"]}
+
+
+def build_camera_proxy(cache_seconds=60.0):
+    return CameraProxy(cache_seconds=cache_seconds)
+
+
+# =====================================================================
 class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -902,10 +980,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._json(PROXY.get(kind))
         return self._json({"error": "unknown endpoint", "path": self.path}, 404)
 
+    def _cameras(self, path):
+        if CAMERAS is None:
+            return self._json({"error": "camera proxy off (started with --no-cameras)"}, 503)
+        if path in ("/api/cameras", "/api/cameras/meta"):
+            return self._json(CAMERAS.meta())
+        if path == "/api/cameras/streams":
+            return self._json(CAMERAS.get())
+        return self._json({"error": "unknown endpoint", "path": self.path}, 404)
+
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.startswith("/api/transit"):
             return self._transit(path)
+        if path.startswith("/api/cameras"):
+            return self._cameras(path)
         if path.startswith("/api/world"):
             if WORLD is None:
                 return self._json({"error": "world not running"}, 503)
@@ -1012,7 +1101,7 @@ def make_server(port, directory=WEB):
 
 
 def main():
-    global WORLD, RENDER, PROXY
+    global WORLD, RENDER, PROXY, CAMERAS
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--hz", type=int, default=50, help="simulation tick rate")
@@ -1023,6 +1112,10 @@ def main():
     ap.add_argument("--no-transit", action="store_true", help="disable the live bus proxy")
     ap.add_argument("--transit-cache-seconds", type=float, default=None,
                     help="seconds to cache each transit feed (default 5 s live / 0.5 s mock)")
+    ap.add_argument("--no-cameras", action="store_true",
+                    help="disable the live traffic-camera URL proxy")
+    ap.add_argument("--camera-cache-seconds", type=float, default=60.0,
+                    help="seconds to cache the scraped camera URLs (tokens last ~900 s; default 60)")
     args = ap.parse_args()
 
     print("loading world (terrain heightmap + building boxes) ...")
@@ -1033,6 +1126,9 @@ def main():
     if not args.no_transit:
         PROXY = build_proxy(mock=args.mock, cache_seconds=args.transit_cache_seconds)
 
+    if not args.no_cameras:
+        CAMERAS = build_camera_proxy(cache_seconds=args.camera_cache_seconds)
+
     httpd = make_server(args.port)
     if args.render:
         RENDER = RenderService(args.port)
@@ -1040,10 +1136,13 @@ def main():
     transit = ("off (--no-transit)" if args.no_transit else
                f"{'MOCK (fixtures)' if args.mock else 'LIVE (mystop.lextran.com)'}"
                "  ->  /api/transit/(vehicles|trips|alerts|meta)")
-    print(f"\nUKy campus twin server — authoritative shared world + live transit")
+    cameras = ("off (--no-cameras)" if args.no_cameras else
+               "LIVE (trafficvid.lexingtonky.gov)  ->  /api/cameras/(streams|meta)")
+    print(f"\nUKy campus twin server — authoritative shared world + live transit + traffic cameras")
     print(f"  viewer:  http://localhost:{args.port}/")
     print(f"  world:   http://localhost:{args.port}/api/world/(state|meta|spawn|agents/<id>/...)")
     print(f"  transit: {transit}")
+    print(f"  cameras: {cameras}")
     print(f"  sim:     {args.hz} Hz   ground:{'on' if WORLD.ground.ok else 'flat'}   "
           f"buildings:{len(WORLD.buildings.items)}")
     print(f"  camera:  {'ON (first-person /agents/<id>/camera; starting headless renderer…)' if args.render else 'off (use --render)'}")

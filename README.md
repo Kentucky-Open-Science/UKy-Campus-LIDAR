@@ -34,11 +34,14 @@ python -m tools.twin_server     # viewer + LIVE Lextran buses + shared-world API
 ```
 
 `tools/twin_server.py` is one server that serves the static viewer, proxies the live
-Lexington (Lextran) GTFS-Realtime feed so you get **moving buses** on the map, and runs the
-authoritative shared-world agent API (`/api/world/*`). Add `--render` for first-person agent
-cameras, `--mock` to replay a recorded bus feed offline, or `--no-transit` to skip the bus
-proxy. No buses or agents needed at all? Plain `cd web && python -m http.server 8000` still
-works — routes + stops render, live buses just stay off.
+Lexington (Lextran) GTFS-Realtime feed so you get **moving buses** on the map, proxies the
+city's **live traffic-camera** stream URLs so you can watch real traffic at the
+intersections (`/api/cameras/*`), and runs the authoritative shared-world agent API
+(`/api/world/*`). Add `--render` for first-person agent cameras, `--mock` to replay a
+recorded bus feed offline, `--no-transit` to skip the bus proxy, or `--no-cameras` to skip
+the camera proxy. No buses or agents needed at all? Plain `cd web && python -m http.server
+8000` still works — routes, stops, and camera markers render; live buses and video just
+stay off.
 
 The viewer loads `web/data/manifest.json` and streams terrain tiles + LiDAR
 point chunks. All data is pre-extracted — the server just serves static files.
@@ -64,8 +67,9 @@ CAMPUS/
 │   ├── osm_roads.py          # OpenStreetMap → campus road network (roads.json)
 │   ├── osm_city.py           # OpenStreetMap → city-wide streets + ground plane (city.json)
 │   ├── lextran_gtfs.py       # Lextran static GTFS → routes + stops (transit.json)
+│   ├── lex_cameras.py        # city traffic cams → intersection mapping (cameras.json)
 │   ├── twin_server.py        # one server: static viewer + shared-world API (/api/world/*)
-│   │                         #   + live GTFS-Realtime bus proxy (/api/transit/*) + --render cams
+│   │                         #   + live bus proxy (/api/transit/*) + camera URL proxy (/api/cameras/*)
 │   ├── pack_buildings.py     # merge 3,109 building meshes → one buffer (fast load)
 │   ├── transit_common.py     # shared lon/lat → scene projection (georef)
 │   ├── roadnet.py            # road graph (routing) from roads.json
@@ -84,10 +88,11 @@ CAMPUS/
 │   ├── roads.js              # road ribbons + signals/crosswalks + live signal controller
 │   ├── city.js               # city-wide OSM ground plane + streets (city.json)
 │   ├── transit.js            # live Lextran buses + routes/stops/arrivals/alerts
+│   ├── cameras.js            # traffic-camera markers + live HLS picture-in-picture
 │   ├── agents.js             # autonomous agents (car/truck/robot/drone) + sensors (local)
 │   ├── netagents.js          # renders the twin_server shared world (agents from any client)
 │   ├── style.css
-│   ├── lib/                  # Vendored Three.js 0.160 + OrbitControls
+│   ├── lib/                  # Vendored Three.js 0.160 + OrbitControls + hls.js 1.6
 │   └── data/                 # Generated extraction output
 │       ├── manifest.json     # Unified scene manifest
 │       ├── meshes/*.bin      # 16 terrain tiles (verts, UVs, indices)
@@ -98,7 +103,8 @@ CAMPUS/
 │       ├── roads.json        # smoothed road centrelines + real intersections
 │       ├── signals.json      # machine-readable signal model (autonomous agents)
 │       ├── city.json         # city-wide OSM streets + ground plane
-│       └── transit.json      # Lextran routes + stops (live buses via tools/twin_server.py)
+│       ├── transit.json      # Lextran routes + stops (live buses via tools/twin_server.py)
+│       └── cameras.json      # traffic cam → intersection map (live HLS via tools/twin_server.py)
 ├── campus_gym/              # Gymnasium (single) + PettingZoo (multi) env over the sim core
 ├── client/                  # twin.py — dependency-free Python client for the world API
 ├── examples/                # drone_demo.py + car/truck/robot vision demos (YOLO via the camera feed)
@@ -246,6 +252,35 @@ agent can yield to or wait for a real campus bus. Because the network spans far 
 the campus tiles, `tools/osm_city.py` lays down the rest of Lexington (OSM streets +
 a ground plane) so every route has ground beneath it. Smoke-test the live layer with
 `python tools/verify_transit.py`.
+
+## Live traffic cameras
+
+The twin also shows **real traffic at the intersections**. The City of Lexington
+publishes ~113 live traffic cameras; `tools/lex_cameras.py` projects each camera's
+lon/lat through the same UTM-16N → scene georef the rest of the twin uses and snaps it
+to the nearest intersection in `signals.json`, baking the mapping into
+`web/data/cameras.json` (106 of 113 land within 75 m of an existing twin intersection;
+the ~7 outliers are highway interchanges, placed at their own GPS position and flagged).
+The viewer (`web/cameras.js`) draws a camera marker on each junction — teal when it sits
+on a twin intersection, amber when it doesn't — and lists them all in the **Traffic
+cameras** panel.
+
+Click a marker (or a list row) to open that intersection's **real-time video in a
+picture-in-picture panel** — just the stream, no detection. The camera feeds are
+tokenized HLS URLs the city re-signs every ~15 minutes, so they can't be baked: like
+the bus positions, `tools/twin_server.py` re-scrapes fresh URLs on demand and serves
+them same-origin (`/api/cameras/streams`); the browser plays them directly with the
+vendored `hls.js` (the camera origin sends permissive CORS, so no segment proxying is
+needed). With no server running you still get the markers and the token-free snapshot
+thumbnail; with it you get live video. Everything is reachable from the console at
+`window.__twin.cameras` (`list` / `getNearest` / `streamUrl` / `still`).
+
+Regenerate the mapping (e.g. if the city adds cameras) with `python -m tools.lex_cameras`
+(reads TrafficStream's cached `cam_data.json`; pass `--scrape` to pull a fresh list, or
+`--cam-data PATH` to point at a specific file). The camera object-detection side
+(YOLO vehicle counts) lives in the separate
+[TrafficStream](https://github.com/Kentucky-Open-Science/TrafficStream2026) project; the
+twin intentionally embeds only the raw stream.
 
 ## Multiplayer twin server — shared world over an API
 

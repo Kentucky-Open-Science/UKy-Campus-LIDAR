@@ -12,6 +12,7 @@ import { OrbitControls } from './lib/OrbitControls.js';
 import { createRoadNetwork } from './roads.js';
 import { createAgentSystem } from './agents.js';
 import { createTransitSystem } from './transit.js';
+import { createCameraSystem } from './cameras.js';
 import { createCitySystem } from './city.js';
 import { createStreetLabels } from './labels.js';
 import { createNetAgents } from './netagents.js';
@@ -38,6 +39,7 @@ const state = {
   labels: null,        // street-name labels (labels.js)
   netagents: null,     // shared-world agents from the twin server (netagents.js)
   transit: null,       // live Lextran transit layer (transit.js)
+  cameras: null,       // live traffic-camera layer (cameras.js)
   agents: null,        // autonomous-agent simulation layer (agents.js)
   helpers: null,
   hasRealData: false,
@@ -882,6 +884,18 @@ async function loadRoads() {
   scene.add(state.transit.group);
   startTransitStatusPolling();
 
+  // Live traffic-camera layer: camera markers snapped to the twin intersection each
+  // one watches (baked data/cameras.json from tools/lex_cameras.py), plus the live
+  // tokenized HLS stream URLs proxied at runtime by tools/twin_server.py
+  // (/api/cameras/*). Click a marker (or a list row) to open the real-time stream in
+  // a picture-in-picture panel — just the video, no detection. Same graceful-
+  // degradation contract as transit: markers with no proxy, live video with it.
+  state.cameras = createCameraSystem({
+    scene, dataDir: DATA_DIR, proxyBase: '', groundY: cityGroundY,
+    groups: { terrain: state.terrain.group },
+  });
+  scene.add(state.cameras.group);
+
   // Street-name labels (campus streets + major city arterials), one per unique
   // name, distance-culled each frame so only nearby ones draw.
   state.labels = createStreetLabels(
@@ -933,6 +947,7 @@ async function loadRoads() {
     model: signalModel,
     agents: state.agents,
     transit: state.transit.transit,
+    cameras: state.cameras.cameras,
   });
 
   onRealData();
@@ -1078,7 +1093,170 @@ function updateTransitStatus() {
       ns.server === 'ok' ? 'ok' : null);
   }
   refreshNetAgentList();
+  updateCameraStatus();
 }
+
+// ---------------------------------------------------------- traffic cameras ---
+// Live camera layer (cameras.js). Master + markers toggles null-guard on
+// state.cameras. The list is filterable (113 cameras); a click on a row — or on a
+// camera marker in the 3D scene — opens the real-time HLS stream in a PiP panel.
+$('cameras-visible')?.addEventListener('change', (e) => {
+  if (state.cameras) state.cameras.group.visible = e.target.checked;
+});
+$('cameras-markers')?.addEventListener('change', (e) => {
+  if (state.cameras) state.cameras.layers.markers.visible = e.target.checked;
+});
+$('cameras-filter')?.addEventListener('input', () => refreshCameraList(true));
+
+function updateCameraStatus() {
+  const node = $('cameras-status');
+  if (!node || !state.cameras) return;
+  const s = state.cameras.cameras.status();
+  const proxyTxt = { ok: 'live streams', offline: 'proxy offline', error: 'feed error',
+                     connecting: 'connecting…' }[s.proxy] || s.proxy;
+  setStatus(node, `cameras: ${s.cameras} (${s.matched} on intersections)\n${proxyTxt}`,
+    s.proxy === 'ok' ? 'ok' : (s.proxy === 'offline' ? 'error' : null));
+  refreshCameraList();
+  // if the PiP panel is open on a still and the proxy just came online, go live
+  if (pip.id != null && !pip.live) {
+    const url = state.cameras.cameras.streamUrl(pip.id);
+    if (url) attachStream(pip.id, url);
+  }
+}
+
+let _camSig = '';
+function refreshCameraList(force) {
+  const node = $('cameras-list');
+  if (!node) return;
+  if (!state.cameras) { node.textContent = '—'; return; }
+  const q = ($('cameras-filter')?.value || '').trim().toLowerCase();
+  let list = state.cameras.cameras.list();
+  if (q) list = list.filter((c) => (c.name || '').toLowerCase().includes(q) ||
+    (c.id || '').toLowerCase().includes(q));
+  list.sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true }));
+  const sig = list.map((c) => c.id).join('|') + '#' + (pip.id || '') + '#' + q +
+    '#' + (state.cameras.cameras.hasProxy() ? '1' : '0');
+  if (!force && sig === _camSig) return;
+  _camSig = sig;
+  node.textContent = '';
+  if (!list.length) {
+    const d = document.createElement('div');
+    d.className = 'hint'; d.style.margin = '2px 0';
+    d.textContent = q ? 'no cameras match' : 'no cameras — run python -m tools.lex_cameras';
+    node.appendChild(d);
+    return;
+  }
+  for (const c of list) {
+    const row = document.createElement('div');
+    row.className = 'bus-row' + (String(c.id) === String(pip.id) ? ' active' : '');
+    const dot = document.createElement('span');
+    dot.className = 'cam-dot';
+    dot.style.background = c.matched ? '#27c4c4' : '#e0a83a';
+    dot.title = c.matched ? `on ${c.intersection} (${c.snapDist} m)` : 'no twin intersection nearby';
+    const info = document.createElement('span');
+    info.textContent = c.name || c.id;
+    row.appendChild(dot); row.appendChild(info);
+    row.addEventListener('click', () => openCamera(c.id));
+    node.appendChild(row);
+  }
+}
+
+// ------- camera PiP: real-time HLS stream (no detection) -------
+const pip = { id: null, hls: null, live: false, stillTimer: null };
+function openCamera(id) {
+  if (!state.cameras) return;
+  const cam = state.cameras.cameras.get(id);
+  if (!cam) return;
+  pip.id = id;
+  $('cam-pip').classList.remove('hidden');
+  $('cam-pip-title').textContent = cam.name + (cam.matched ? '' : ' · (no junction)');
+  const url = state.cameras.cameras.streamUrl(id);
+  if (url) {
+    attachStream(id, url);
+  } else {
+    showStill(id);   // no fresh URL yet — token-free thumbnail until the proxy answers
+  }
+  refreshCameraList(true);
+}
+function teardownStream() {
+  const v = $('cam-pip-video');
+  if (pip.hls) { try { pip.hls.destroy(); } catch (e) { /* noop */ } pip.hls = null; }
+  if (pip.stillTimer) { clearInterval(pip.stillTimer); pip.stillTimer = null; }
+  pip.live = false;
+  try { v.pause(); } catch (e) { /* noop */ }
+  v.removeAttribute('poster');
+  v.removeAttribute('src');
+  try { v.load(); } catch (e) { /* noop */ }
+}
+function attachStream(id, url) {
+  teardownStream();
+  const v = $('cam-pip-video');
+  const note = $('cam-pip-note');
+  const cam = state.cameras.cameras.get(id);
+  const Hls = window.Hls;
+  if (v.canPlayType('application/vnd.apple.mpegurl')) {   // Safari / iOS native HLS
+    v.src = url; v.play().catch(() => {});
+    pip.live = true;
+  } else if (Hls && Hls.isSupported()) {
+    const hls = new Hls({ liveSyncDurationCount: 3, lowLatencyMode: true, backBufferLength: 30 });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
+    hls.on(Hls.Events.ERROR, (evt, data) => {
+      if (!data || !data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();   // token may have rotated
+      else { note.textContent = 'stream error — falling back to snapshot'; showStill(id); }
+    });
+    hls.loadSource(url); hls.attachMedia(v);
+    pip.hls = hls; pip.live = true;
+  } else {
+    showStill(id); return;
+  }
+  note.textContent = cam && cam.intersection
+    ? `live · ${cam.intersection}${cam.snapDist != null ? ' · ' + cam.snapDist + ' m' : ''}`
+    : 'live';
+}
+function showStill(id) {
+  teardownStream();
+  const v = $('cam-pip-video');
+  const note = $('cam-pip-note');
+  const base = state.cameras.cameras.still(id);
+  if (!base) { note.textContent = 'no stream available'; return; }
+  const bust = () => { v.setAttribute('poster', base + (base.includes('?') ? '&' : '?') + '_t=' + Date.now()); };
+  bust();
+  pip.stillTimer = setInterval(() => { if (pip.id === id && !pip.live) bust(); }, 3000);
+  note.textContent = 'snapshot · start  python -m tools.twin_server  for live video';
+}
+$('cam-pip-close')?.addEventListener('click', () => {
+  teardownStream();
+  pip.id = null;
+  $('cam-pip').classList.add('hidden');
+  refreshCameraList(true);
+});
+$('cam-pip-native')?.addEventListener('click', async () => {
+  const v = $('cam-pip-video');
+  try {
+    if (document.pictureInPictureElement) await document.exitPictureInPicture();
+    else if (v.requestPictureInPicture) await v.requestPictureInPicture();
+  } catch (e) { $('cam-pip-note').textContent = 'browser PiP unavailable for this stream'; }
+});
+// drag the PiP panel by its title bar
+(function makeCamPipDraggable() {
+  const panel = $('cam-pip'), bar = panel?.querySelector('.cam-pip-bar');
+  if (!bar) return;
+  let dx = 0, dy = 0, dragging = false;
+  bar.addEventListener('pointerdown', (e) => {
+    if (e.target.tagName === 'BUTTON') return;
+    dragging = true; bar.setPointerCapture(e.pointerId);
+    const r = panel.getBoundingClientRect();
+    dx = e.clientX - r.left; dy = e.clientY - r.top;
+    panel.style.right = 'auto';
+  });
+  bar.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    panel.style.left = Math.max(0, e.clientX - dx) + 'px';
+    panel.style.top = Math.max(0, e.clientY - dy) + 'px';
+  });
+  bar.addEventListener('pointerup', (e) => { dragging = false; try { bar.releasePointerCapture(e.pointerId); } catch (_) {} });
+})();
 
 $('buildings-visible').addEventListener('change', (e) => {
   state.buildings.group.visible = e.target.checked;
@@ -1516,7 +1694,18 @@ renderer.domElement.addEventListener('pointerup', (e) => {
       }
     }
   }
-  // 2) otherwise identify the building under the click (one-off raycast, NOT per-frame)
+  // 2) a traffic-camera marker -> open its live stream in the PiP panel
+  if (state.cameras && state.cameras.group.visible && state.cameras.layers.markers.visible) {
+    const picks = state.cameras.layers.markers.children.filter((o) => o.userData && o.userData.pick);
+    if (picks.length) {
+      const hits = raycaster.intersectObjects(picks, false);
+      if (hits.length && hits[0].instanceId != null) {
+        const cam = state.cameras.cameras.byInstance(hits[0].instanceId);
+        if (cam) { openCamera(cam.id); return; }
+      }
+    }
+  }
+  // 3) otherwise identify the building under the click (one-off raycast, NOT per-frame)
   if (state.buildings.group.visible && state.buildings.group.children.length) {
     const hits = raycaster.intersectObjects(state.buildings.group.children, false);
     if (hits.length) {
@@ -1597,6 +1786,7 @@ function animate() {
   updateCursorReadout();
   // transit first so its interpolated bus positions are fresh when agents sense them
   if (state.transit) state.transit.transit.tick(dt);
+  if (state.cameras) state.cameras.cameras.tick(dt); // re-drape camera markers as terrain streams in
   if (state.netagents) state.netagents.tick(dt); // interpolate shared-world agents
   if (state.roadnet && state.roadnet.signals) state.roadnet.signals.tick(dt);
   if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
