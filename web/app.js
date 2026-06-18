@@ -20,7 +20,22 @@ import { createNetAgents } from './netagents.js';
 // ---------------------------------------------------------------- config ---
 
 const params = new URLSearchParams(location.search);
-const DATA_DIR = (params.get('data') || 'data').replace(/\/+$/, '') + '/';
+// The optional ?data= override points the viewer at an alternate LOCAL data dir, but it
+// must stay a same-origin RELATIVE path: every layer concatenates DATA_DIR into fetch()
+// URLs (manifest, tiles, lidar, buildings, roads, transit.json, cameras.json, …), so an
+// unsanitized value like ?data=https://evil.com/ or ?data=//evil.com/ would redirect all
+// of those requests off-origin (client-side request forgery, CodeQL
+// js/client-side-request-forgery). Restrict it to path-safe characters — which drops the
+// ':' in a scheme and (with the leading-slash strip) any protocol-relative or absolute
+// authority — so the result can only ever resolve against our own origin.
+function sanitizeDataDir(raw) {
+  const cleaned = String(raw || '')
+    .replace(/[^A-Za-z0-9_\-/]/g, '')   // path-safe chars only (no ':', '.', '\\', etc.)
+    .replace(/^\/+/, '')                 // no absolute or '//authority' leading slash
+    .replace(/\/+$/, '');                // trailing slash is re-added below
+  return (cleaned || 'data') + '/';
+}
+const DATA_DIR = sanitizeDataDir(params.get('data'));
 const CM_TO_M = 0.01;
 
 const state = {
