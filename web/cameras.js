@@ -30,6 +30,16 @@ const POLE_H = 6.0;             // camera mast height (m)
 const COL_MATCHED = new THREE.Color('#27c4c4');   // sits on a real twin intersection
 const COL_UNMATCHED = new THREE.Color('#e0a83a'); // placed at its own GPS (highway ramp etc.)
 
+// Resolve a data path against the page origin and refuse anything that would leave it.
+// `dataDir` can originate from the ?data= query param (see app.js DATA_DIR), so this
+// keeps that user-controlled value from redirecting a fetch off-origin — i.e. it can
+// only ever load same-origin data files (CodeQL js/client-side-request-forgery).
+function sameOriginPath(path) {
+  const u = new URL(path, window.location.href);
+  if (u.origin !== window.location.origin) throw new Error('blocked cross-origin data path: ' + path);
+  return u.pathname + u.search;
+}
+
 export function createCameraSystem(deps = {}) {
   const {
     scene, dataDir = 'data/', proxyBase = '', groundY: cityGroundY = 285,
@@ -95,7 +105,7 @@ export function createCameraSystem(deps = {}) {
   async function loadStatic() {
     let data;
     try {
-      const r = await fetch(dataDir + 'cameras.json', { cache: 'no-cache' });
+      const r = await fetch(sameOriginPath(dataDir + 'cameras.json'), { cache: 'no-cache' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       data = await r.json();
     } catch (e) {
