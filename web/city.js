@@ -17,6 +17,7 @@
 // campus, roads, and live transit sit in front of, not another detailed model.
 
 import * as THREE from 'three';
+import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 // class -> line colour (major roads brighter so the network reads at a glance)
 const STREET_COLOR = {
@@ -32,7 +33,8 @@ const STREET_LIFT = 0.4;     // above the ground plane
 const GROUND_COLOR = 0x363d31;   // muted sage-grey ground plane (visible backdrop)
 
 export function createCitySystem(data, deps = {}) {
-  const groundY = (data && typeof data.groundY === 'number') ? data.groundY : 285;
+  const groundY = FLAT_WORLD ? FLAT_Y
+    : ((data && typeof data.groundY === 'number') ? data.groundY : 285);
   const roads = (data && data.roads) || [];
   const bb = (data && data.bbox_scene) || [-1000, -1000, 1000, 1000];
 
@@ -48,7 +50,9 @@ export function createCitySystem(data, deps = {}) {
   const planeGeo = new THREE.PlaneGeometry(w, d);
   const plane = new THREE.Mesh(planeGeo, new THREE.MeshBasicMaterial({ color: GROUND_COLOR }));
   plane.rotation.x = -Math.PI / 2;             // lie flat in XZ
-  plane.position.set(cx, groundY, cz);
+  // In flat mode the campus terrain is pinned to FLAT_Y too; drop the plane a hair so
+  // the textured terrain tiles render cleanly on top of it instead of z-fighting.
+  plane.position.set(cx, FLAT_WORLD ? groundY - 0.5 : groundY, cz);
   plane.renderOrder = -2;                        // behind everything else
   plane.name = 'city-plane';
   layers.ground.add(plane);

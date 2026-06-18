@@ -20,6 +20,7 @@
 // yawFor = (dx,dz) => atan2(-dz, dx). Never reinvent this mapping.
 
 import * as THREE from 'three';
+import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 // ---- module-level scratch (no per-frame allocation; roads.js _pos/_quat idiom) ----
 const _v3a = new THREE.Vector3(), _v3b = new THREE.Vector3(), _v3c = new THREE.Vector3();
@@ -608,6 +609,20 @@ class Agent {
     const cands = this.sys._groundCandidates(x, z);
     const hits = cands.length ? _ray.intersectObjects(cands, false) : [];
     if (!hits.length) {
+      // Flat world: there's one ground everywhere, so rest on FLAT_Y even where no
+      // terrain tile / road ribbon exists (the open city beyond the campus) instead
+      // of falling through.
+      if (FLAT_WORLD) {
+        this.offMap = false; this.surface = 'flat';
+        this.groundY = FLAT_Y; this.groundNormal = [0, 1, 0]; this.slopeDeg = 0;
+        if (this.groundBound) { this.pos.y = FLAT_Y; this.altitudeAGL = 0; this.onGround = true; }
+        else {
+          const floor = FLAT_Y + this.minClearance;
+          if (this.pos.y < floor) { this.pos.y = floor; if (this.vel.y < 0) this.vel.y = 0; }
+          this.altitudeAGL = this.pos.y - FLAT_Y; this.onGround = this.altitudeAGL < 0.5;
+        }
+        return;
+      }
       if (!this.offMap) this._warnOnce('offmap', 'no ground under agent (off map / data not loaded yet); holding altitude');
       this.surface = 'none'; this.groundY = null; this.groundNormal = null;
       this.slopeDeg = null; this.offMap = true;

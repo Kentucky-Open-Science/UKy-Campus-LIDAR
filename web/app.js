@@ -16,6 +16,7 @@ import { createCameraSystem } from './cameras.js';
 import { createCitySystem } from './city.js';
 import { createStreetLabels } from './labels.js';
 import { createNetAgents } from './netagents.js';
+import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 // ---------------------------------------------------------------- config ---
 
@@ -367,7 +368,7 @@ async function loadTile(tile) {
     const wy = lx * M[1] + ly * M[4] + lz * M[7] + dy; // UE world y
     const wz = lx * M[2] + ly * M[5] + lz * M[8] + dz; // UE world z
     outPos[j]     = wx * CM_TO_M; // three.x = ue.x
-    outPos[j + 1] = wz * CM_TO_M; // three.y = ue.z
+    outPos[j + 1] = FLAT_WORLD ? FLAT_Y : wz * CM_TO_M; // three.y = ue.z (pinned flat in flat mode)
     outPos[j + 2] = wy * CM_TO_M; // three.z = ue.y
   }
 
@@ -680,7 +681,9 @@ async function loadBuilding(bld, minH, maxH) {
   mesh.name = bld.name;
   // Drop the building so its base sits on the terrain (ground_y_m baked by
   // tools/ground_buildings.py), unless it is a bridge crossing over a road.
-  if (bld.groundYm != null && !bld.bridge && geometry.boundingBox) {
+  if (FLAT_WORLD && geometry.boundingBox) {
+    mesh.position.y = FLAT_Y - geometry.boundingBox.min.y;   // base on the flat ground
+  } else if (bld.groundYm != null && !bld.bridge && geometry.boundingBox) {
     mesh.position.y = bld.groundYm - geometry.boundingBox.min.y;
   }
   mesh.userData = { buildingName: bld.name, heightCm: bld.heightCm };
@@ -742,6 +745,19 @@ async function loadBuildingsPacked(meta) {
   const idx = new Uint32Array(buf, off, ti);
 
   const blds = meta.buildings || [];
+  // Flat world: shift each building's vertices so its base sits on FLAT_Y (otherwise
+  // campus buildings, baked at the old terrain height, would float once the ground is
+  // flattened). Done before the AABBs below so collision/raycast stay in sync.
+  if (FLAT_WORLD) {
+    for (const b of blds) {
+      const base = (b.min && b.min[1] != null) ? b.min[1] : null;
+      if (base == null) continue;
+      const shift = FLAT_Y - base;
+      if (!shift) continue;
+      for (let v = b.vStart; v < b.vStart + b.vCount; v++) pos[v * 3 + 1] += shift;
+      b.min[1] += shift; b.max[1] += shift;
+    }
+  }
   const heights = blds.map((b) => b.heightM);
   const minH = Math.min(...heights), maxH = Math.max(...heights);
   const mode = $('buildings-color-mode').value;
@@ -873,6 +889,20 @@ async function loadRoads() {
     const sresp = await fetch(DATA_DIR + 'signals.json', { cache: 'no-cache' });
     if (sresp.ok) signalModel = await sresp.json();
   } catch (e) { /* no signals.json: legacy fallback */ }
+
+  // Flat world: pin every road/intersection/crosswalk vertex to FLAT_Y before the
+  // network (and the signal model the agents query) is built, so ribbons, lane
+  // markings, stop bars, crosswalks, signal masts, and the agent stop-line geometry
+  // all sit at one elevation. roads.js then needs no flat-specific code.
+  if (FLAT_WORLD) {
+    for (const r of data.roads || []) for (const p of r.pts || []) p[1] = FLAT_Y;
+    for (const it of data.intersections || []) if (Array.isArray(it) && it.length >= 3) it[1] = FLAT_Y;
+    if (signalModel) for (const it of signalModel.intersections || []) {
+      if (it.center) it.center[1] = FLAT_Y;
+      for (const leg of it.legs || []) if (leg && leg.stopPoint) leg.stopPoint[1] = FLAT_Y;
+      for (const xw of it.crosswalks || []) if (xw && xw.y != null) xw.y = FLAT_Y;
+    }
+  }
 
   state.roadnet = createRoadNetwork(data, { trees: false, cars: false, signalModel });
   scene.add(state.roadnet.group);

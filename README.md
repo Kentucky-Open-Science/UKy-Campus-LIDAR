@@ -199,6 +199,14 @@ restricting `osm_roads` to the arterial classes (leaving residential as the ligh
 UI panel: layer toggles, terrain opacity, UV V-flip, point cloud budget slider,
 wireframe mode, camera reset.
 
+**Flat world (default).** The viewer pins terrain, roads, the city ground plane,
+buildings, buses, agents, and camera markers to a single elevation (`web/flat.js`),
+so moving vehicles always sit on the road instead of clipping through it at the
+campus/city seam (the two elevation systems — campus LiDAR relief and the lower flat
+city plane — used to disagree there). The campus relief is intentionally discarded in
+this mode; append **`?flat=0`** to the URL to restore the real LiDAR terrain elevation
+and per-surface draping.
+
 ## Data stats
 
 - 16 terrain tiles (804 m square grid, half-mile spacing)
