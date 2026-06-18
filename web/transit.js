@@ -30,7 +30,11 @@ import * as THREE from 'three';
 // ---- module-level scratch (no per-frame allocation; roads.js idiom) ----
 const D2R = Math.PI / 180;
 const BUS_LIFT = 0.35;          // wheels sit just above the road ribbon (LIFT 0.30)
-const ROUTE_LIFT = 1.6;         // float route lines clear of the asphalt (draping differs slightly)
+const ROUTE_LIFT = 2.8;         // route lines float this far above cityGroundY. The road
+                                // asphalt rides ~2.3 m above the ground plane (placeholder
+                                // terrain + road LIFT), so one flat height here clears it
+                                // everywhere — no per-point draping mismatch dipping a route
+                                // under the asphalt (which caused the z-fighting).
 const STOP_LIFT = 0.3;
 
 // bearing (deg CW from north) -> three yaw, where forward = (cos yaw, 0, -sin yaw).
@@ -148,12 +152,18 @@ export function createTransitSystem(deps = {}) {
   // asphalt — readable from a campus-wide view where 1px lines vanish. One merged
   // vertex-coloured geometry (one draw call) over all routes.
   function buildRoutes(routes) {
-    const ROUTE_HALF = 1.6;               // ribbon half-width (m)
+    const ROUTE_HALF = 0.5;               // ribbon half-width (m)
+    const N_LANES = 7, LANE = 1.0;        // lateral lanes (m apart) so routes that share a
+                                          // street draw as parallel ribbons instead of one
+                                          // coplanar pile that fights itself.
+    const routeY = cityGroundY + ROUTE_LIFT;   // ONE flat height, clear of the asphalt
     const positions = [], colors = [], index = [];
-    let base = 0;
+    let base = 0, ri = 0;
     for (const rt of routes) {
       routesById.set(rt.id, rt);
       const col = hex(rt.color);
+      // deterministic lane per route, centred on the road (±~3 m)
+      const lat = ((ri++ % N_LANES) - (N_LANES - 1) / 2) * LANE;
       for (const poly of rt.shapes || []) {
         const n = poly.length;
         if (n < 2) continue;
@@ -163,9 +173,10 @@ export function createTransitSystem(deps = {}) {
           if (i > 0) { dx += poly[i][0] - poly[i - 1][0]; dz += poly[i][2] - poly[i - 1][2]; }
           if (i < n - 1) { dx += poly[i + 1][0] - poly[i][0]; dz += poly[i + 1][2] - poly[i][2]; }
           const len = Math.hypot(dx, dz) || 1;
-          const px = -dz / len * ROUTE_HALF, pz = dx / len * ROUTE_HALF;
-          const x = poly[i][0], y = poly[i][1] + ROUTE_LIFT, z = poly[i][2];
-          positions.push(x + px, y, z + pz, x - px, y, z - pz);
+          const ux = -dz / len, uz = dx / len;          // perpendicular unit
+          const cx = poly[i][0] + lat * ux, cz = poly[i][2] + lat * uz;   // lane-shifted centre
+          positions.push(cx + ux * ROUTE_HALF, routeY, cz + uz * ROUTE_HALF,
+                         cx - ux * ROUTE_HALF, routeY, cz - uz * ROUTE_HALF);
           colors.push(col.r, col.g, col.b, col.r, col.g, col.b);
         }
         for (let i = 0; i + 1 < n; i++) {
@@ -182,11 +193,9 @@ export function createTransitSystem(deps = {}) {
     geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
     geo.setIndex(index);
     geo.computeBoundingSphere();
-    // Overlay semantics so the colours don't z-fight: many Lextran routes share a
-    // street, so their ribbons are coplanar. Drawing them as a transparent overlay
-    // (after the opaque road/terrain) with depthWrite OFF means coplanar routes no
-    // longer fight — the last one in the buffer wins crisply — and a polygon offset
-    // lets the ribbon win the depth test against the road surface it sits just above.
+    // One flat height clear of the asphalt + lateral lanes means route ribbons are
+    // never coplanar with the road or with each other, so nothing z-fights. depthWrite
+    // stays off (overlay, doesn't clip buses) and a polygon offset keeps it crisp.
     const mat = new THREE.MeshBasicMaterial({
       vertexColors: true, side: THREE.DoubleSide,
       transparent: true, opacity: 0.95, depthWrite: false,

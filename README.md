@@ -171,12 +171,13 @@ downtown (Lexington's tallest tower). Tune with `--grid` / `--sample` / `--roof-
 
 **Performance:** the viewer renders all buildings as one packed buffer / one draw call,
 and `roads.js` renders ribbons + signal props with merged + instanced geometry, so the
-full city holds **60 fps** (LiDAR off by default). Detailing *every* residential street
-city-wide pushes the scene past ~13M triangles, so the shipped twin details the
-**arterial** road network (where the signals are) and leaves residential streets as the
-lightweight `city.json` lines — filter the OSM highway set to the major classes before
-`osm_roads` to reproduce that. The cursor read-out intersects the ground plane
-analytically (no per-frame mesh raycast), so orbit/pan stays smooth at city scale.
+**full street network city-wide** (~9.6k roads / 2,800 km, ~13M triangles) still holds
+**~60 fps** with LiDAR off by default. The cursor read-out intersects the ground plane
+analytically (no per-frame mesh raycast), so orbit/pan stays smooth at city scale. Bus
+route lines are floated a fixed height above the asphalt and split into lateral lanes,
+so coplanar routes never z-fight the road or each other. If you target a low-end GPU,
+restricting `osm_roads` to the arterial classes (leaving residential as the lightweight
+`city.json` lines) roughly halves the triangle count.
 
 ## Viewer controls
 
