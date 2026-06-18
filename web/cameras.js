@@ -230,12 +230,14 @@ export function createCameraSystem(deps = {}) {
     // freshest live HLS URL for a camera (null if the proxy hasn't answered yet)
     streamUrl(id) { const s = streams.get(String(id)); return (s && s.hls) || null; },
     dashUrl(id) { const s = streams.get(String(id)); return (s && s.dash) || null; },
-    // token-free live snapshot — baked into cameras.json, so it works with no proxy
+    // token-free live snapshot — baked into cameras.json, so it works with no proxy.
+    // The map publishes it at 352x240; request 960x720 (the live stream's native size,
+    // which the thumbnail endpoint honours) so the no-proxy fallback isn't a soft
+    // upscale in the enlarged PiP panel.
     still(id) {
       const s = streams.get(String(id));
-      if (s && s.still) return s.still;
-      const c = byId.get(String(id));
-      return c ? c.still || null : null;
+      const url = (s && s.still) || (byId.get(String(id)) || {}).still || null;
+      return url ? url.replace(/([?&]size=)\d+x\d+/i, '$1960x720') : null;
     },
     hasProxy: () => status.proxy === 'ok',
   };
