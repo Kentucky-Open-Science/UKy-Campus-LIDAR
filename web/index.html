@@ -94,6 +94,18 @@
   </fieldset>
 
   <fieldset class="collapsed">
+    <legend>Traffic cameras</legend>
+    <label class="row"><input type="checkbox" id="cameras-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="cameras-markers" checked> camera markers</label>
+    <div id="cameras-status" class="status">cameras: loading&hellip;</div>
+    <div class="bus-list-label">cameras &mdash; click to view live stream</div>
+    <input type="text" id="cameras-filter" class="cam-filter" placeholder="filter by intersection&hellip;">
+    <div id="cameras-list" class="bus-list">&mdash;</div>
+    <div class="hint">Live video needs the proxy: <code>python -m tools.twin_server</code><br>
+      Real-time stream only (no detection). Query: <code>window.__twin.cameras</code></div>
+  </fieldset>
+
+  <fieldset class="collapsed">
     <legend>Camera</legend>
     <button id="camera-reset">Reset view</button>
     <div class="hint">LMB orbit &middot; RMB pan &middot; wheel zoom<br>
@@ -139,8 +151,24 @@
 
 <div id="loading-overlay" class="hidden"><div id="loading-text"></div></div>
 <canvas id="agent-pip-canvas" class="agent-pip hidden"></canvas>
+
+<!-- Live traffic-camera picture-in-picture: real HLS stream (no detection) -->
+<div id="cam-pip" class="cam-pip hidden">
+  <div class="cam-pip-bar">
+    <span id="cam-pip-title">camera</span>
+    <span class="cam-pip-actions">
+      <button id="cam-pip-native" title="browser picture-in-picture">PiP</button>
+      <button id="cam-pip-close" title="close">&times;</button>
+    </span>
+  </div>
+  <video id="cam-pip-video" class="cam-pip-video" muted autoplay playsinline></video>
+  <div id="cam-pip-note" class="cam-pip-note"></div>
+</div>
 <div id="drive-hint" class="hidden"></div>
 
+<!-- hls.js (vendored): plays the city's live HLS feeds where the browser lacks
+     native HLS. Classic script so window.Hls exists before the app module runs. -->
+<script src="lib/hls.min.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>

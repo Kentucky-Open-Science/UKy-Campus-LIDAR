@@ -151,6 +151,52 @@ code { color: #ffcf5e; }
   font-size: 10px; color: #fff; text-shadow: 0 1px 1px rgba(0,0,0,0.5);
 }
 
+/* camera list filter box (Traffic cameras fieldset) */
+.cam-filter {
+  width: 100%; box-sizing: border-box; margin: 2px 0 4px;
+  background: rgba(0,0,0,0.3); color: #e8e8e8;
+  border: 1px solid rgba(255,255,255,0.18); border-radius: 4px;
+  padding: 3px 6px; font-size: 11px;
+}
+.cam-filter:focus { outline: none; border-color: #27c4c4; }
+/* a small dot in front of each camera row showing matched (teal) / unmatched (amber) */
+.cam-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+
+/* Live traffic-camera picture-in-picture (top-right, below the agent PiP slot) */
+.cam-pip {
+  position: fixed;
+  right: 12px;
+  top: 12px;
+  width: 360px;
+  background: rgba(12, 16, 22, 0.94);
+  border: 1px solid #2a3340;
+  border-radius: 6px;
+  z-index: 7;
+  overflow: hidden;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+}
+.cam-pip.hidden { display: none; }
+.cam-pip-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 5px 6px 5px 10px;
+  font-size: 12px; font-weight: 600; color: #cfe6ff;
+  background: rgba(255,255,255,0.05); cursor: move;
+}
+.cam-pip-actions { display: flex; gap: 4px; }
+.cam-pip-bar button {
+  padding: 1px 8px; font-size: 11px; line-height: 1.5;
+  background: #25384c; border: 1px solid rgba(255,255,255,0.15);
+}
+.cam-pip-bar button:hover { background: #335272; }
+.cam-pip-video {
+  display: block; width: 360px; height: 270px;
+  background: #000; object-fit: cover;
+}
+.cam-pip-note {
+  padding: 4px 10px 6px; font-size: 10.5px; color: #8d99a6;
+  white-space: pre-line; min-height: 14px;
+}
+
 /* "Now driving …" banner shown while WASD is bound to a third-person agent */
 #drive-hint {
   position: fixed;
