@@ -88,6 +88,19 @@ class TwinClient:
         except Exception:  # noqa: BLE001
             return {}
 
+    def publish_detections(self, camera, frame, dets):
+        """Relay the image-space boxes (the viewer's PiP overlay draws these)."""
+        try:
+            self._req("POST", "/api/cameras/detections", {"camera": camera, "frame": frame, "dets": dets})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def active_camera(self):
+        try:
+            return self._req("GET", "/api/cameras/active").get("camera")
+        except Exception:  # noqa: BLE001
+            return None
+
     def calib(self):
         try:
             return self._req("GET", "/api/cameras/calib")
@@ -190,7 +203,8 @@ def tire_to_scene(H, sw, sh, x1, y1, x2, y2):
 
 
 class CameraDetector:
-    def __init__(self, twin, camera_id, Hq, model="yolo26n.pt", conf=0.35, imgsz=640, max_det=50):
+    def __init__(self, twin, camera_id, Hq, model="yolo26n.pt", conf=0.35, imgsz=640,
+                 max_det=50, publish=True, follow_active=False):
         self.twin = twin
         self.cam = camera_id
         self.Hq = Hq                  # {quad: H}
@@ -198,6 +212,8 @@ class CameraDetector:
         self.conf = conf
         self.imgsz = imgsz
         self.max_det = max_det
+        self.publish = publish        # relay image boxes for the PiP overlay
+        self.follow_active = follow_active  # only run inference while this camera is viewed
         self.tracker = SceneTracker(twin, camera_id)
 
     def _stream_url(self):
@@ -221,8 +237,14 @@ class CameraDetector:
                 ok, img = cap.read()
                 if not ok or img is None:
                     cap.release(); time.sleep(1.0); cap = cv2.VideoCapture(self._stream_url() or url); continue
+                # per-active-camera perf bounding: idle (no inference) while nobody views us
+                if self.follow_active and self.twin.active_camera() != self.cam:
+                    self.tracker.update(frame, [])      # lets tracks age out -> despawn
+                    frame += 1
+                    time.sleep(0.4)
+                    continue
                 h, w = img.shape[:2]
-                dets = []
+                dets, raw = [], []
                 for q, H in self.Hq.items():
                     col, row = q % 2, q // 2
                     sub = img[row * h // 2:(row + 1) * h // 2, col * w // 2:(col + 1) * w // 2]
@@ -231,12 +253,17 @@ class CameraDetector:
                                         max_det=self.max_det, verbose=False)[0]
                     for box in res.boxes:
                         x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        cls = int(box.cls[0])
+                        raw.append({"quad": q, "box": [x1 / sw, y1 / sh, x2 / sw, y2 / sh],
+                                    "cls": cls, "conf": round(float(box.conf[0]), 2)})
                         sc = tire_to_scene(H, sw, sh, x1, y1, x2, y2)
                         if sc:
-                            dets.append({"x": sc[0], "z": sc[1], "quad": q, "cls": int(box.cls[0])})
+                            dets.append({"x": sc[0], "z": sc[1], "quad": q, "cls": cls})
                 stat = self.tracker.update(frame, dets)
+                if self.publish:
+                    self.twin.publish_detections(self.cam, frame, raw)
                 if on_frame:
-                    on_frame(frame, dets, stat)
+                    on_frame(frame, dets, stat, raw)
                 frame += 1
                 dt = time.time() - t0
                 if period > dt:
@@ -255,6 +282,11 @@ def main():
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--max-det", type=int, default=50)
     ap.add_argument("--max-fps", type=float, default=8.0, help="detection pace (0 = uncapped)")
+    ap.add_argument("--no-publish", action="store_true",
+                    help="don't relay image boxes for the PiP overlay (spawn cars only)")
+    ap.add_argument("--follow-active", action="store_true",
+                    help="only run inference while this camera is the one being viewed "
+                         "(per-active-camera perf bounding)")
     args = ap.parse_args()
 
     twin = TwinClient(args.twin)
@@ -262,7 +294,8 @@ def main():
     if not Hq:
         raise SystemExit(f"{args.camera} has no calibrated quads — calibrate it in the PiP tool first.")
     det = CameraDetector(twin, args.camera, Hq, model=args.model, conf=args.conf,
-                         imgsz=args.imgsz, max_det=args.max_det)
+                         imgsz=args.imgsz, max_det=args.max_det,
+                         publish=not args.no_publish, follow_active=args.follow_active)
     try:
         det.run(max_fps=args.max_fps)
     except KeyboardInterrupt:

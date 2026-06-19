@@ -1206,8 +1206,14 @@ function refreshCameraList(force) {
   }
 }
 
-// ------- camera PiP: real-time HLS stream (no detection) -------
+// ------- camera PiP: real-time HLS stream + detection overlay -------
 const pip = { id: null, hls: null, live: false, stillTimer: null };
+// Tell the detector(s) which camera is being viewed so a --follow-active detector only
+// burns GPU on the camera someone is actually watching (per-active-camera perf bounding).
+function setActiveCamera(id) {
+  fetch('/api/cameras/active', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ camera: id }) }).catch(() => {});
+}
 function openCamera(id) {
   if (!state.cameras) return;
   const cam = state.cameras.cameras.get(id);
@@ -1215,6 +1221,7 @@ function openCamera(id) {
   pip.id = id;
   $('cam-pip').classList.remove('hidden');
   $('cam-pip').dispatchEvent(new CustomEvent('cam-open'));   // reset calibration tool
+  setActiveCamera(id);   // tell detectors which camera is being viewed (perf bounding)
   $('cam-pip-title').textContent = cam.name + (cam.matched ? '' : ' · (no junction)');
   const url = state.cameras.cameras.streamUrl(id);
   if (url) {
@@ -1273,6 +1280,7 @@ function showStill(id) {
 }
 $('cam-pip-close')?.addEventListener('click', () => {
   teardownStream();
+  setActiveCamera(null);   // no camera viewed -> a --follow-active detector idles
   pip.id = null;
   $('cam-pip').classList.add('hidden');
   refreshCameraList(true);
@@ -1310,9 +1318,13 @@ $('cam-pip-native')?.addEventListener('click', async () => {
 // click the video where a car is and a kinematic twin car appears (visible to everyone).
 const camCal = (() => {
   const overlay = $('cam-pip-overlay');
-  let mode = false, spawn = false;
+  let mode = false, spawn = false, detect = false;
+  let detectTimer = null, lastDets = [], lastDetMeta = null;
   const clickCars = [];            // [{id,x,z}] kinematic cars from clicks
   let heartbeat = null;
+  // class colours/names match tools/camera_detect.py CLASS_COLOR / VEHICLE_CLASSES
+  const CLS_COLOR = { 1: '#4aa05a', 2: '#27c4c4', 3: '#c77f2a', 5: '#e0a83a' };
+  const CLS_NAME = { 1: 'bike', 2: 'car', 3: 'moto', 5: 'bus' };
   const api = () => state.cameras && state.cameras.cameras;
   const calStatus = (t) => { const n = $('cam-cal-status'); if (n) n.textContent = t; };
   const fullOf = (quad, qu, qv) => {                 // quad-local -> full-frame normalized
@@ -1327,6 +1339,18 @@ const camCal = (() => {
     overlay.height = Math.max(2, Math.round(r.height));
     const g = overlay.getContext('2d'), W = overlay.width, H = overlay.height;
     g.clearRect(0, 0, W, H);
+    if (!mode && !spawn && !detect) return;
+    if (detect) {                                                       // live detection boxes
+      g.lineWidth = 2; g.font = '11px system-ui, sans-serif';
+      for (const d of lastDets) {
+        const col = d.quad % 2, row = d.quad >= 2 ? 1 : 0;             // box is normalized within its quad
+        const x = (col * 0.5 + d.box[0] * 0.5) * W, y = (row * 0.5 + d.box[1] * 0.5) * H;
+        const x2 = (col * 0.5 + d.box[2] * 0.5) * W, y2 = (row * 0.5 + d.box[3] * 0.5) * H;
+        const c = CLS_COLOR[d.cls] || '#27c4c4';
+        g.strokeStyle = c; g.strokeRect(x, y, x2 - x, y2 - y);
+        g.fillStyle = c; g.fillText((CLS_NAME[d.cls] || '?') + (d.conf != null ? ' ' + d.conf : ''), x + 2, Math.max(10, y - 3));
+      }
+    }
     if (!mode && !spawn) return;
     g.strokeStyle = 'rgba(159,194,232,0.45)'; g.lineWidth = 1;          // 2x2 quad grid
     g.beginPath(); g.moveTo(W / 2, 0); g.lineTo(W / 2, H); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
@@ -1350,13 +1374,38 @@ const camCal = (() => {
   }
 
   function showBars() {
-    $('cam-cal-bar')?.classList.toggle('hidden', !(mode || spawn));
-    overlay?.classList.toggle('hidden', !(mode || spawn));
+    const anyMode = mode || spawn || detect;
+    $('cam-cal-bar')?.classList.toggle('hidden', !anyMode);
+    overlay?.classList.toggle('hidden', !anyMode);
     $('cam-cal-toggle')?.classList.toggle('active', mode);
     $('cam-cal-spawn')?.classList.toggle('active', spawn);
+    $('cam-det-toggle')?.classList.toggle('active', detect);
     draw();
   }
-  function reset() { mode = false; spawn = false; showBars(); }
+  function reset() { mode = false; spawn = false; stopDetect(); showBars(); }
+
+  // ---- live detection boxes: poll the relay the detector publishes to ----
+  async function pollDetections() {
+    if (!detect || !pip.id) return;
+    try {
+      const r = await fetch(`/api/cameras/detections?camera=${encodeURIComponent(pip.id)}`, { cache: 'no-store' });
+      const d = await r.json();
+      lastDets = d.dets || [];
+      lastDetMeta = d.stale ? null : { age: d.age, n: lastDets.length };
+      calStatus(d.stale
+        ? 'detections: none — run  python -m tools.camera_detect --camera ' + pip.id
+        : `detections: ${lastDets.length} (live, ${d.age}s)`);
+      draw();
+    } catch (e) { calStatus('detections: relay offline'); }
+    if (detect) detectTimer = setTimeout(pollDetections, 200);
+  }
+  function enterDetect() {
+    if (!pip.id) return;
+    detect = !detect;
+    if (detect) { showBars(); pollDetections(); }
+    else { stopDetect(); showBars(); }
+  }
+  function stopDetect() { detect = false; clearTimeout(detectTimer); detectTimer = null; lastDets = []; }
 
   function enterCalibrate() {
     if (!pip.id || !api()) return;
@@ -1426,6 +1475,7 @@ const camCal = (() => {
       else spawnClickCar(sc.x, sc.z, sc.quad);
     }
   });
+  $('cam-det-toggle')?.addEventListener('click', enterDetect);
   $('cam-cal-toggle')?.addEventListener('click', enterCalibrate);
   $('cam-cal-spawn')?.addEventListener('click', enterSpawn);
   $('cam-cal-save')?.addEventListener('click', save);
@@ -1435,9 +1485,11 @@ const camCal = (() => {
   $('cam-pip')?.addEventListener('cam-open', reset);
   if (typeof ResizeObserver !== 'undefined' && overlay) new ResizeObserver(() => draw()).observe(overlay);
 
-  return { active: () => mode, spawning: () => spawn, onScenePoint, reset,
-           _draw: draw };   // _draw exposed for tests
+  return { active: () => mode, spawning: () => spawn, detecting: () => detect,
+           onScenePoint, reset, _draw: draw, _dets: () => lastDets };   // exposed for tests
 })();
+window.__camCal = camCal;                 // test/console hook
+window.__camCalDets = () => camCal._dets();
 
 $('buildings-visible').addEventListener('change', (e) => {
   state.buildings.group.visible = e.target.checked;

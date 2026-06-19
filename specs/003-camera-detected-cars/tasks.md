@@ -59,8 +59,21 @@ opencv, e.g. TrafficStream's; talks to the twin over HTTP only):
 
 Run: `python -m tools.camera_detect --camera LEX-CAM-052` (twin running; quad calibrated).
 
-## Phase 3 — overlay + polish (next)
+## Phase 3 — detection overlay + perf bounding (DONE)
 
-- [ ] In-browser PiP detection boxes (synced to the displayed frame)
-- [ ] Per-active-camera perf bounding (only the focused camera runs detection)
-- [ ] Optional: ByteTrack for occlusion robustness; fisheye undistortion for accuracy
+Decision: the PiP boxes are **server-published** (the detector relays the exact boxes it
+spawns cars from), not an in-browser model — fully testable, reuses the accurate YOLO,
+shows "this detection → this twin car". Tradeoff: ~1–2 s offset from the buffered video.
+
+- [x] T13 — twin server relay: `GET/POST /api/cameras/detections` (per-camera, TTL'd) +
+      `GET/POST /api/cameras/active` (which camera is viewed). API tested 8/8.
+- [x] T14 — `camera_detect.py` publishes its image boxes each frame (`--no-publish` to
+      opt out); `--follow-active` idles inference while its camera isn't being viewed.
+- [x] T15 — PiP **Detect** toggle: polls the relay, draws class-coloured boxes on the
+      overlay (quad-aware). Opening a PiP signals the active camera; closing clears it.
+- [x] T16 — Headless overlay test 8/8 (open → active signalled → Detect → boxes polled +
+      drawn → close → cleared) + real YOLO publish to the relay (9 live boxes).
+
+Deferred (optional, not needed for the feature): ByteTrack for occlusion robustness;
+fisheye undistortion for tighter positioning; an in-browser model for frame-perfect PiP
+sync.

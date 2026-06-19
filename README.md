@@ -317,8 +317,16 @@ dependency-free and unit-tested. With the twin running and a camera calibrated:
 `python -m tools.camera_detect --camera LEX-CAM-052`. Verified end to end on the live
 Harrodsburg/Lakespur feed (real YOLO detections → scene points → tracked twin cars).
 
-Spec + plan + tasks under `specs/003-camera-detected-cars/`. Phase 3 adds in-browser PiP
-detection boxes and per-active-camera perf bounding.
+**Phase 3 — detection overlay + perf bounding.** The detector relays the image-space
+boxes it spawns cars from (`/api/cameras/detections`); the PiP's **Detect** toggle polls
+and draws them, class-coloured, on the quad — so you see *this detection → this twin car*.
+Opening a camera's PiP also signals it as the active camera (`/api/cameras/active`), so a
+detector started with `--follow-active` only burns GPU on the camera someone's actually
+watching. (Boxes sit ~1–2 s off the buffered video; that's the cost of showing the real,
+accurate YOLO detections rather than a separate in-browser model.)
+
+Spec + plan + tasks under `specs/003-camera-detected-cars/` — feature complete through
+Phase 3.
 
 ## Multiplayer twin server — shared world over an API
 
