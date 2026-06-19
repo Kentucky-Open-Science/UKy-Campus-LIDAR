@@ -265,29 +265,51 @@ export function createCameraSystem(deps = {}) {
     },
     undo() { const s = calibState.session; s.pendingImg = null; s.pairs.pop(); return s.pairs.length; },
     clearSession() { const s = calibState.session; s.pairs = []; s.pendingImg = null; s.quad = null; },
-    // solve the homography for the current session (>=4 pairs)
+    // solve the homography for the current session (>=4 pairs). Returns { H, reproj }
+    // on success (reproj = max residual in scene metres) or { error } (string) on failure
+    // — the two are kept on DISTINCT keys so a caller can never mistake a numeric quality
+    // metric for a failure (or vice versa).
     solve() {
       const s = calibState.session;
       if (s.pairs.length < 4) return { error: 'need >=4 points, have ' + s.pairs.length };
+      // Reject a misclick where two image points coincide: they produce a high-residual
+      // (or under-constrained) H that the collinearity guard does NOT catch.
+      for (let i = 0; i < s.pairs.length; i++) {
+        for (let j = i + 1; j < s.pairs.length; j++) {
+          if (Math.hypot(s.pairs[i].img[0] - s.pairs[j].img[0],
+                         s.pairs[i].img[1] - s.pairs[j].img[1]) < 1e-3) {
+            return { error: `image points ${i + 1} and ${j + 1} are the same pixel — move one` };
+          }
+        }
+      }
       const H = solveHomography(s.pairs.map((p) => p.img), s.pairs.map((p) => p.scene));
       if (!H) return { error: 'degenerate points (collinear?) — spread them out' };
-      return { H, error: reprojError(H, s.pairs.map((p) => p.img), s.pairs.map((p) => p.scene)) };
+      return { H, reproj: reprojError(H, s.pairs.map((p) => p.img), s.pairs.map((p) => p.scene)) };
     },
     // persist the current session's homography for (camId, quad)
     async save(extra = {}) {
       const s = calibState.session;
       const sol = this.solve();
-      if (sol.error && !sol.H) return sol;
+      if (sol.error || !sol.H) return sol;                 // failure string -> bubble up
+      // Refuse to persist an obviously-broken fit (e.g. a stray correspondence) so it
+      // can't silently mislocate every car in this quad. Fisheye-approximate fits of a
+      // few metres are fine; this only blocks egregious garbage.
+      const SAVE_CEILING_M = 30;
+      if (sol.reproj > SAVE_CEILING_M) {
+        return { error: `reproj ${sol.reproj.toFixed(1)} m too high — re-spread the points and recalibrate` };
+      }
+      const savedQuad = s.quad;                            // capture before clearSession()
       const body = { cameraId: s.camId, quad: s.quad, H: sol.H,
-        points: s.pairs, reprojError: sol.error, ...extra };
+        points: s.pairs, reprojError: sol.reproj, ...extra };
       const r = await fetch(sameOriginPath((proxyBase || '') + '/api/cameras/calib'),
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!r.ok) return { error: 'save failed HTTP ' + r.status };
-      // update local cache so imageToScene works immediately
+      // update local cache so imageToScene works immediately (keep reprojError too)
       const cam = (calibState.data.cameras || (calibState.data.cameras = {}))[s.camId] || (calibState.data.cameras[s.camId] = {});
       if (extra.intersection) cam.intersection = extra.intersection;
-      (cam.quads || (cam.quads = {}))[String(s.quad)] = { H: sol.H, points: s.pairs, ...extra };
-      return { ok: true, quad: s.quad, reprojError: sol.error };
+      (cam.quads || (cam.quads = {}))[String(s.quad)] = { H: sol.H, points: s.pairs, reprojError: sol.reproj, ...extra };
+      this.clearSession();                                 // ready for the next quad (no off/on toggle)
+      return { ok: true, quad: savedQuad, reprojError: sol.reproj };
     },
     // map a full-frame normalized image point -> scene [x,z] using the stored homography
     imageToScene(camId, u, v) {

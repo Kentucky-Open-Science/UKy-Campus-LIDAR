@@ -17,8 +17,14 @@ const CITY_LABEL_CLASSES = new Set([
 ]);
 
 export function createStreetLabels(sources = {}, opts = {}) {
-  const FAR = opts.far || 480;            // cull labels beyond this camera distance (m)
-  const MAX = opts.maxLabels || 220;
+  // Cull radius is measured from the look-at point and scales with zoom (see tick()).
+  // FAR_MIN/FAR_MAX bound it so labels stay readable up close and still appear in an
+  // overview. (The old fixed eye-distance cull hid every label at normal viewing heights
+  // once the road network grew to span the whole metro.)
+  const FAR_MIN = opts.farMin || 700;
+  const FAR_MAX = opts.farMax || 3000;
+  const CELL = opts.cell || 650;          // spatial-binning cell size (m); see below
+  const MAX = opts.maxLabels || 2000;
   const group = new THREE.Group();
   group.name = 'street-labels';
 
@@ -46,9 +52,21 @@ export function createStreetLabels(sources = {}, opts = {}) {
     considerInto(city, r.name, r.pts.map((p) => [p[0], cy, p[1]]));
   }
 
-  const campusArr = [...campus.values()].sort((a, b) => b.len - a.len);
-  const cityArr = [...city.values()].sort((a, b) => b.len - a.len);
-  const chosen = campusArr.concat(cityArr).slice(0, MAX);   // all campus, then top city
+  // Spatially bin candidates so labels are spread across wherever roads are (the campus
+  // core AND the wider metro), keeping the most prominent (longest) named road per grid
+  // cell. The old "globally longest first" pick was dominated by metro-spanning arterials
+  // whose midpoints clustered away from the campus, leaving the area you actually look at
+  // unlabelled. Binning guarantees that any view has a nearby street name.
+  const byCell = new Map();
+  const binInto = (rec) => {
+    const k = Math.round(rec.mid[0] / CELL) + ',' + Math.round(rec.mid[2] / CELL);
+    const cur = byCell.get(k);
+    if (!cur || rec.len > cur.len) byCell.set(k, rec);
+  };
+  for (const c of campus.values()) binInto(c);
+  for (const c of city.values()) binInto(c);
+  // one label per cell; if still over budget, keep the longest cells
+  const chosen = [...byCell.values()].sort((a, b) => b.len - a.len).slice(0, MAX);
   const sprites = [];
   for (const L of chosen) {
     const spr = makeLabelSprite(L.name);
@@ -59,13 +77,22 @@ export function createStreetLabels(sources = {}, opts = {}) {
     sprites.push(spr);
   }
 
-  // per-frame: show only labels within FAR of the camera (XZ distance)
-  function tick(camera) {
+  // per-frame: show labels near the FOCUS point (the orbit target = where you're looking),
+  // with a radius that grows as you zoom out — so the streets in view are named at any
+  // zoom. Culling from the eye instead hid everything whenever the eye sat well above the
+  // ground (the normal case). Falls back to the eye position when no target is supplied.
+  function tick(camera, target) {
     if (!group.visible) return;
-    const cx = camera.position.x, cz = camera.position.z;
+    const fx = target ? target.x : camera.position.x;
+    const fy = target ? target.y : 0;
+    const fz = target ? target.z : camera.position.z;
+    const e = camera.position;
+    const zoom = Math.hypot(e.x - fx, e.y - fy, e.z - fz);   // eye distance to focus
+    const far = Math.min(FAR_MAX, Math.max(FAR_MIN, zoom * 1.1));
+    const far2 = far * far;
     for (const s of sprites) {
-      const dx = cx - s.position.x, dz = cz - s.position.z;
-      s.visible = (dx * dx + dz * dz) < FAR * FAR;
+      const dx = fx - s.position.x, dz = fz - s.position.z;
+      s.visible = (dx * dx + dz * dz) < far2;
     }
   }
 
