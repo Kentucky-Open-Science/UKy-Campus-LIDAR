@@ -68,6 +68,7 @@ CAMPUS/
 │   ├── osm_city.py           # OpenStreetMap → city-wide streets + ground plane (city.json)
 │   ├── lextran_gtfs.py       # Lextran static GTFS → routes + stops (transit.json)
 │   ├── lex_cameras.py        # city traffic cams → intersection mapping (cameras.json)
+│   ├── camera_detect.py      # YOLO per quad → homography → kinematic twin cars (Phase 2)
 │   ├── twin_server.py        # one server: static viewer + shared-world API (/api/world/*)
 │   │                         #   + live bus proxy (/api/transit/*) + camera URL proxy (/api/cameras/*)
 │   ├── pack_buildings.py     # merge 3,109 building meshes → one buffer (fast load)
@@ -303,9 +304,21 @@ saved (version-controlled) under `calibration/cameras.json` via the twin server
 **kinematic** car appears in the shared world at the mapped scene point, visible to every
 viewer (`netagents.js`). Kinematic agents (`/api/world/.../pose`, `kinematic:true` on
 spawn) carry no physics and auto-despawn after `--kinematic-ttl` seconds (default 5)
-without a pose update, so a feed that stops cleans up after itself. Spec + plan under
-`specs/003-camera-detected-cars/`. Phase 2 adds the server-side YOLO + ByteTrack detector
-that drives the spawn loop from real detections.
+without a pose update, so a feed that stops cleans up after itself.
+
+**Phase 2 — live detector.** `tools/camera_detect.py` closes the loop: a decoupled world
+client that pulls one camera's HLS, splits the 2×2 quad, runs **YOLO** per calibrated
+sub-view, maps each vehicle's tire point through the calibrated homography to a scene
+(x,z), and drives the kinematic cars via a scene-space tracker (cross-quad dedup +
+nearest-neighbour association → stable ids, motion-derived heading, despawn-when-lost).
+It talks to the twin over HTTP only, so it runs wherever ultralytics + OpenCV live (e.g.
+TrafficStream's GPU venv) with no campus deps; the geometry + lifecycle core is
+dependency-free and unit-tested. With the twin running and a camera calibrated:
+`python -m tools.camera_detect --camera LEX-CAM-052`. Verified end to end on the live
+Harrodsburg/Lakespur feed (real YOLO detections → scene points → tracked twin cars).
+
+Spec + plan + tasks under `specs/003-camera-detected-cars/`. Phase 3 adds in-browser PiP
+detection boxes and per-active-camera perf bounding.
 
 ## Multiplayer twin server — shared world over an API
 
