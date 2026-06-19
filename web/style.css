@@ -235,7 +235,7 @@ code { color: #ffcf5e; }
   background: #25384c; border: 1px solid rgba(255,255,255,0.15);
 }
 .cam-cal-bar button:hover { background: #335272; }
-#cam-cal-toggle.active, #cam-cal-spawn.active { background: #2f7d52; border-color: #49b07a; }
+#cam-cal-toggle.active, #cam-cal-spawn.active, #cam-det-toggle.active { background: #2f7d52; border-color: #49b07a; }
 /* a clearer grab affordance at the resize corner */
 .cam-pip::after {
   content: ''; position: absolute; right: 2px; bottom: 2px;

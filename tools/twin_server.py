@@ -37,6 +37,9 @@ API (JSON, CORS-open; see client/twin.py for a Python wrapper):
     GET    /api/transit/meta                 -> transit proxy status (mode, cache ages, georef)
     GET    /api/cameras/streams             -> fresh tokenized HLS URLs per camera id
     GET    /api/cameras/meta                -> camera proxy status (mode, cache age, count)
+    GET/POST /api/cameras/calib             -> camera->scene homographies (calibration/cameras.json)
+    GET/POST /api/cameras/detections        -> live detection boxes per camera (detector -> PiP overlay)
+    GET/POST /api/cameras/active            -> which camera is being viewed (per-active-camera bounding)
     (anything else) -> served as a static file from web/
 
 Run:  python -m tools.twin_server [--port 8000] [--hz 50] [--render]
@@ -71,6 +74,16 @@ WEB = os.path.abspath(os.path.join(_HERE, "..", "web"))
 # lives OUTSIDE the gitignored web/data/ and is version-controlled (constitution P1).
 CALIB_PATH = os.path.abspath(os.path.join(_HERE, "..", "calibration", "cameras.json"))
 CALIB_LOCK = threading.Lock()
+
+# Live detection relay (Phase 3): the detector (tools/camera_detect.py) publishes the
+# image-space boxes it's spawning cars from; the viewer's PiP overlay polls + draws them.
+# Plus an "active camera" signal so a detector can idle when nobody is viewing its camera
+# (per-active-camera perf bounding). All in-memory + TTL'd; never persisted.
+DET_LOCK = threading.Lock()
+DETECTIONS = {}                 # camera_id -> {ts, frame, dets:[...]}
+ACTIVE = {"camera": None, "ts": 0.0}
+DET_TTL = 6.0                   # serve detections younger than this (s)
+ACTIVE_TTL = 12.0               # an active-camera signal is valid this long (s)
 
 
 def load_calib():
@@ -1040,6 +1053,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._transit(path)
         if path == "/api/cameras/calib":     # works without the live camera proxy
             return self._json(load_calib())
+        if path == "/api/cameras/detections":
+            return self._json(self._get_detections())
+        if path == "/api/cameras/active":
+            return self._json(self._get_active())
         if path.startswith("/api/cameras"):
             return self._cameras(path)
         if path.startswith("/api/world"):
@@ -1110,10 +1127,46 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         save_calib(calib)
         return self._json({"ok": True, "cameraId": cid, "quad": quad})
 
+    # ---- live detection relay + active-camera signal (Phase 3) ----
+    def _get_detections(self):
+        cam = parse_qs(urlparse(self.path).query).get("camera", [None])[0]
+        now = time.time()
+        with DET_LOCK:
+            rec = DETECTIONS.get(cam) if cam else None
+        if not rec or (now - rec["ts"]) > DET_TTL:
+            return {"camera": cam, "dets": [], "stale": True}
+        return {"camera": cam, "ts": rec["ts"], "age": round(now - rec["ts"], 2),
+                "frame": rec.get("frame"), "dets": rec["dets"]}
+
+    def _post_detections(self, b):
+        cam = b.get("camera")
+        if not cam:
+            return self._json({"error": "need camera"}, 400)
+        with DET_LOCK:
+            DETECTIONS[str(cam)] = {"ts": time.time(), "frame": b.get("frame"),
+                                    "dets": b.get("dets") or []}
+        return self._json({"ok": True, "camera": cam, "count": len(b.get("dets") or [])})
+
+    def _get_active(self):
+        with DET_LOCK:
+            cam, ts = ACTIVE["camera"], ACTIVE["ts"]
+        age = time.time() - ts
+        return {"camera": cam if age <= ACTIVE_TTL else None, "age": round(age, 2)}
+
+    def _post_active(self, b):
+        with DET_LOCK:
+            ACTIVE["camera"] = b.get("camera")    # None clears it
+            ACTIVE["ts"] = time.time()
+        return self._json({"ok": True, "camera": b.get("camera")})
+
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/api/cameras/calib":
             return self._calib_post(self._body())
+        if path == "/api/cameras/detections":
+            return self._post_detections(self._body())
+        if path == "/api/cameras/active":
+            return self._post_active(self._body())
         if WORLD is None and path.startswith("/api/world"):
             return self._json({"error": "world not running"}, 503)
         if path == "/api/world/spawn":

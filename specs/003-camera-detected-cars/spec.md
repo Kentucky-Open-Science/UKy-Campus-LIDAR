@@ -4,7 +4,8 @@
 
 **Created**: 2026-06-18
 
-**Status**: Phases 1–2 done (geometry + kinematic spawn; live YOLO detector). Phase 3 next.
+**Status**: Phases 1–3 done (geometry + kinematic spawn; live YOLO detector; PiP detection
+overlay + per-active-camera bounding). Feature complete.
 
 **Input**: User description: "use the traffic cameras to detect cars in the intersection
 and then spawn a digital twin car into the scene for the duration of when the car is in
