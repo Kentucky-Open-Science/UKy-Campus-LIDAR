@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "note": "Camera sub-view -> scene homographies, authored from the PiP calibration tool (tools/twin_server.py /api/cameras/calib). Quad index 0=TL 1=TR 2=BL 3=BR; image points are normalized [0,1] within the quad; H maps image (u,v) -> scene (x,z).",
+  "cameras": {}
+}

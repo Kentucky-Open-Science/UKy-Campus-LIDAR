@@ -290,6 +290,23 @@ Regenerate the mapping (e.g. if the city adds cameras) with `python -m tools.lex
 [TrafficStream](https://github.com/Kentucky-Open-Science/TrafficStream2026) project; the
 twin intentionally embeds only the raw stream.
 
+### Camera-detected cars (Phase 1 — geometry + spawn)
+
+Work in progress toward spawning a twin car for each vehicle a camera sees. Each stream
+is a 2×2 quad of four independent wide-angle views, so there's no automatic camera→world
+mapping; instead you **calibrate** it. Open a camera's PiP, click **Calibrate**, then
+click a point in the camera image and the matching spot in the 3D twin (4+ per quad) — the
+viewer solves a per-(camera, quad) **homography** (`web/homography.js`, dependency-free,
+Hartley-normalized) and reprojects the fit back onto the video to judge. Calibrations are
+saved (version-controlled) under `calibration/cameras.json` via the twin server
+(`/api/cameras/calib`). Then **Spawn mode**: click the video where a car is and a
+**kinematic** car appears in the shared world at the mapped scene point, visible to every
+viewer (`netagents.js`). Kinematic agents (`/api/world/.../pose`, `kinematic:true` on
+spawn) carry no physics and auto-despawn after `--kinematic-ttl` seconds (default 5)
+without a pose update, so a feed that stops cleans up after itself. Spec + plan under
+`specs/003-camera-detected-cars/`. Phase 2 adds the server-side YOLO + ByteTrack detector
+that drives the spawn loop from real detections.
+
 ## Multiplayer twin server — shared world over an API
 
 `window.__twin.agents` is private to one browser tab. For a **shared** world — where

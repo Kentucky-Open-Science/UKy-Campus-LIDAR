@@ -152,17 +152,30 @@
 <div id="loading-overlay" class="hidden"><div id="loading-text"></div></div>
 <canvas id="agent-pip-canvas" class="agent-pip hidden"></canvas>
 
-<!-- Live traffic-camera picture-in-picture: real HLS stream (no detection) -->
+<!-- Live traffic-camera picture-in-picture: real HLS stream + calibration tool -->
 <div id="cam-pip" class="cam-pip hidden">
   <div class="cam-pip-bar">
     <span id="cam-pip-title">camera</span>
     <span class="cam-pip-actions">
+      <button id="cam-cal-toggle" title="calibrate this camera's sub-views to the twin">Calibrate</button>
       <button id="cam-pip-native" title="browser picture-in-picture">PiP</button>
       <button id="cam-pip-close" title="close">&times;</button>
     </span>
   </div>
-  <video id="cam-pip-video" class="cam-pip-video" muted autoplay playsinline></video>
+  <div class="cam-pip-stage">
+    <video id="cam-pip-video" class="cam-pip-video" muted autoplay playsinline></video>
+    <canvas id="cam-pip-overlay" class="cam-pip-overlay hidden"></canvas>
+  </div>
   <div id="cam-pip-note" class="cam-pip-note"></div>
+  <div id="cam-cal-bar" class="cam-cal-bar hidden">
+    <span id="cam-cal-status">calibrate</span>
+    <span class="cam-cal-actions">
+      <button id="cam-cal-undo" title="remove last point">Undo</button>
+      <button id="cam-cal-save" title="solve + save homography for this quad">Solve&nbsp;&amp;&nbsp;Save</button>
+      <button id="cam-cal-spawn" title="click the video to drop a twin car (needs a calibrated quad)">Spawn&nbsp;mode</button>
+      <button id="cam-cal-clearcars" title="remove cars spawned from clicks">Clear&nbsp;cars</button>
+    </span>
+  </div>
 </div>
 <div id="drive-hint" class="hidden"></div>
 

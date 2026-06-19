@@ -13,8 +13,13 @@
 // createNetAgents(deps) -> { group, tick(dt), setVisible(b), status(), count }
 
 import * as THREE from 'three';
+import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 const D2R = Math.PI / 180;
+// The server computes y from the real terrain; in flat mode the whole viewer is pinned
+// to FLAT_Y, so ground the shared-world agents (incl. kinematic camera cars) on it,
+// otherwise they'd float/sink relative to the flat roads.
+const groundOf = (p) => (FLAT_WORLD ? FLAT_Y : p[1]);
 // [length(+X), height(+Y), width(+Z)] per type, matching the server's kinematic defs
 const DIMS = { car: [4.3, 1.45, 1.9], truck: [8.5, 3.2, 2.5], robot: [0.8, 0.6, 0.6], drone: [0.9, 0.35, 0.9] };
 
@@ -64,8 +69,9 @@ export function createNetAgents(deps = {}) {
     root.add(sprite);
     group.add(root);
     const p = a.position;
+    const gy = groundOf(p);
     const obj = { object: root, body, mat, sprite, data: a,
-      cur: new THREE.Vector3(p[0], p[1], p[2]), tgt: new THREE.Vector3(p[0], p[1], p[2]),
+      cur: new THREE.Vector3(p[0], gy, p[2]), tgt: new THREE.Vector3(p[0], gy, p[2]),
       yaw: (a.heading || 0) * D2R, tgtYaw: (a.heading || 0) * D2R };
     root.position.copy(obj.cur);
     agents.set(a.id, obj);
@@ -79,7 +85,7 @@ export function createNetAgents(deps = {}) {
       let o = agents.get(a.id);
       if (!o) o = spawn(a);
       o.data = a;
-      o.tgt.set(a.position[0], a.position[1], a.position[2]);
+      o.tgt.set(a.position[0], groundOf(a.position), a.position[2]);
       o.tgtYaw = (a.heading || 0) * D2R;
       const hit = (a.collisions && a.collisions.length) > 0;
       o.mat.emissive.setHex(hit ? 0x661111 : 0x000000);
