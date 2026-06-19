@@ -39,3 +39,28 @@ Ordered so each layer is verified before the next stacks on it.
 - [ ] Run all three test tiers green; capture evidence
 - [ ] README note (Traffic cameras: calibrate + click-to-spawn; Phase 2/3 to come)
 - [ ] Branch `feat/camera-cars-phase1` → PR with test evidence
+
+## Phase 2 — live detector (DONE)
+
+`tools/camera_detect.py` — a decoupled world client (runs in a venv with ultralytics +
+opencv, e.g. TrafficStream's; talks to the twin over HTTP only):
+
+- [x] T8 — `apply_h` (pure-python homography apply; cross-checked == `web/homography.js`)
+      + `heading_from_motion` (scene motion → world heading)
+- [x] T9 — `TwinClient` (stdlib urllib): spawn/pose/despawn/streams/calib
+- [x] T10 — `SceneTracker`: scene-space cross-quad **dedup**, greedy nearest-neighbour
+      **association** (stable ids), spawn / pose (motion-heading) / despawn-when-lost.
+      Unit-tested 13/13 (mock twin) + integration 7/7 (real twin world API).
+- [x] T11 — `CameraDetector`: pull the camera HLS, split the 2×2 quad, run YOLO per
+      **calibrated** quad, tire point (bbox bottom-centre) → homography → scene → tracker.
+      Lazy ultralytics/cv2 import so the core stays testable without a GPU.
+- [x] T12 — Real YOLO smoke on the live Harrodsburg/Lakespur feed: 40/40 frames detected
+      vehicles (369 dets, up to 11 simultaneous tracks) → scene points → twin cars.
+
+Run: `python -m tools.camera_detect --camera LEX-CAM-052` (twin running; quad calibrated).
+
+## Phase 3 — overlay + polish (next)
+
+- [ ] In-browser PiP detection boxes (synced to the displayed frame)
+- [ ] Per-active-camera perf bounding (only the focused camera runs detection)
+- [ ] Optional: ByteTrack for occlusion robustness; fisheye undistortion for accuracy
