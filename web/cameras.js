@@ -25,6 +25,16 @@
 
 import * as THREE from 'three';
 import { FLAT_WORLD, FLAT_Y } from './flat.js';
+import { solveHomography, applyHomography, invertHomography, reprojError } from './homography.js';
+
+// Quad geometry: every stream is a 2x2 grid of independent camera views. Map a
+// full-frame normalized point (u,v in [0,1]) to its quad index (0=TL 1=TR 2=BL 3=BR)
+// and the point's normalized coordinates WITHIN that quad (what the homography uses).
+function quadOf(u, v) {
+  const col = u < 0.5 ? 0 : 1, row = v < 0.5 ? 0 : 1;
+  const quad = row * 2 + col;
+  return { quad, qu: (u - col * 0.5) * 2, qv: (v - row * 0.5) * 2 };
+}
 
 const MARK_LIFT = 0.3;          // housing sits this far above the post top
 const POLE_H = 6.0;             // camera mast height (m)
@@ -201,6 +211,106 @@ export function createCameraSystem(deps = {}) {
     redrapeIfNeeded();
   }
 
+  // ----------------------------------------------- calibration (homography) ---
+  // Per-(camera, quad) image->scene homography, authored from the PiP tool and persisted
+  // server-side at /api/cameras/calib. `data` is the loaded document; `session` is the
+  // in-progress authoring state for one quad (a list of image<->scene point pairs).
+  const calibState = { data: { cameras: {} },
+    session: { camId: null, quad: null, pairs: [], pendingImg: null } };
+
+  async function loadCalib() {
+    try {
+      const r = await fetch(sameOriginPath((proxyBase || '') + '/api/cameras/calib'), { cache: 'no-store' });
+      if (r.ok) calibState.data = await r.json();
+    } catch (e) { /* no server -> empty calibration */ }
+    return calibState.data;
+  }
+  function camCalib(id) { return (calibState.data.cameras || {})[String(id)] || null; }
+  function quadH(id, quad) {
+    const c = camCalib(id);
+    const q = c && c.quads && c.quads[String(quad)];
+    return (q && Array.isArray(q.H) && q.H.length === 9) ? q.H : null;
+  }
+
+  const calib = {
+    data: () => calibState.data,
+    forCamera: (id) => camCalib(id),
+    quadOf,
+    getH: quadH,
+    // is a given camera fully unusable / partly / fully calibrated?
+    coverage(id) {
+      const c = camCalib(id);
+      const have = c && c.quads ? Object.keys(c.quads).length : 0;
+      return { quads: have, any: have > 0 };
+    },
+    // ---- authoring session ----
+    begin(camId) { calibState.session = { camId: String(camId), quad: null, pairs: [], pendingImg: null }; return calibState.session; },
+    session: () => calibState.session,
+    // record an image click (full-frame normalized u,v). Locks the quad on first point.
+    addImagePoint(u, v) {
+      const s = calibState.session; if (!s.camId) return null;
+      const { quad, qu, qv } = quadOf(u, v);
+      if (s.quad == null) s.quad = quad;
+      if (quad !== s.quad) return { error: 'point is in quad ' + quad + ', session is calibrating quad ' + s.quad };
+      s.pendingImg = [qu, qv];
+      return { quad, img: [qu, qv], awaitingScene: true };
+    },
+    // record the matching scene ground point (x,z); completes the pair
+    addScenePoint(x, z) {
+      const s = calibState.session;
+      if (!s.pendingImg) return { error: 'click an image point first' };
+      s.pairs.push({ img: s.pendingImg, scene: [x, z] });
+      s.pendingImg = null;
+      return { pairs: s.pairs.length };
+    },
+    undo() { const s = calibState.session; s.pendingImg = null; s.pairs.pop(); return s.pairs.length; },
+    clearSession() { const s = calibState.session; s.pairs = []; s.pendingImg = null; s.quad = null; },
+    // solve the homography for the current session (>=4 pairs)
+    solve() {
+      const s = calibState.session;
+      if (s.pairs.length < 4) return { error: 'need >=4 points, have ' + s.pairs.length };
+      const H = solveHomography(s.pairs.map((p) => p.img), s.pairs.map((p) => p.scene));
+      if (!H) return { error: 'degenerate points (collinear?) — spread them out' };
+      return { H, error: reprojError(H, s.pairs.map((p) => p.img), s.pairs.map((p) => p.scene)) };
+    },
+    // persist the current session's homography for (camId, quad)
+    async save(extra = {}) {
+      const s = calibState.session;
+      const sol = this.solve();
+      if (sol.error && !sol.H) return sol;
+      const body = { cameraId: s.camId, quad: s.quad, H: sol.H,
+        points: s.pairs, reprojError: sol.error, ...extra };
+      const r = await fetch(sameOriginPath((proxyBase || '') + '/api/cameras/calib'),
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!r.ok) return { error: 'save failed HTTP ' + r.status };
+      // update local cache so imageToScene works immediately
+      const cam = (calibState.data.cameras || (calibState.data.cameras = {}))[s.camId] || (calibState.data.cameras[s.camId] = {});
+      if (extra.intersection) cam.intersection = extra.intersection;
+      (cam.quads || (cam.quads = {}))[String(s.quad)] = { H: sol.H, points: s.pairs, ...extra };
+      return { ok: true, quad: s.quad, reprojError: sol.error };
+    },
+    // map a full-frame normalized image point -> scene [x,z] using the stored homography
+    imageToScene(camId, u, v) {
+      const { quad, qu, qv } = quadOf(u, v);
+      const H = quadH(camId, quad);
+      if (!H) return null;
+      const [x, z] = applyHomography(H, [qu, qv]);
+      if (!isFinite(x) || !isFinite(z)) return null;
+      return { x, z, quad };
+    },
+    // inverse: a scene [x,z] -> full-frame normalized [u,v] in the given quad (for the
+    // on-video reprojection overlay), or null if not calibrated / behind the camera
+    sceneToImage(camId, quad, x, z) {
+      const H = quadH(camId, quad);
+      const Hi = H && invertHomography(H);
+      if (!Hi) return null;
+      const [qu, qv] = applyHomography(Hi, [x, z]);
+      if (!isFinite(qu) || !isFinite(qv)) return null;
+      const col = quad % 2, row = quad >= 2 ? 1 : 0;
+      return [col * 0.5 + qu * 0.5, row * 0.5 + qv * 0.5];
+    },
+  };
+
   // ------------------------------------------------------- query API ---
   function rec(c) {
     return c ? {
@@ -210,7 +320,7 @@ export function createCameraSystem(deps = {}) {
   }
 
   const cameras = {
-    group, layers, stats, tick,
+    group, layers, stats, tick, calib,
     start() { stopped = false; if (!pollTimer) pollStreams(); return this; },
     stop() { stopped = true; clearTimeout(pollTimer); pollTimer = null; return this; },
     status: () => ({ ...status, cameras: stats.cameras, matched: stats.matched }),
@@ -245,5 +355,6 @@ export function createCameraSystem(deps = {}) {
   };
 
   loadStatic().finally(() => cameras.start());
+  loadCalib();
   return { group, layers, stats, cameras };
 }

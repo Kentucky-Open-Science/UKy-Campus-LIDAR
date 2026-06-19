@@ -24,11 +24,13 @@ API (JSON, CORS-open; see client/twin.py for a Python wrapper):
     GET    /api/world/state                  -> { t, agents:[ ... ] }   (everyone's agents)
     GET    /api/world/agents/<id>            -> one agent's full sensor state
     GET    /api/world/meta                   -> types, bounds, georef
-    POST   /api/world/spawn                  { type, position?, heading?, color?, name?, owner? } -> { id, ... }
+    POST   /api/world/spawn                  { type, position?, heading?, color?, name?, owner?, kinematic?, source? } -> { id, ... }
     POST   /api/world/agents/<id>/controls   { throttle/brake/steer/reverse | move | thrust/climb/yawRate }
     POST   /api/world/agents/<id>/driveTo    { x, z, y?, speed?, arriveRadius?, stop? }
+    POST   /api/world/agents/<id>/pose       { x, z, y?, heading? }   (kinematic agents: set pose directly)
     POST   /api/world/agents/<id>/stop
     DELETE /api/world/agents/<id>
+        (kinematic agents carry no physics and auto-despawn after World.kinematic_ttl s without a pose update)
     GET    /api/transit/vehicles             -> live bus positions, projected to scene [x,_,z]
     GET    /api/transit/trips                -> predicted arrivals, indexed by stop and trip
     GET    /api/transit/alerts               -> service alerts (decoded cause/effect)
@@ -65,6 +67,25 @@ SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_transit_sam
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.abspath(os.path.join(_HERE, "..", "web"))
+# Camera->scene homography calibration: authored config (NOT pipeline output), so it
+# lives OUTSIDE the gitignored web/data/ and is version-controlled (constitution P1).
+CALIB_PATH = os.path.abspath(os.path.join(_HERE, "..", "calibration", "cameras.json"))
+CALIB_LOCK = threading.Lock()
+
+
+def load_calib():
+    try:
+        with open(CALIB_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001 — missing/blank is a valid empty calibration
+        return {"version": 1, "cameras": {}}
+
+
+def save_calib(obj):
+    os.makedirs(os.path.dirname(CALIB_PATH), exist_ok=True)
+    with CALIB_LOCK:
+        with open(CALIB_PATH, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
 
 # ---- per-type kinematic defs (scene metres), ported from web/agents.js TYPES ----
 DEFS = {
@@ -268,6 +289,12 @@ class Agent:
             self.y = gy + (20.0 if typ == "drone" else 0.0)
         self.prev = [self.x, self.y, self.z]
 
+        # Kinematic agents (e.g. camera-detected cars) carry no physics: their pose is set
+        # directly via set_pose() and they auto-expire when updates stop (World TTL sweep).
+        self.kinematic = bool(opts.get("kinematic"))
+        self.source = opts.get("source")     # e.g. {"cam":.., "quad":.., "track":..}
+        self.last_update = time.time()
+
     # ---- control inputs ----
     def set_controls(self, c):
         self.goal = None
@@ -331,8 +358,20 @@ class Agent:
         else:
             self.controls = {"throttle": clamp(g["speed"] / self.maxSpeed, 0, 1), "steer": steer, "brake": 0}
 
+    # ---- pose set directly (kinematic agents: camera cars, replays) ----
+    def set_pose(self, x, z, y=None, heading=None):
+        self.x = float(x)
+        self.z = float(z)
+        if y is not None:
+            self.y = float(y)
+        if heading is not None:
+            self.yaw = float(heading) * D2R
+        self.last_update = time.time()
+
     # ---- integrate one tick ----
     def integrate(self, dt):
+        if self.kinematic:
+            return                      # pose is externally driven; no physics
         self._apply_goal()
         kin = self.d["kin"]
         if kin == "ackermann":
@@ -510,6 +549,7 @@ class World:
         self.max_agents = max_agents
         self._next = 1
         self._names = set()
+        self.kinematic_ttl = 5.0   # despawn kinematic agents un-updated for this long (s)
 
     def spawn(self, opts):
         typ = opts.get("type", "car")
@@ -549,6 +589,11 @@ class World:
                 a.finalize(dt)
             for a in arr:
                 a.detect()
+            if self.kinematic_ttl:        # reap kinematic agents whose feed went silent
+                now = time.time()
+                for a in arr:
+                    if a.kinematic and (now - a.last_update) > self.kinematic_ttl:
+                        self.despawn(a.id)
             self.t += dt
             self.frame += 1
 
@@ -993,6 +1038,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.startswith("/api/transit"):
             return self._transit(path)
+        if path == "/api/cameras/calib":     # works without the live camera proxy
+            return self._json(load_calib())
         if path.startswith("/api/cameras"):
             return self._cameras(path)
         if path.startswith("/api/world"):
@@ -1045,8 +1092,28 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(img)
 
+    def _calib_post(self, b):
+        """Upsert one (cameraId, quad) homography into calibration/cameras.json, or
+        replace the whole document with {full:{...}}."""
+        if isinstance(b.get("full"), dict):
+            save_calib(b["full"])
+            return self._json({"ok": True, "mode": "full"})
+        cid, quad = b.get("cameraId"), b.get("quad")
+        if not cid or quad is None:
+            return self._json({"error": "need cameraId and quad (or full)"}, 400)
+        calib = load_calib()
+        cam = calib.setdefault("cameras", {}).setdefault(str(cid), {})
+        if b.get("intersection") is not None:
+            cam["intersection"] = b["intersection"]
+        entry = {k: b[k] for k in ("covers", "imgW", "imgH", "H", "points") if k in b}
+        cam.setdefault("quads", {})[str(quad)] = entry
+        save_calib(calib)
+        return self._json({"ok": True, "cameraId": cid, "quad": quad})
+
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/api/cameras/calib":
+            return self._calib_post(self._body())
         if WORLD is None and path.startswith("/api/world"):
             return self._json({"error": "world not running"}, 503)
         if path == "/api/world/spawn":
@@ -1067,6 +1134,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 a.drive_to(b)
             elif action == "stop":
                 a.stop()
+            elif action == "pose":
+                if b.get("x") is None or b.get("z") is None:
+                    return self._json({"error": "pose needs x and z"}, 400)
+                a.set_pose(b["x"], b["z"], b.get("y"), b.get("heading"))
             else:
                 return self._json({"error": "unknown action"}, 404)
             return self._json({"ok": True})
@@ -1116,10 +1187,14 @@ def main():
                     help="disable the live traffic-camera URL proxy")
     ap.add_argument("--camera-cache-seconds", type=float, default=60.0,
                     help="seconds to cache the scraped camera URLs (tokens last ~900 s; default 60)")
+    ap.add_argument("--kinematic-ttl", type=float, default=5.0,
+                    help="despawn kinematic agents (e.g. camera cars) after this many seconds "
+                         "without a pose update (default 5; 0 disables the sweep)")
     args = ap.parse_args()
 
     print("loading world (terrain heightmap + building boxes) ...")
     WORLD = World(hz=args.hz)
+    WORLD.kinematic_ttl = args.kinematic_ttl
     stop_evt = threading.Event()
     threading.Thread(target=WORLD.run, args=(stop_evt,), daemon=True).start()
 

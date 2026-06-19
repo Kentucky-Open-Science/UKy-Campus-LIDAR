@@ -1214,6 +1214,7 @@ function openCamera(id) {
   if (!cam) return;
   pip.id = id;
   $('cam-pip').classList.remove('hidden');
+  $('cam-pip').dispatchEvent(new CustomEvent('cam-open'));   // reset calibration tool
   $('cam-pip-title').textContent = cam.name + (cam.matched ? '' : ' · (no junction)');
   const url = state.cameras.cameras.streamUrl(id);
   if (url) {
@@ -1301,6 +1302,141 @@ $('cam-pip-native')?.addEventListener('click', async () => {
     panel.style.top = Math.max(0, e.clientY - dy) + 'px';
   });
   bar.addEventListener('pointerup', (e) => { dragging = false; try { bar.releasePointerCapture(e.pointerId); } catch (_) {} });
+})();
+
+// ---- camera calibration + click-to-spawn (Phase 1 geometry tool, on the PiP) ----
+// Calibrate: click an image point in the camera, then the matching spot in the 3D twin,
+// 4+ times per quad, then Solve & Save -> a per-(camera,quad) homography. Spawn mode:
+// click the video where a car is and a kinematic twin car appears (visible to everyone).
+const camCal = (() => {
+  const overlay = $('cam-pip-overlay');
+  let mode = false, spawn = false;
+  const clickCars = [];            // [{id,x,z}] kinematic cars from clicks
+  let heartbeat = null;
+  const api = () => state.cameras && state.cameras.cameras;
+  const calStatus = (t) => { const n = $('cam-cal-status'); if (n) n.textContent = t; };
+  const fullOf = (quad, qu, qv) => {                 // quad-local -> full-frame normalized
+    const col = quad % 2, row = quad >= 2 ? 1 : 0;
+    return [col * 0.5 + qu * 0.5, row * 0.5 + qv * 0.5];
+  };
+
+  function draw() {
+    if (!overlay) return;
+    const r = overlay.getBoundingClientRect();
+    overlay.width = Math.max(2, Math.round(r.width));
+    overlay.height = Math.max(2, Math.round(r.height));
+    const g = overlay.getContext('2d'), W = overlay.width, H = overlay.height;
+    g.clearRect(0, 0, W, H);
+    if (!mode && !spawn) return;
+    g.strokeStyle = 'rgba(159,194,232,0.45)'; g.lineWidth = 1;          // 2x2 quad grid
+    g.beginPath(); g.moveTo(W / 2, 0); g.lineTo(W / 2, H); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
+    const a = api(); if (!a) return;
+    const s = a.calib.session();
+    if (mode && s.quad != null) {                                      // highlight active quad
+      const col = s.quad % 2, row = s.quad >= 2 ? 1 : 0;
+      g.fillStyle = 'rgba(73,176,122,0.10)'; g.fillRect(col * W / 2, row * H / 2, W / 2, H / 2);
+    }
+    g.font = '12px system-ui, sans-serif';
+    s.pairs.forEach((p, i) => {
+      const [fu, fv] = fullOf(s.quad, p.img[0], p.img[1]); const x = fu * W, y = fv * H;
+      g.fillStyle = '#27c46a'; g.beginPath(); g.arc(x, y, 5, 0, 7); g.fill();
+      g.fillStyle = '#fff'; g.fillText(String(i + 1), x + 7, y - 7);
+      const uv = a.calib.sceneToImage(s.camId, s.quad, p.scene[0], p.scene[1]);   // reproj fit
+      if (uv) { const cx = uv[0] * W, cy = uv[1] * H; g.strokeStyle = '#ff8a2a'; g.lineWidth = 2;
+        g.beginPath(); g.moveTo(cx - 6, cy); g.lineTo(cx + 6, cy); g.moveTo(cx, cy - 6); g.lineTo(cx, cy + 6); g.stroke(); }
+    });
+    if (s.pendingImg) { const [fu, fv] = fullOf(s.quad, s.pendingImg[0], s.pendingImg[1]);
+      g.fillStyle = '#ffd23a'; g.beginPath(); g.arc(fu * W, fv * H, 6, 0, 7); g.fill(); }
+  }
+
+  function showBars() {
+    $('cam-cal-bar')?.classList.toggle('hidden', !(mode || spawn));
+    overlay?.classList.toggle('hidden', !(mode || spawn));
+    $('cam-cal-toggle')?.classList.toggle('active', mode);
+    $('cam-cal-spawn')?.classList.toggle('active', spawn);
+    draw();
+  }
+  function reset() { mode = false; spawn = false; showBars(); }
+
+  function enterCalibrate() {
+    if (!pip.id || !api()) return;
+    mode = !mode; if (mode) spawn = false;
+    if (mode) { api().calib.begin(pip.id); calStatus('quad ?: click a point in the camera image, then the SAME spot in the 3D twin (×4+)'); }
+    showBars();
+  }
+  function enterSpawn() {
+    if (!pip.id || !api()) return;
+    spawn = !spawn; if (spawn) mode = false;
+    calStatus(spawn ? 'spawn: click the video where a car is (the quad must be calibrated)' : 'spawn off');
+    showBars();
+  }
+  async function save() {
+    const a = api(); if (!a) return;
+    const cam = a.get(pip.id);
+    const v = $('cam-pip-video');
+    const res = await a.calib.save({ intersection: cam && cam.intersection,
+      imgW: v && v.videoWidth, imgH: v && v.videoHeight });
+    if (res.error && !res.ok) calStatus('save: ' + res.error);
+    else calStatus(`saved quad ${res.quad} — reproj error ${res.reprojError.toFixed(1)} m. Calibrate another quad or use Spawn mode.`);
+    draw();
+  }
+  function onScenePoint(x, z) {
+    const a = api(); if (!a) return;
+    const r = a.calib.addScenePoint(x, z);
+    if (r.error) calStatus(r.error);
+    else calStatus(`quad ${a.calib.session().quad}: ${r.pairs} point(s). ${r.pairs >= 4 ? 'Solve & Save, or add more.' : 'Add ' + (4 - r.pairs) + ' more.'}`);
+    draw();
+  }
+  async function spawnClickCar(x, z, quad) {
+    try {
+      const r = await fetch('/api/world/spawn', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'car', kinematic: true, position: [x, null, z], color: 0xe0a83a,
+          source: { cam: pip.id, quad, manual: true } }) });
+      const a = await r.json();
+      if (a && a.id != null) { clickCars.push({ id: a.id, x, z }); ensureHeartbeat();
+        calStatus(`car #${a.id} at (${x.toFixed(0)}, ${z.toFixed(0)}) — quad ${quad}`); }
+      else calStatus('spawn failed: ' + (a.error || '?'));
+    } catch (e) { calStatus('spawn failed (twin server not running?)'); }
+  }
+  function ensureHeartbeat() {            // keep click-cars alive (re-pose) past the TTL
+    if (heartbeat || !clickCars.length) return;
+    heartbeat = setInterval(() => {
+      for (const c of clickCars) fetch(`/api/world/agents/${c.id}/pose`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x: c.x, z: c.z }) }).catch(() => {});
+    }, 2000);
+  }
+  async function clearCars() {
+    for (const c of clickCars.splice(0)) await fetch(`/api/world/agents/${c.id}`, { method: 'DELETE' }).catch(() => {});
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    calStatus('cleared spawned cars');
+  }
+
+  overlay?.addEventListener('click', (e) => {
+    const a = api(); if (!a || !pip.id) return;
+    const r = overlay.getBoundingClientRect();
+    const u = (e.clientX - r.left) / r.width, v = (e.clientY - r.top) / r.height;
+    if (mode) {
+      const res = a.calib.addImagePoint(u, v);
+      if (res && res.error) calStatus(res.error);
+      else calStatus(`quad ${a.calib.session().quad}: now click the SAME spot in the 3D twin`);
+      draw();
+    } else if (spawn) {
+      const sc = a.calib.imageToScene(pip.id, u, v);
+      if (!sc) calStatus('that quad is not calibrated yet — Calibrate it first');
+      else spawnClickCar(sc.x, sc.z, sc.quad);
+    }
+  });
+  $('cam-cal-toggle')?.addEventListener('click', enterCalibrate);
+  $('cam-cal-spawn')?.addEventListener('click', enterSpawn);
+  $('cam-cal-save')?.addEventListener('click', save);
+  $('cam-cal-undo')?.addEventListener('click', () => { api() && api().calib.undo(); draw(); calStatus('removed last point'); });
+  $('cam-cal-clearcars')?.addEventListener('click', clearCars);
+  $('cam-pip-close')?.addEventListener('click', reset);
+  $('cam-pip')?.addEventListener('cam-open', reset);
+  if (typeof ResizeObserver !== 'undefined' && overlay) new ResizeObserver(() => draw()).observe(overlay);
+
+  return { active: () => mode, spawning: () => spawn, onScenePoint, reset,
+           _draw: draw };   // _draw exposed for tests
 })();
 
 $('buildings-visible').addEventListener('change', (e) => {
@@ -1713,6 +1849,24 @@ function refreshNetAgentList() {
 
 // Click a bus or a shared-world agent in the 3D scene to follow it (distinguish a
 // click from an orbit drag).
+// Ground point under the current raycaster ray: the FLAT_Y plane in flat mode, else a
+// terrain raycast (fallback: the city ground plane). Used to pick the twin point that
+// matches a clicked camera-image point during calibration.
+const _calPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const _calHit = new THREE.Vector3();
+function groundPointFromRay() {
+  if (FLAT_WORLD) {
+    _calPlane.constant = -FLAT_Y;
+    return raycaster.ray.intersectPlane(_calPlane, _calHit) ? { x: _calHit.x, z: _calHit.z } : null;
+  }
+  if (state.terrain.group.children.length) {
+    const h = raycaster.intersectObjects(state.terrain.group.children, false);
+    if (h.length) return { x: h[0].point.x, z: h[0].point.z };
+  }
+  _calPlane.constant = -((state.city && state.city.groundY) || 285);
+  return raycaster.ray.intersectPlane(_calPlane, _calHit) ? { x: _calHit.x, z: _calHit.z } : null;
+}
+
 let _clickX = 0, _clickY = 0, _clickT = 0;
 renderer.domElement.addEventListener('pointerdown', (e) => {
   _clickX = e.clientX; _clickY = e.clientY; _clickT = performance.now();
@@ -1723,6 +1877,11 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   mouseNdc.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouseNdc.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouseNdc, camera);
+  // 0) CALIBRATION: a scene click provides the ground point matching a pending image point
+  if (state.cameras && camCal.active() && state.cameras.cameras.calib.session().pendingImg) {
+    const gp = groundPointFromRay();
+    if (gp) { camCal.onScenePoint(gp.x, gp.z); return; }
+  }
   // 1) a bus / shared-world agent -> follow it
   const movers = [];
   if (state.transit) movers.push(...state.transit.layers.buses.children);
