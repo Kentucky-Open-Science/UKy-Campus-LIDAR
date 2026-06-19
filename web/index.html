@@ -64,8 +64,8 @@
     <label class="row"><input type="checkbox" id="road-roads" checked> road surface</label>
     <label class="row"><input type="checkbox" id="road-markings" checked> lane markings &amp; stop bars</label>
     <label class="row"><input type="checkbox" id="road-crosswalks" checked> crosswalks</label>
-    <label class="row"><input type="checkbox" id="road-trees"> trees</label>
-    <label class="row"><input type="checkbox" id="road-cars"> cars</label>
+    <label class="row"><input type="checkbox" id="road-cars" checked> live traffic detections (vehicles &amp; pedestrians)</label>
+    <label class="row"><input type="checkbox" id="road-car-labels" checked> &nbsp;&nbsp;&boxur; detection labels</label>
     <label class="row"><input type="checkbox" id="road-signals" checked> traffic &amp; pedestrian signals</label>
     <label class="row"><input type="checkbox" id="labels-visible" checked> street name labels</label>
     <div id="road-status" class="status">roads: loading&hellip;</div>
@@ -157,7 +157,8 @@
   <div class="cam-pip-bar">
     <span id="cam-pip-title">camera</span>
     <span class="cam-pip-actions">
-      <button id="cam-det-toggle" title="show live detection boxes (needs tools.camera_detect running)">Detect</button>
+      <button id="cam-det-run" title="run the YOLO detector for this camera on the server — spawns live detected vehicles/pedestrians into the twin">Run&nbsp;YOLO</button>
+      <button id="cam-det-toggle" title="overlay the live detection boxes on the video">Detect</button>
       <button id="cam-cal-toggle" title="calibrate this camera's sub-views to the twin">Calibrate</button>
       <button id="cam-pip-native" title="browser picture-in-picture">PiP</button>
       <button id="cam-pip-close" title="close">&times;</button>

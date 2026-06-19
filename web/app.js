@@ -945,7 +945,7 @@ async function loadRoads() {
   // name, distance-culled each frame so only nearby ones draw.
   state.labels = createStreetLabels(
     { roads: data.roads || [], cityRoads: state.cityRoads || [], cityY: cityGroundY },
-    { far: 480, maxLabels: 220 });
+    { maxLabels: 2500 });
   const lblCb = $('labels-visible');
   state.labels.group.visible = lblCb ? lblCb.checked : true;
   scene.add(state.labels.group);
@@ -953,7 +953,9 @@ async function loadRoads() {
   // Shared-world agents from the authoritative twin server (tools/twin_server.py):
   // renders every agent in the shared world, including ones spawned by other clients'
   // scripts. Backs off to nothing when the page isn't served by the twin server.
-  state.netagents = createNetAgents({ scene, base: '', pollMs: 120 });
+  state.netagents = createNetAgents({ scene, base: '', pollMs: 120,
+    camCarsVisible: $('road-cars') ? $('road-cars').checked : true,        // Roads & props "cars" toggle
+    camLabelsVisible: $('road-car-labels') ? $('road-car-labels').checked : true });
   const naCb = $('netagents-visible');
   state.netagents.group.visible = naCb ? naCb.checked : true;
   scene.add(state.netagents.group);
@@ -1058,12 +1060,20 @@ $('camera-reset').addEventListener('click', () => { exitDrive(); exitFollow(); r
 $('road-visible').addEventListener('change', (e) => {
   if (state.roadnet) state.roadnet.group.visible = e.target.checked;
 });
-for (const key of ['roads', 'markings', 'crosswalks', 'trees', 'cars', 'signals']) {
+for (const key of ['roads', 'markings', 'crosswalks', 'signals']) {
   const cb = $('road-' + key);
   if (cb) cb.addEventListener('change', (e) => {
     if (state.roadnet) state.roadnet.layers[key].visible = e.target.checked;
   });
 }
+// "cars" = the live traffic-stream (camera-detected) cars in the shared world, not the
+// static prop cars — toggle their visibility via netagents.
+$('road-cars')?.addEventListener('change', (e) => {
+  if (state.netagents) state.netagents.setCamCarsVisible(e.target.checked);
+});
+$('road-car-labels')?.addEventListener('change', (e) => {
+  if (state.netagents) state.netagents.setCamLabelsVisible(e.target.checked);
+});
 $('labels-visible')?.addEventListener('change', (e) => {
   if (state.labels) state.labels.setVisible(e.target.checked);
 });
@@ -1210,18 +1220,48 @@ function refreshCameraList(force) {
 const pip = { id: null, hls: null, live: false, stillTimer: null };
 // Tell the detector(s) which camera is being viewed so a --follow-active detector only
 // burns GPU on the camera someone is actually watching (per-active-camera perf bounding).
-function setActiveCamera(id) {
+// The signal is per-camera and TTL'd server-side, so we refresh it on a heartbeat while
+// the PiP is open (otherwise it would expire mid-view and idle the detector), and clear
+// only THIS camera on close (not every viewer's).
+let _activeTimer = null;
+function _postActive(body) {
   fetch('/api/cameras/active', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ camera: id }) }).catch(() => {});
+    body: JSON.stringify(body) }).catch(() => {});
+}
+function setActiveCamera(id) {
+  if (_activeTimer) { clearInterval(_activeTimer); _activeTimer = null; }
+  if (id == null) { _postActive({ camera: null }); return; }
+  _postActive({ camera: id });
+  _activeTimer = setInterval(() => _postActive({ camera: id }), 5000);  // < server ACTIVE_TTL
+}
+function clearActiveCamera(id) {
+  if (_activeTimer) { clearInterval(_activeTimer); _activeTimer = null; }
+  _postActive({ camera: id, active: false });   // remove only this camera's viewer signal
+}
+// Move the orbit camera to look at a traffic camera's intersection (the scene position
+// baked in cameras.json — the snapped junction centre for matched cameras). Clicking a
+// camera should take you there, so we drop any follow/drive lock first, then frame the
+// junction with a comfortable oblique view.
+function flyToCamera(cam) {
+  if (!cam || !cam.position) return;
+  exitDrive(); exitFollow();
+  const x = cam.position[0], z = cam.position[2];
+  const gy = FLAT_WORLD ? FLAT_Y : (Number.isFinite(cam.position[1]) ? cam.position[1]
+    : ((state.city && state.city.groundY) || 285));
+  controls.target.set(x, gy, z);
+  camera.position.set(x + 70, gy + 85, z + 70);   // oblique view of the intersection
+  controls.update();
 }
 function openCamera(id) {
   if (!state.cameras) return;
   const cam = state.cameras.cameras.get(id);
   if (!cam) return;
+  flyToCamera(cam);   // take the 3D view to this camera's intersection
   pip.id = id;
   $('cam-pip').classList.remove('hidden');
   $('cam-pip').dispatchEvent(new CustomEvent('cam-open'));   // reset calibration tool
   setActiveCamera(id);   // tell detectors which camera is being viewed (perf bounding)
+  camDetect.refresh();   // reflect whether a server-side YOLO detector is already running
   $('cam-pip-title').textContent = cam.name + (cam.matched ? '' : ' · (no junction)');
   const url = state.cameras.cameras.streamUrl(id);
   if (url) {
@@ -1280,7 +1320,7 @@ function showStill(id) {
 }
 $('cam-pip-close')?.addEventListener('click', () => {
   teardownStream();
-  setActiveCamera(null);   // no camera viewed -> a --follow-active detector idles
+  if (pip.id != null) clearActiveCamera(pip.id);   // clear only this camera's viewer signal
   pip.id = null;
   $('cam-pip').classList.add('hidden');
   refreshCameraList(true);
@@ -1319,58 +1359,87 @@ $('cam-pip-native')?.addEventListener('click', async () => {
 const camCal = (() => {
   const overlay = $('cam-pip-overlay');
   let mode = false, spawn = false, detect = false;
-  let detectTimer = null, lastDets = [], lastDetMeta = null;
+  let detectTimer = null, lastDets = [], lastDetMeta = null, _detSig = '';
   const clickCars = [];            // [{id,x,z}] kinematic cars from clicks
   let heartbeat = null;
-  // class colours/names match tools/camera_detect.py CLASS_COLOR / VEHICLE_CLASSES
-  const CLS_COLOR = { 1: '#4aa05a', 2: '#27c4c4', 3: '#c77f2a', 5: '#e0a83a' };
-  const CLS_NAME = { 1: 'bike', 2: 'car', 3: 'moto', 5: 'bus' };
+  // class colours/names match tools/camera_detect.py CLASS_COLOR / DETECT_CLASSES
+  const CLS_COLOR = { 0: '#e25fae', 1: '#4aa05a', 2: '#27c4c4', 3: '#c77f2a', 5: '#e0a83a', 7: '#8e6bd0' };
+  const CLS_NAME = { 0: 'ped', 1: 'bike', 2: 'car', 3: 'moto', 5: 'bus', 7: 'truck' };
   const api = () => state.cameras && state.cameras.cameras;
   const calStatus = (t) => { const n = $('cam-cal-status'); if (n) n.textContent = t; };
   const fullOf = (quad, qu, qv) => {                 // quad-local -> full-frame normalized
     const col = quad % 2, row = quad >= 2 ? 1 : 0;
     return [col * 0.5 + qu * 0.5, row * 0.5 + qv * 0.5];
   };
+  // The PiP <video> is object-fit:contain, so the video CONTENT is letterboxed inside the
+  // stage whenever the panel aspect != the stream's (true even at the default size, and
+  // always after a resize). Map between full-frame-normalized [0,1] coords and overlay
+  // pixels through the REAL displayed content box, so clicks and overlay geometry track
+  // the visible pixels — not the black bars. Without this the homography is authored from
+  // misregistered clicks and both click- and detector-spawned cars land in the wrong place.
+  function contentBox(W, H) {
+    const v = $('cam-pip-video');
+    const vw = (v && v.videoWidth) || 960, vh = (v && v.videoHeight) || 720;  // streams are 960x720
+    const scale = Math.min(W / vw, H / vh);
+    const dispW = vw * scale, dispH = vh * scale;
+    return { offX: (W - dispW) / 2, offY: (H - dispH) / 2, dispW, dispH };
+  }
+  // full-frame-normalized -> overlay px (within the content box). Exposed for the click
+  // handler's inverse mapping too.
+  function toPx(cb, fu, fv) { return [cb.offX + fu * cb.dispW, cb.offY + fv * cb.dispH]; }
+  function clickToContent(r, clientX, clientY) {   // overlay px -> full-frame-normalized
+    const cb = contentBox(r.width, r.height);
+    const u = (clientX - r.left - cb.offX) / cb.dispW;
+    const v = (clientY - r.top - cb.offY) / cb.dispH;
+    return { u, v, inside: u >= 0 && u <= 1 && v >= 0 && v <= 1 };
+  }
 
   function draw() {
     if (!overlay) return;
     const r = overlay.getBoundingClientRect();
-    overlay.width = Math.max(2, Math.round(r.width));
-    overlay.height = Math.max(2, Math.round(r.height));
+    // Resize the backing store only when the measured size actually changes — assigning
+    // canvas.width/height ALWAYS reallocates+clears it, so doing it every 200ms poll was
+    // needless reflow + GC churn. clearRect below still clears each frame.
+    const w = Math.max(2, Math.round(r.width)), h = Math.max(2, Math.round(r.height));
+    if (overlay.width !== w) overlay.width = w;
+    if (overlay.height !== h) overlay.height = h;
     const g = overlay.getContext('2d'), W = overlay.width, H = overlay.height;
     g.clearRect(0, 0, W, H);
     if (!mode && !spawn && !detect) return;
+    const cb = contentBox(W, H);
     if (detect) {                                                       // live detection boxes
       g.lineWidth = 2; g.font = '11px system-ui, sans-serif';
       for (const d of lastDets) {
         const col = d.quad % 2, row = d.quad >= 2 ? 1 : 0;             // box is normalized within its quad
-        const x = (col * 0.5 + d.box[0] * 0.5) * W, y = (row * 0.5 + d.box[1] * 0.5) * H;
-        const x2 = (col * 0.5 + d.box[2] * 0.5) * W, y2 = (row * 0.5 + d.box[3] * 0.5) * H;
+        const [x, y] = toPx(cb, col * 0.5 + d.box[0] * 0.5, row * 0.5 + d.box[1] * 0.5);
+        const [x2, y2] = toPx(cb, col * 0.5 + d.box[2] * 0.5, row * 0.5 + d.box[3] * 0.5);
         const c = CLS_COLOR[d.cls] || '#27c4c4';
         g.strokeStyle = c; g.strokeRect(x, y, x2 - x, y2 - y);
         g.fillStyle = c; g.fillText((CLS_NAME[d.cls] || '?') + (d.conf != null ? ' ' + d.conf : ''), x + 2, Math.max(10, y - 3));
       }
     }
     if (!mode && !spawn) return;
-    g.strokeStyle = 'rgba(159,194,232,0.45)'; g.lineWidth = 1;          // 2x2 quad grid
-    g.beginPath(); g.moveTo(W / 2, 0); g.lineTo(W / 2, H); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
+    g.strokeStyle = 'rgba(159,194,232,0.45)'; g.lineWidth = 1;          // 2x2 quad grid (over the content box)
+    const mid = toPx(cb, 0.5, 0.5), tl = toPx(cb, 0, 0), br = toPx(cb, 1, 1);
+    g.beginPath(); g.moveTo(mid[0], tl[1]); g.lineTo(mid[0], br[1]); g.moveTo(tl[0], mid[1]); g.lineTo(br[0], mid[1]); g.stroke();
     const a = api(); if (!a) return;
     const s = a.calib.session();
     if (mode && s.quad != null) {                                      // highlight active quad
       const col = s.quad % 2, row = s.quad >= 2 ? 1 : 0;
-      g.fillStyle = 'rgba(73,176,122,0.10)'; g.fillRect(col * W / 2, row * H / 2, W / 2, H / 2);
+      const [hx, hy] = toPx(cb, col * 0.5, row * 0.5);
+      g.fillStyle = 'rgba(73,176,122,0.10)'; g.fillRect(hx, hy, cb.dispW * 0.5, cb.dispH * 0.5);
     }
     g.font = '12px system-ui, sans-serif';
     s.pairs.forEach((p, i) => {
-      const [fu, fv] = fullOf(s.quad, p.img[0], p.img[1]); const x = fu * W, y = fv * H;
+      const [fu, fv] = fullOf(s.quad, p.img[0], p.img[1]); const [x, y] = toPx(cb, fu, fv);
       g.fillStyle = '#27c46a'; g.beginPath(); g.arc(x, y, 5, 0, 7); g.fill();
       g.fillStyle = '#fff'; g.fillText(String(i + 1), x + 7, y - 7);
       const uv = a.calib.sceneToImage(s.camId, s.quad, p.scene[0], p.scene[1]);   // reproj fit
-      if (uv) { const cx = uv[0] * W, cy = uv[1] * H; g.strokeStyle = '#ff8a2a'; g.lineWidth = 2;
+      if (uv) { const [cx, cy] = toPx(cb, uv[0], uv[1]); g.strokeStyle = '#ff8a2a'; g.lineWidth = 2;
         g.beginPath(); g.moveTo(cx - 6, cy); g.lineTo(cx + 6, cy); g.moveTo(cx, cy - 6); g.lineTo(cx, cy + 6); g.stroke(); }
     });
-    if (s.pendingImg) { const [fu, fv] = fullOf(s.quad, s.pendingImg[0], s.pendingImg[1]);
-      g.fillStyle = '#ffd23a'; g.beginPath(); g.arc(fu * W, fv * H, 6, 0, 7); g.fill(); }
+    if (s.pendingImg) { const [fu, fv] = fullOf(s.quad, s.pendingImg[0], s.pendingImg[1]); const [px, py] = toPx(cb, fu, fv);
+      g.fillStyle = '#ffd23a'; g.beginPath(); g.arc(px, py, 6, 0, 7); g.fill(); }
   }
 
   function showBars() {
@@ -1382,7 +1451,15 @@ const camCal = (() => {
     $('cam-det-toggle')?.classList.toggle('active', detect);
     draw();
   }
-  function reset() { mode = false; spawn = false; stopDetect(); showBars(); }
+  function reset() {
+    mode = false; spawn = false; stopDetect();
+    // Tear down click-spawned cars + their keep-alive heartbeat on PiP close / camera
+    // switch — otherwise the 2 s heartbeat keeps re-posing orphaned cars forever (the
+    // user can no longer see or clear them once the PiP is closed).
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    for (const c of clickCars.splice(0)) fetch(`/api/world/agents/${c.id}`, { method: 'DELETE' }).catch(() => {});
+    showBars();
+  }
 
   // ---- live detection boxes: poll the relay the detector publishes to ----
   async function pollDetections() {
@@ -1395,7 +1472,10 @@ const camCal = (() => {
       calStatus(d.stale
         ? 'detections: none — run  python -m tools.camera_detect --camera ' + pip.id
         : `detections: ${lastDets.length} (live, ${d.age}s)`);
-      draw();
+      // only repaint when the boxes actually changed — a static scene was repainting
+      // (and reflowing the canvas) 5x/second for nothing (the _camSig/_busSig pattern).
+      const sig = (d.stale ? 'stale|' : '') + lastDets.map((x) => x.quad + ':' + x.box.join(',') + ':' + x.cls).join('|');
+      if (sig !== _detSig) { _detSig = sig; draw(); }
     } catch (e) { calStatus('detections: relay offline'); }
     if (detect) detectTimer = setTimeout(pollDetections, 200);
   }
@@ -1463,7 +1543,10 @@ const camCal = (() => {
   overlay?.addEventListener('click', (e) => {
     const a = api(); if (!a || !pip.id) return;
     const r = overlay.getBoundingClientRect();
-    const u = (e.clientX - r.left) / r.width, v = (e.clientY - r.top) / r.height;
+    // map the click through the letterboxed content box, not the raw overlay rect, so
+    // the recorded image point matches the visible video pixel (see contentBox).
+    const { u, v, inside } = clickToContent(r, e.clientX, e.clientY);
+    if (!inside) { calStatus('click on the video, not the black letterbox bars'); return; }
     if (mode) {
       const res = a.calib.addImagePoint(u, v);
       if (res && res.error) calStatus(res.error);
@@ -1486,10 +1569,55 @@ const camCal = (() => {
   if (typeof ResizeObserver !== 'undefined' && overlay) new ResizeObserver(() => draw()).observe(overlay);
 
   return { active: () => mode, spawning: () => spawn, detecting: () => detect,
-           onScenePoint, reset, _draw: draw, _dets: () => lastDets };   // exposed for tests
+           onScenePoint, reset, _draw: draw, _dets: () => lastDets,
+           // surfaces feedback when a calibration scene-click missed the ground
+           noGround: () => calStatus('clicked off the ground — aim at the road surface in the 3D view') };
 })();
 window.__camCal = camCal;                 // test/console hook
 window.__camCalDets = () => camCal._dets();
+
+// ---- Run YOLO: start/stop the server's in-process detector for the open camera ----
+// Replaces running `python -m tools.camera_detect --camera <id>` by hand — clicking the
+// PiP button asks the twin server (POST /api/cameras/detect) to run YOLO for this camera,
+// which spawns live detected vehicles/pedestrians into the shared twin. State is read back
+// on open so the button reflects whether a detector is already running.
+const camDetect = (() => {
+  const btn = $('cam-det-run');
+  let running = false;
+  const note = (t) => { const n = $('cam-pip-note'); if (n) n.textContent = t; };
+  function render() {
+    if (!btn) return;
+    btn.classList.toggle('active', running);
+    btn.textContent = running ? '● Detecting' : 'Run YOLO';
+  }
+  async function refresh() {
+    if (!pip.id) { running = false; render(); return; }
+    try {
+      const r = await fetch(`/api/cameras/detect?camera=${encodeURIComponent(pip.id)}`, { cache: 'no-store' });
+      const d = await r.json();
+      running = !!d.running; render();
+    } catch (e) { running = false; render(); }
+  }
+  async function toggle() {
+    if (!pip.id) return;
+    const want = !running;
+    note(want ? 'starting YOLO detector…' : 'stopping detector…');
+    try {
+      const r = await fetch('/api/cameras/detect', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ camera: pip.id, on: want }) });
+      const d = await r.json();
+      if (d.error) { running = false; render(); note('detector: ' + d.error); return; }
+      running = !!d.running; render();
+      note(running ? `detector running (${d.model || 'yolo'}) — live cars spawning in the twin`
+                   : 'detector stopped');
+      if (running && !camCal.detecting()) $('cam-det-toggle')?.click();   // show the boxes too
+    } catch (e) { note('detector: twin server not reachable'); }
+  }
+  btn?.addEventListener('click', toggle);
+  return { refresh, running: () => running };
+})();
+window.__camDetect = camDetect;
 
 $('buildings-visible').addEventListener('change', (e) => {
   state.buildings.group.visible = e.target.checked;
@@ -1508,11 +1636,15 @@ $('buildings-color-mode').addEventListener('change', () => {
   if (state.buildings.packed) {
     const { mesh, minH, maxH, meta } = state.buildings.packed;
     const col = mesh.geometry.getAttribute('color');
-    const c = new THREE.Color();
-    for (const b of meta.buildings) {
+    const arr = col.array;                 // write the packed Float32Array directly:
+    const c = new THREE.Color();            // setXYZ per vertex over ~millions of verts
+    for (const b of meta.buildings) {       // hitched the toggle (same fast path as load)
       if (mode === 'grey') c.setHex(0x8899aa);
       else c.copy(buildingHeightColor(b.heightM, minH, maxH));
-      for (let v = b.vStart; v < b.vStart + b.vCount; v++) col.setXYZ(v, c.r, c.g, c.b);
+      const r = c.r, gr = c.g, bl = c.b;
+      for (let v = b.vStart, e = b.vStart + b.vCount; v < e; v++) {
+        const o = v * 3; arr[o] = r; arr[o + 1] = gr; arr[o + 2] = bl;
+      }
     }
     col.needsUpdate = true;
     return;
@@ -1933,6 +2065,7 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (state.cameras && camCal.active() && state.cameras.cameras.calib.session().pendingImg) {
     const gp = groundPointFromRay();
     if (gp) { camCal.onScenePoint(gp.x, gp.z); return; }
+    camCal.noGround(); return;   // consume the click + tell the user it missed the ground
   }
   // 1) a bus / shared-world agent -> follow it
   const movers = [];
@@ -2048,7 +2181,7 @@ function animate() {
   if (state.agents) state.agents.tick(dt); // integrate agents after signals, before render
   if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame
   if (follow.id != null) updateFollowCamera(dt); // follow AFTER the target moved this frame
-  if (state.labels) state.labels.tick(camera); // distance-cull street labels (camera final)
+  if (state.labels) state.labels.tick(camera, controls.target); // cull labels around the look-at point
   renderer.render(scene, camera);
 
   frames++;

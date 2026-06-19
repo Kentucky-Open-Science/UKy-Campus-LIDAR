@@ -63,9 +63,18 @@ def scrape_cameras(url=CITY_MAP_URL):
     with urllib.request.urlopen(req, timeout=30) as r:
         html = r.read().decode("utf-8", "replace")
     html = html.replace("'", '"')
-    sub = html[html.find("camMarker"):]
-    arr = sub[sub.find("["):sub.find("]")] + "]"
-    return json.loads(arr)
+    i = html.find("camMarker")
+    if i < 0:
+        raise ValueError("camMarker array not found in the city map HTML "
+                         "(page layout may have changed)")
+    start = html.find("[", i)
+    if start < 0:
+        raise ValueError("camMarker array opening bracket not found")
+    # raw_decode parses exactly one JSON array starting at '[' and ignores any trailing
+    # content, so a nested array or a ']' inside a string can't truncate it (the old
+    # find("]") slice did, raising json errors on otherwise-valid pages).
+    arr, _ = json.JSONDecoder().raw_decode(html[start:])
+    return arr
 
 
 def load_cam_data(path):
@@ -143,7 +152,11 @@ def main():
 
     if args.scrape:
         print(f"scraping {CITY_MAP_URL} ...")
-        cams = scrape_cameras()
+        try:
+            cams = scrape_cameras()
+        except Exception as e:  # noqa: BLE001 — a clean message beats a raw traceback
+            raise SystemExit(f"scrape failed ({e}); retry, or omit --scrape to use "
+                             f"the cached {args.cam_data}")
     else:
         print(f"reading {args.cam_data} ...")
         cams = load_cam_data(args.cam_data)

@@ -18,7 +18,7 @@ has at least one quad calibrated via the PiP tool (calibration/cameras.json).
 Usage (from a venv with ultralytics+opencv, e.g. TrafficStream's):
     python -m tools.camera_detect --camera LEX-CAM-052
     python -m tools.camera_detect --camera LEX-CAM-052 --twin http://127.0.0.1:8000 \
-        --model yolo26n.pt --conf 0.35 --imgsz 640 --max-fps 8
+        --model yolo26x.pt --conf 0.30 --imgsz 640 --max-fps 8
 
 Camera feeds (c) City of Lexington, KY — personal/educational use; respect their terms.
 """
@@ -26,11 +26,17 @@ import argparse
 import json
 import math
 import time
+import urllib.parse
 import urllib.request
 
-# COCO vehicle classes (matches TrafficStream)
-VEHICLE_CLASSES = {1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus"}
-CLASS_COLOR = {1: 0x4aa05a, 2: 0x35c4c4, 3: 0xc77f2a, 5: 0xe0a83a}
+# COCO classes we map into the twin: pedestrians + every road vehicle (person, bicycle,
+# car, motorcycle, bus, truck). Each maps to a twin agent TYPE sized for that class
+# (CLASS_TYPE) and a COLOUR that must match web/app.js CLS_COLOR (the PiP overlay) so the
+# on-video box and the spawned 3D body are the same colour.
+DETECT_CLASSES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+CLASS_COLOR = {0: 0xe25fae, 1: 0x4aa05a, 2: 0x27c4c4, 3: 0xc77f2a, 5: 0xe0a83a, 7: 0x8e6bd0}
+CLASS_TYPE = {0: "ped", 1: "bike", 2: "car", 3: "moto", 5: "bus", 7: "truck"}
+DEFAULT_CAR_COLOR = 0x27c4c4
 
 
 # ---- homography apply (pure python; mirrors web/homography.js applyHomography) ----
@@ -61,10 +67,10 @@ class TwinClient:
         with urllib.request.urlopen(r, timeout=10) as resp:
             return json.loads(resp.read() or b"{}")
 
-    def spawn(self, x, z, heading, source, color=0x35c4c4):
+    def spawn(self, x, z, heading, source, color=DEFAULT_CAR_COLOR, typ="car"):
         try:
             a = self._req("POST", "/api/world/spawn", {
-                "type": "car", "kinematic": True, "position": [x, None, z],
+                "type": typ, "kinematic": True, "position": [x, None, z],
                 "heading": heading, "color": color, "source": source})
             return a.get("id")
         except Exception:  # noqa: BLE001 — a flaky twin must not kill the detector
@@ -95,11 +101,14 @@ class TwinClient:
         except Exception:  # noqa: BLE001
             pass
 
-    def active_camera(self):
+    def is_active(self, camera):
+        """True iff `camera` currently has a live viewer (per-camera signal, so two
+        viewers on two cameras don't alias one global slot)."""
         try:
-            return self._req("GET", "/api/cameras/active").get("camera")
+            r = self._req("GET", "/api/cameras/active?camera=" + urllib.parse.quote(str(camera)))
+            return bool(r.get("active"))
         except Exception:  # noqa: BLE001
-            return None
+            return False
 
     def calib(self):
         try:
@@ -123,18 +132,34 @@ class SceneTracker:
         self._next = 1
 
     def _dedup(self, dets):
+        """Merge detections of the SAME vehicle seen across DIFFERENT quads (the only
+        real duplicate source — overlap near quad seams). Detections from the SAME quad
+        are never merged: one quad's YOLO already de-duplicates via NMS, so merging
+        within a quad would collapse two cars in adjacent lanes (< dedup_m apart) into
+        one track and drop the other. Each detection joins its NEAREST eligible cluster
+        (order-independent), not the first within range, and we record the full set of
+        contributing quads so a seam car is distinguishable downstream."""
         clusters = []
         for d in dets:
+            dq = d.get("quad")
+            best, bd = None, self.dedup_m
             for c in clusters:
-                if math.hypot(c["x"] - d["x"], c["z"] - d["z"]) <= self.dedup_m:
-                    n = c["n"]
-                    c["x"] = (c["x"] * n + d["x"]) / (n + 1)
-                    c["z"] = (c["z"] * n + d["z"]) / (n + 1)
-                    c["n"] = n + 1
-                    c["cls"] = c["cls"] or d.get("cls")
-                    break
+                if dq is not None and dq in c["quads"]:
+                    continue                      # same quad -> distinct vehicle, never merge
+                dist = math.hypot(c["x"] - d["x"], c["z"] - d["z"])
+                if dist <= bd:
+                    bd, best = dist, c
+            if best is not None:
+                n = best["n"]
+                best["x"] = (best["x"] * n + d["x"]) / (n + 1)
+                best["z"] = (best["z"] * n + d["z"]) / (n + 1)
+                best["n"] = n + 1
+                best["cls"] = best["cls"] or d.get("cls")
+                if dq is not None:
+                    best["quads"].add(dq)
             else:
-                clusters.append({"x": d["x"], "z": d["z"], "n": 1, "cls": d.get("cls"), "quad": d.get("quad")})
+                clusters.append({"x": d["x"], "z": d["z"], "n": 1, "cls": d.get("cls"),
+                                 "quad": dq, "quads": {dq} if dq is not None else set()})
         return clusters
 
     def update(self, frame, dets):
@@ -153,9 +178,14 @@ class SceneTracker:
             if ci in matched or tid not in free:
                 continue
             c, t = clusters[ci], self.tracks[tid]
-            dx, dz = c["x"] - t["x"], c["z"] - t["z"]
-            if math.hypot(dx, dz) >= self.min_move:
-                t["heading"] = heading_from_motion(dx, dz)
+            # Heading from CUMULATIVE motion since the last commit (anchor), not the
+            # single-frame step: a slow/queued car (or one detected at < min_move per
+            # 125 ms frame) still accumulates enough travel to get a correct heading,
+            # instead of being pinned to +X until one frame happens to jump >= min_move.
+            adx, adz = c["x"] - t["ax"], c["z"] - t["az"]
+            if math.hypot(adx, adz) >= self.min_move:
+                t["heading"] = heading_from_motion(adx, adz)
+                t["ax"], t["az"] = c["x"], c["z"]   # re-anchor at the committed point
             t["x"], t["z"], t["last_frame"] = c["x"], c["z"], frame
             self.twin.pose(t["agent_id"], c["x"], c["z"], t["heading"])
             matched.add(ci); free.discard(tid)
@@ -163,12 +193,18 @@ class SceneTracker:
         for ci, c in enumerate(clusters):
             if ci in matched:
                 continue
-            color = CLASS_COLOR.get(c.get("cls"), 0x35c4c4)
+            cls = c.get("cls")
+            color = CLASS_COLOR.get(cls, DEFAULT_CAR_COLOR)
+            typ = CLASS_TYPE.get(cls, "car")        # person->ped, truck->truck, bus->bus, ...
             aid = self.twin.spawn(c["x"], c["z"], 0.0,
-                                  {"cam": self.cam, "quad": c.get("quad"), "track": self._next}, color)
+                                  {"cam": self.cam, "quad": c.get("quad"),
+                                   "quads": sorted(c["quads"]), "cls": cls, "track": self._next},
+                                  color, typ)
             if aid is not None:
-                self.tracks[self._next] = {"agent_id": aid, "x": c["x"], "z": c["z"], "heading": 0.0,
-                                           "last_frame": frame, "quad": c.get("quad"), "cls": c.get("cls")}
+                self.tracks[self._next] = {"agent_id": aid, "x": c["x"], "z": c["z"],
+                                           "ax": c["x"], "az": c["z"],  # heading anchor
+                                           "heading": 0.0, "last_frame": frame,
+                                           "quad": c.get("quad"), "cls": c.get("cls")}
                 self._next += 1
         # reap tracks unseen for too long (the twin TTL is the backstop)
         for tid in [t for t, v in self.tracks.items() if frame - v["last_frame"] > self.lost_frames]:
@@ -203,7 +239,7 @@ def tire_to_scene(H, sw, sh, x1, y1, x2, y2):
 
 
 class CameraDetector:
-    def __init__(self, twin, camera_id, Hq, model="yolo26n.pt", conf=0.35, imgsz=640,
+    def __init__(self, twin, camera_id, Hq, model="yolo26x.pt", conf=0.30, imgsz=640,
                  max_det=50, publish=True, follow_active=False):
         self.twin = twin
         self.cam = camera_id
@@ -229,8 +265,9 @@ class CameraDetector:
         print(f"detector: {self.cam}  quads={sorted(self.Hq)}  model={self.model_name}")
         model = YOLO(self.model_name)
         cap = cv2.VideoCapture(url)
-        classes = list(VEHICLE_CLASSES)
+        classes = list(DETECT_CLASSES)
         frame, period = 0, (1.0 / max_fps if max_fps else 0)
+        was_idle = False
         try:
             while not (stop and stop()):
                 t0 = time.time()
@@ -238,11 +275,15 @@ class CameraDetector:
                 if not ok or img is None:
                     cap.release(); time.sleep(1.0); cap = cv2.VideoCapture(self._stream_url() or url); continue
                 # per-active-camera perf bounding: idle (no inference) while nobody views us
-                if self.follow_active and self.twin.active_camera() != self.cam:
+                if self.follow_active and not self.twin.is_active(self.cam):
                     self.tracker.update(frame, [])      # lets tracks age out -> despawn
+                    if self.publish and not was_idle:   # clear the PiP overlay on going idle
+                        self.twin.publish_detections(self.cam, frame, [])  # else stale boxes linger up to DET_TTL
+                    was_idle = True
                     frame += 1
                     time.sleep(0.4)
                     continue
+                was_idle = False
                 h, w = img.shape[:2]
                 dets, raw = [], []
                 for q, H in self.Hq.items():
@@ -277,8 +318,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--camera", required=True, help="camera id, e.g. LEX-CAM-052")
     ap.add_argument("--twin", default="http://127.0.0.1:8000", help="twin server base URL")
-    ap.add_argument("--model", default="yolo26n.pt", help="YOLO weights (nano by default for speed)")
-    ap.add_argument("--conf", type=float, default=0.35)
+    ap.add_argument("--model", default="yolo26x.pt",
+                    help="YOLO weights. Default yolo26x (largest/most accurate) for a GPU; "
+                         "drop to yolo26l/m/n if you need more speed.")
+    ap.add_argument("--conf", type=float, default=0.30, help="detection confidence threshold")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--max-det", type=int, default=50)
     ap.add_argument("--max-fps", type=float, default=8.0, help="detection pace (0 = uncapped)")

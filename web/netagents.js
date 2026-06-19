@@ -20,11 +20,21 @@ const D2R = Math.PI / 180;
 // to FLAT_Y, so ground the shared-world agents (incl. kinematic camera cars) on it,
 // otherwise they'd float/sink relative to the flat roads.
 const groundOf = (p) => (FLAT_WORLD ? FLAT_Y : p[1]);
-// [length(+X), height(+Y), width(+Z)] per type, matching the server's kinematic defs
-const DIMS = { car: [4.3, 1.45, 1.9], truck: [8.5, 3.2, 2.5], robot: [0.8, 0.6, 0.6], drone: [0.9, 0.35, 0.9] };
+// [length(+X), height(+Y), width(+Z)] per type, matching the server's kinematic DEFS
+// (slightly under real-world so vehicles don't look oversized in the twin).
+const DIMS = {
+  car: [3.0, 1.3, 1.6], truck: [6.0, 2.6, 2.1], bus: [8.5, 2.9, 2.3],
+  moto: [1.8, 1.4, 0.7], bike: [1.6, 1.5, 0.5], ped: [0.5, 1.7, 0.5],
+  robot: [0.8, 0.6, 0.6], drone: [0.9, 0.35, 0.9],
+};
 
 function shortestAngle(a, b) { let d = (b - a) % (2 * Math.PI);
   if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI; return d; }
+
+// A "camera car" is a shared-world agent spawned from a traffic-camera detection
+// (tools/camera_detect.py) or a calibration click — both tag their source with a camera
+// id. The Roads & props "cars" toggle shows/hides exactly these (not scripted agents).
+const isCamCar = (a) => !!(a && a.source && a.source.cam != null);
 
 export function createNetAgents(deps = {}) {
   const { scene, base = '', pollMs = 120 } = deps;
@@ -32,11 +42,29 @@ export function createNetAgents(deps = {}) {
   const agents = new Map();                 // id -> { object, body, mat, sprite, cur, tgt, yaw, tgtYaw, hit, data }
   const status = { server: 'connecting', count: 0, t: 0 };
   let stopped = false, pollTimer = null;
+  let camCarsVisible = deps.camCarsVisible !== false;   // traffic-stream cars shown by default
+  let camLabelsVisible = deps.camLabelsVisible !== false; // their small id labels shown by default
   const RECONNECT_MS = 4000;
 
   function dims(type) { return DIMS[type] || [2, 1, 2]; }
 
-  function labelSprite(text) {
+  // Shared geometry/material caches. Camera-detected cars spawn/despawn continuously,
+  // so allocating (and disposing) a BoxGeometry + ConeGeometry + arrow material per
+  // agent is pure churn — and the old code never disposed the body/arrow geometry or
+  // arrow material, leaking GPU buffers over a session. Bodies share one BoxGeometry per
+  // type; the arrow shares one cone geometry + one material. Only the body MATERIAL is
+  // per-agent (its color/emissive), so it's the sole thing created per spawn / disposed
+  // per removal.
+  const _bodyGeo = new Map();   // type -> BoxGeometry
+  const _coneGeo = new THREE.ConeGeometry(0.22, 0.7, 8);
+  const _arrowMat = new THREE.MeshStandardMaterial({ color: 0xffe14d });
+  function bodyGeo(type) {
+    let g = _bodyGeo.get(type);
+    if (!g) { const [L, H, W] = dims(type); g = new THREE.BoxGeometry(L, H, W); _bodyGeo.set(type, g); }
+    return g;
+  }
+
+  function labelSprite(text, worldH = 6) {
     const c = document.createElement('canvas');
     const g = c.getContext('2d');
     g.font = '600 30px system-ui, sans-serif';
@@ -47,7 +75,7 @@ export function createNetAgents(deps = {}) {
     g.fillStyle = '#fff'; g.fillText(text, w / 2, h / 2);
     const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4;
     const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: true }));
-    spr.scale.set(6 * (w / h), 6, 1);
+    spr.scale.set(worldH * (w / h), worldH, 1);   // worldH = on-screen label height (m)
     return spr;
   }
 
@@ -56,18 +84,23 @@ export function createNetAgents(deps = {}) {
     const root = new THREE.Group(); root.name = 'net-' + a.id;
     const mat = new THREE.MeshStandardMaterial({ color: a.color != null ? a.color : 0x3577c9,
       roughness: 0.5, metalness: 0.35, emissive: 0x000000 });
-    const body = new THREE.Mesh(new THREE.BoxGeometry(L, H, W), mat);
+    const body = new THREE.Mesh(bodyGeo(a.type), mat);   // shared geo, per-agent material
     body.position.y = H / 2;
     root.add(body);
-    // forward heading marker (+X)
-    const arrow = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.7, 8),
-      new THREE.MeshStandardMaterial({ color: 0xffe14d }));
+    // forward heading marker (+X) — shared geometry + material (not per-agent)
+    const arrow = new THREE.Mesh(_coneGeo, _arrowMat);
     arrow.rotation.z = -Math.PI / 2; arrow.position.set(L / 2 + 0.35, H / 2, 0);
     root.add(arrow);
-    const sprite = labelSprite(`${a.type} #${a.id} ${a.owner || ''}`.trim());
-    sprite.position.set(0, H + 2.2, 0);
+    // YOLO/camera cars get a much smaller, terser label (no "anon" owner) that hugs the
+    // roof, and obey the car-labels toggle; scripted agents keep the full large label.
+    const cam = isCamCar(a);
+    const text = cam ? `${a.type} #${a.id}` : `${a.type} #${a.id} ${a.owner || ''}`.trim();
+    const sprite = labelSprite(text, cam ? 1.3 : 6);
+    sprite.position.set(0, H + (cam ? 0.85 : 2.2), 0);
+    if (cam) sprite.visible = camLabelsVisible;
     root.add(sprite);
     group.add(root);
+    if (cam) root.visible = camCarsVisible;   // honour the cars toggle for new ones
     const p = a.position;
     const gy = groundOf(p);
     const obj = { object: root, body, mat, sprite, data: a,
@@ -94,6 +127,9 @@ export function createNetAgents(deps = {}) {
     for (const [id, o] of agents) {            // remove agents that left the world
       if (!seen.has(id)) {
         group.remove(o.object);
+        // dispose only this agent's OWN GPU resources: the body material and the label
+        // sprite's texture+material. Body/arrow geometry and the arrow material are
+        // shared caches (see bodyGeo/_coneGeo/_arrowMat) and must NOT be disposed.
         o.mat.dispose();
         o.sprite.material.map.dispose(); o.sprite.material.dispose();
         agents.delete(id);
@@ -133,6 +169,17 @@ export function createNetAgents(deps = {}) {
   return {
     group, tick,
     setVisible(b) { group.visible = !!b; },
+    // show/hide only the traffic-stream (camera-detected) cars, leaving scripted agents
+    // alone; applies to current agents and is remembered for ones that spawn later.
+    setCamCarsVisible(b) {
+      camCarsVisible = !!b;
+      for (const o of agents.values()) if (isCamCar(o.data)) o.object.visible = camCarsVisible;
+    },
+    // show/hide the small id labels on the camera-detected cars (leaves the cars themselves)
+    setCamLabelsVisible(b) {
+      camLabelsVisible = !!b;
+      for (const o of agents.values()) if (isCamCar(o.data)) o.sprite.visible = camLabelsVisible;
+    },
     status: () => ({ ...status }),
     get count() { return agents.size; },
     stop() { stopped = true; clearTimeout(pollTimer); },

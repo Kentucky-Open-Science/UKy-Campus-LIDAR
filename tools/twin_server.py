@@ -40,6 +40,8 @@ API (JSON, CORS-open; see client/twin.py for a Python wrapper):
     GET/POST /api/cameras/calib             -> camera->scene homographies (calibration/cameras.json)
     GET/POST /api/cameras/detections        -> live detection boxes per camera (detector -> PiP overlay)
     GET/POST /api/cameras/active            -> which camera is being viewed (per-active-camera bounding)
+    GET/POST /api/cameras/detect            -> start/stop the in-process YOLO detector per camera
+                                               (POST {camera, on}; needs ultralytics+opencv in this venv)
     (anything else) -> served as a static file from web/
 
 Run:  python -m tools.twin_server [--port 8000] [--hz 50] [--render]
@@ -73,7 +75,9 @@ WEB = os.path.abspath(os.path.join(_HERE, "..", "web"))
 # Camera->scene homography calibration: authored config (NOT pipeline output), so it
 # lives OUTSIDE the gitignored web/data/ and is version-controlled (constitution P1).
 CALIB_PATH = os.path.abspath(os.path.join(_HERE, "..", "calibration", "cameras.json"))
-CALIB_LOCK = threading.Lock()
+# Reentrant so a read-modify-write (_calib_post) can hold it across load+mutate+write
+# without self-deadlocking when save_calib re-acquires it (fixes a lost-update race).
+CALIB_LOCK = threading.RLock()
 
 # Live detection relay (Phase 3): the detector (tools/camera_detect.py) publishes the
 # image-space boxes it's spawning cars from; the viewer's PiP overlay polls + draws them.
@@ -81,9 +85,21 @@ CALIB_LOCK = threading.Lock()
 # (per-active-camera perf bounding). All in-memory + TTL'd; never persisted.
 DET_LOCK = threading.Lock()
 DETECTIONS = {}                 # camera_id -> {ts, frame, dets:[...]}
-ACTIVE = {"camera": None, "ts": 0.0}
+ACTIVE = {}                     # camera_id -> last-seen ts (per-camera "is being viewed")
 DET_TTL = 6.0                   # serve detections younger than this (s)
 ACTIVE_TTL = 12.0               # an active-camera signal is valid this long (s)
+
+# In-process YOLO detector control. So the viewer can start/stop detection per-camera
+# (a PiP checkbox) and `twin_server` runs the camera_detect loop itself in a daemon
+# thread, instead of a separate `python -m tools.camera_detect`. ultralytics/opencv are
+# imported lazily by the detector, so the server still starts without them — detection
+# just can't be enabled until the server runs in a venv that has them (e.g. the GPU one).
+DETECTORS = {}                  # camera_id -> {stop, thread, started, model, alive, error}
+DET_MGR_LOCK = threading.Lock()
+DETECT_MODEL = "yolo26x.pt"     # overridden by --detect-model in main()
+DETECT_MAX_FPS = 8.0            # overridden by --detect-max-fps
+DETECT_CONF = 0.30              # overridden by --detect-conf
+SERVER_BASE = None              # "http://127.0.0.1:<port>", set in main() (in-process client)
 
 
 def load_calib():
@@ -100,20 +116,121 @@ def save_calib(obj):
         with open(CALIB_PATH, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2)
 
+
+def finite(*vals):
+    """True iff every value is a finite real number (rejects NaN/inf from the network)."""
+    try:
+        return all(math.isfinite(float(v)) for v in vals)
+    except (TypeError, ValueError):
+        return False
+
+
+# ---- in-process detector manager (start/stop the YOLO loop per camera) -------------
+def _have_detector_deps():
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None for m in ("cv2", "ultralytics"))
+
+
+def _run_detector(det, stop_evt, camera):
+    """Thread body: run the detector loop; record any failure for the UI; never crash
+    the server. The loop checks stop_evt each frame and clears its cars on exit."""
+    err = None
+    try:
+        det.run(max_fps=DETECT_MAX_FPS, stop=stop_evt.is_set)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — surface to the UI, don't propagate
+        err = str(e) or e.__class__.__name__
+    finally:
+        with DET_MGR_LOCK:
+            rec = DETECTORS.get(camera)
+            if rec and rec.get("thread") is threading.current_thread():
+                rec["alive"] = False
+                if err:
+                    rec["error"] = err
+
+
+def start_detector(camera):
+    if SERVER_BASE is None:
+        return {"error": "server base URL not set"}
+    if not _have_detector_deps():
+        return {"error": "detection needs ultralytics + opencv — start the server from a "
+                         "venv that has them (e.g. the GPU detection env)"}
+    from tools.camera_detect import CameraDetector, TwinClient, quad_homographies
+    Hq = quad_homographies(load_calib(), camera)
+    if not Hq:
+        return {"error": f"{camera} has no calibrated quads — calibrate it in the PiP first"}
+    with DET_MGR_LOCK:
+        rec = DETECTORS.get(camera)
+        if rec and rec.get("alive") and rec["thread"].is_alive():
+            return {"ok": True, "camera": camera, "running": True, "already": True}
+        twin = TwinClient(SERVER_BASE)
+        det = CameraDetector(twin, camera, Hq, model=DETECT_MODEL, conf=DETECT_CONF,
+                             publish=True, follow_active=False)
+        stop_evt = threading.Event()
+        th = threading.Thread(target=_run_detector, args=(det, stop_evt, camera),
+                              name=f"detect-{camera}", daemon=True)
+        DETECTORS[camera] = {"stop": stop_evt, "thread": th, "started": time.time(),
+                             "model": DETECT_MODEL, "alive": True, "error": None}
+        th.start()
+    return {"ok": True, "camera": camera, "running": True, "model": DETECT_MODEL}
+
+
+def stop_detector(camera):
+    with DET_MGR_LOCK:
+        rec = DETECTORS.get(camera)
+        if rec:
+            rec["stop"].set()
+            rec["alive"] = False
+    return {"ok": True, "camera": camera, "running": False}
+
+
+def stop_all_detectors():
+    with DET_MGR_LOCK:
+        for rec in DETECTORS.values():
+            rec["stop"].set()
+            rec["alive"] = False
+
+
+def detector_status(camera=None):
+    with DET_MGR_LOCK:
+        if camera is not None:
+            rec = DETECTORS.get(camera)
+            alive = bool(rec and rec.get("alive") and rec["thread"].is_alive())
+            return {"camera": camera, "running": alive,
+                    "model": rec.get("model") if rec else DETECT_MODEL,
+                    "error": rec.get("error") if rec else None,
+                    "depsAvailable": _have_detector_deps()}
+        running = [c for c, r in DETECTORS.items() if r.get("alive") and r["thread"].is_alive()]
+        return {"running": running, "model": DETECT_MODEL, "depsAvailable": _have_detector_deps()}
+
 # ---- per-type kinematic defs (scene metres), ported from web/agents.js TYPES ----
+# Footprints are deliberately a bit smaller than real-world so vehicles don't look
+# oversized against the twin's roads/buildings (≈70% scale for the larger vehicles).
 DEFS = {
-    "car":   dict(L=4.3, W=1.9, H=1.45, wheelbase=2.6, kin="ackermann", ground=True,
+    "car":   dict(L=3.0, W=1.6, H=1.3, wheelbase=1.9, kin="ackermann", ground=True,
                   maxSpeed=25, maxAccel=6, maxSteerDeg=35),
-    "truck": dict(L=8.5, W=2.5, H=3.2, wheelbase=5.0, kin="ackermann", ground=True,
+    "truck": dict(L=6.0, W=2.1, H=2.6, wheelbase=3.6, kin="ackermann", ground=True,
                   maxSpeed=18, maxAccel=4, maxSteerDeg=28),
+    # bus / motorcycle / bicycle / pedestrian: the rest of the road-user classes the
+    # traffic-camera detector (tools/camera_detect.py) maps COCO detections onto, sized so
+    # each renders at a believable footprint instead of a generic car box.
+    "bus":   dict(L=8.5, W=2.3, H=2.9, wheelbase=4.3, kin="ackermann", ground=True,
+                  maxSpeed=18, maxAccel=3, maxSteerDeg=25),
+    "moto":  dict(L=1.8, W=0.7, H=1.4, wheelbase=1.2, kin="ackermann", ground=True,
+                  maxSpeed=25, maxAccel=7, maxSteerDeg=40),
+    "bike":  dict(L=1.6, W=0.5, H=1.5, trackWidth=0.5, kin="differential", ground=True,
+                  maxSpeed=8, maxAccel=3),
+    "ped":   dict(L=0.5, W=0.5, H=1.7, trackWidth=0.4, kin="differential", ground=True,
+                  maxSpeed=2, maxAccel=3),
     "robot": dict(L=0.8, W=0.6, H=0.6, trackWidth=0.5, kin="differential", ground=True,
                   maxSpeed=3, maxAccel=4),
     "drone": dict(L=0.9, W=0.9, H=0.35, kin="holonomic", ground=False,
                   maxSpeed=15, maxAccel=10, maxClimb=6, maxYawRateDeg=120, minClearance=0.5),
 }
-DEFAULT_COLORS = {"car": 0x3577c9, "truck": 0xc7702a, "robot": 0x4aa05a, "drone": 0x9b59b6}
+DEFAULT_COLORS = {"car": 0x3577c9, "truck": 0x8e6bd0, "bus": 0xe0a83a, "moto": 0xc77f2a,
+                  "bike": 0x4aa05a, "ped": 0xe25fae, "robot": 0x4aa05a, "drone": 0x9b59b6}
 # first-person camera mount per type: eye height above the agent (m) + downward pitch (deg)
-CAM_EYE = {"car": 1.4, "truck": 2.6, "robot": 0.5, "drone": 0.0}
+CAM_EYE = {"car": 1.4, "truck": 2.6, "bus": 2.8, "moto": 1.3, "bike": 1.5, "ped": 1.6,
+           "robot": 0.5, "drone": 0.0}
 CAM_PITCH = {"car": 6.0, "truck": 6.0, "robot": 4.0, "drone": 22.0}
 
 D2R = math.pi / 180.0
@@ -194,6 +311,8 @@ class Ground:
         self.szmin, self.szmax = -gz1 / 100, -gz0 / 100
 
     def height(self, sx, sz):
+        if not (math.isfinite(sx) and math.isfinite(sz)):   # never int(NaN) into the grid
+            return 0.0, "none"
         if self.kygrid is not None:                    # KYAPED city ground (primary)
             arr, gm = self.kygrid
             ix = int((sx - gm["x0"]) / gm["cell"]); iz = int((sz - gm["z0"]) / gm["cell"])
@@ -278,9 +397,12 @@ class Agent:
         self.half = [d["L"] / 2, d["H"] / 2, d["W"] / 2]
 
         pos = opts.get("position")
-        self.x = float(pos[0]) if pos else 0.0
-        self.z = float(pos[2]) if pos and len(pos) > 2 else (float(pos[1]) if pos else 0.0)
-        self.yaw = (opts.get("heading", 0) or 0) * D2R
+        px = pos[0] if pos else 0.0
+        pz = (pos[2] if pos and len(pos) > 2 else (pos[1] if pos else 0.0))
+        self.x = float(px) if finite(px) else 0.0          # reject NaN/inf spawn coords
+        self.z = float(pz) if finite(pz) else 0.0
+        _hd = opts.get("heading", 0) or 0
+        self.yaw = (float(_hd) if finite(_hd) else 0.0) * D2R
         self.speed = 0.0
         self.steerAngle = 0.0
         self.vel = [0.0, 0.0, 0.0]
@@ -373,11 +495,16 @@ class Agent:
 
     # ---- pose set directly (kinematic agents: camera cars, replays) ----
     def set_pose(self, x, z, y=None, heading=None):
+        # Reject non-finite poses from a flaky detector/client: a NaN x/z would later
+        # be int()'d into the ground grid and throw inside World.tick. Drop the update
+        # (and do NOT bump last_update, so the TTL sweep can still reap a stuck agent).
+        if not finite(x, z):
+            return
         self.x = float(x)
         self.z = float(z)
-        if y is not None:
+        if y is not None and finite(y):
             self.y = float(y)
-        if heading is not None:
+        if heading is not None and finite(heading):
             self.yaw = float(heading) * D2R
         self.last_update = time.time()
 
@@ -462,6 +589,10 @@ class Agent:
         self.groundY = gy
         self.surface = surf
         if self.ground_bound:
+            # NOTE: this runs every tick for kinematic agents too, so a y passed to
+            # set_pose / spawn is intentionally overridden for ground-bound types
+            # (cars/trucks/robots) — they obey the one-ground-model invariant. The y?
+            # field of POST /pose is therefore only effective for airborne types (drone).
             self.y = gy
             self.altitudeAGL = 0.0
             self.onGround = True
@@ -483,6 +614,11 @@ class Agent:
     # ---- collision (axis-aligned boxes; agent-vs-building + agent-vs-agent) ----
     def detect(self):
         self.contacts = []
+        # Kinematic agents (camera-detected cars) have no physics response, never read
+        # self.contacts, and overlapping detections would otherwise flash them phantom-red
+        # in the viewer — so they neither generate nor receive collision contacts.
+        if self.kinematic:
+            return
         amin = [self.x - self.half[0], self.y, self.z - self.half[2]]
         amax = [self.x + self.half[0], self.y + 2 * self.half[1], self.z + self.half[2]]
         for b in self.world.buildings.nearby(self.x, self.z):
@@ -490,7 +626,7 @@ class Agent:
             if r:
                 self._contact("building", b["id"], b["name"], r, (0, 0, 0))
         for o in self.world.agents.values():
-            if o is self:
+            if o is self or o.kinematic:        # don't collide real agents with phantom cars
                 continue
             omin = [o.x - o.half[0], o.y, o.z - o.half[2]]
             omax = [o.x + o.half[0], o.y + 2 * o.half[1], o.z + o.half[2]]
@@ -527,6 +663,9 @@ class Agent:
             "onGround": self.onGround, "offMap": self.offMap,
             "utm": self.world.ground.utm(self.x, self.z),
             "collisions": self.contacts,
+            # so the viewer can identify camera-detected (traffic-stream) cars: these carry
+            # a source with a camera id, and are kinematic (pose-driven, no physics).
+            "kinematic": self.kinematic, "source": self.source,
         }
 
 
@@ -944,9 +1083,13 @@ class CameraProxy:
         with urllib.request.urlopen(req, timeout=30) as r:
             html = r.read().decode("utf-8", "replace")
         html = html.replace("'", '"')
-        sub = html[html.find("camMarker"):]
-        arr = sub[sub.find("["):sub.find("]")] + "]"
-        rows = json.loads(arr)
+        i = html.find("camMarker")
+        start = html.find("[", i) if i >= 0 else -1
+        if start < 0:
+            raise ValueError("camMarker array not found in city map HTML")
+        # raw_decode tolerates nested arrays / a ']' inside strings that the old
+        # find("]") slice would truncate on (CameraProxy.get() serves stale on raise).
+        rows, _ = json.JSONDecoder().raw_decode(html[start:])
         cams = {}
         for c in rows:
             cid = c.get("camera")
@@ -995,7 +1138,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
     def _json(self, obj, status=200):
-        body = json.dumps(obj).encode("utf-8")
+        # allow_nan=False: a stray NaN/inf would serialize to a bare `NaN` token that
+        # browser JSON.parse rejects, silently breaking the viewer's poll. Refuse it
+        # here (and never throw out of the handler) rather than emit invalid JSON.
+        try:
+            body = json.dumps(obj, allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError):
+            body = b'{"error":"non-serializable response"}'
+            status = 500
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1057,6 +1207,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self._get_detections())
         if path == "/api/cameras/active":
             return self._json(self._get_active())
+        if path == "/api/cameras/detect":
+            cam = parse_qs(urlparse(self.path).query).get("camera", [None])[0]
+            return self._json(detector_status(cam))
         if path.startswith("/api/cameras"):
             return self._cameras(path)
         if path.startswith("/api/world"):
@@ -1066,11 +1219,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._json(WORLD.snapshot())
             if path == "/api/world/nearest_building":
                 q = parse_qs(urlparse(self.path).query)
-                x = float(q.get("x", [0])[0]); z = float(q.get("z", [0])[0])
+                try:
+                    x = float(q.get("x", [0])[0]); z = float(q.get("z", [0])[0])
+                except (TypeError, ValueError):
+                    return self._json({"error": "x and z must be numbers"}, 400)
                 return self._json(WORLD.buildings.nearest(x, z) or {})
             if path == "/api/world/meta":
                 return self._json({
                     "types": list(DEFS), "hz": WORLD.hz, "maxAgents": WORLD.max_agents,
+                    "agents": len(WORLD.agents),   # live count, so cap pressure is visible
                     "ground": WORLD.ground.ok, "buildings": len(WORLD.buildings.items),
                     "camera": RENDER is not None and RENDER.error is None,
                     "cameraReady": RENDER is not None and RENDER.ready.is_set(),
@@ -1092,7 +1249,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if RENDER is None:
             return self._json({"error": "camera feed off — start the server with --render"}, 503)
         q = parse_qs(urlparse(self.path).query)
-        w = int(float(q.get("w", [320])[0])); h = int(float(q.get("h", [240])[0]))
+        try:
+            w = int(float(q.get("w", [320])[0])); h = int(float(q.get("h", [240])[0]))
+        except (TypeError, ValueError):
+            return self._json({"error": "w and h must be numbers"}, 400)
         (ex, ey, ez), (fx, fy, fz) = a.camera_pose()
         data, err = RENDER.render([a.id, ex, ey, ez, fx, fy, fz, w, h])
         if err or not data:
@@ -1118,13 +1278,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         cid, quad = b.get("cameraId"), b.get("quad")
         if not cid or quad is None:
             return self._json({"error": "need cameraId and quad (or full)"}, 400)
-        calib = load_calib()
-        cam = calib.setdefault("cameras", {}).setdefault(str(cid), {})
-        if b.get("intersection") is not None:
-            cam["intersection"] = b["intersection"]
-        entry = {k: b[k] for k in ("covers", "imgW", "imgH", "H", "points") if k in b}
-        cam.setdefault("quads", {})[str(quad)] = entry
-        save_calib(calib)
+        # Hold the lock across the whole read-modify-write so two concurrent calib POSTs
+        # can't both load the same baseline and clobber each other's quad (lost update).
+        # CALIB_LOCK is reentrant, so save_calib re-acquiring it inside is safe.
+        with CALIB_LOCK:
+            calib = load_calib()
+            cam = calib.setdefault("cameras", {}).setdefault(str(cid), {})
+            if b.get("intersection") is not None:
+                cam["intersection"] = b["intersection"]
+            # keep reprojError so a quad's calibration quality survives reload (triage)
+            entry = {k: b[k] for k in ("covers", "imgW", "imgH", "H", "points", "reprojError") if k in b}
+            cam.setdefault("quads", {})[str(quad)] = entry
+            save_calib(calib)
         return self._json({"ok": True, "cameraId": cid, "quad": quad})
 
     # ---- live detection relay + active-camera signal (Phase 3) ----
@@ -1142,22 +1307,42 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         cam = b.get("camera")
         if not cam:
             return self._json({"error": "need camera"}, 400)
+        now = time.time()
         with DET_LOCK:
-            DETECTIONS[str(cam)] = {"ts": time.time(), "frame": b.get("frame"),
+            DETECTIONS[str(cam)] = {"ts": now, "frame": b.get("frame"),
                                     "dets": b.get("dets") or []}
+            # sweep stale entries so DETECTIONS can't grow unbounded over a long run
+            # (arbitrary camera ids POSTed over time would otherwise accumulate keys).
+            for k in [k for k, v in DETECTIONS.items() if now - v["ts"] > DET_TTL]:
+                del DETECTIONS[k]
         return self._json({"ok": True, "camera": cam, "count": len(b.get("dets") or [])})
 
     def _get_active(self):
+        # Per-camera signal: report whether THE queried camera has a live viewer, so
+        # multiple viewers/detectors on different cameras don't alias one global slot.
+        cam = parse_qs(urlparse(self.path).query).get("camera", [None])[0]
+        now = time.time()
         with DET_LOCK:
-            cam, ts = ACTIVE["camera"], ACTIVE["ts"]
-        age = time.time() - ts
-        return {"camera": cam if age <= ACTIVE_TTL else None, "age": round(age, 2)}
+            for k in [k for k, ts in ACTIVE.items() if now - ts > ACTIVE_TTL]:
+                del ACTIVE[k]   # prune expired viewers
+            if cam is not None:
+                ts = ACTIVE.get(cam)
+                return {"camera": cam, "active": ts is not None,
+                        "age": round(now - ts, 2) if ts is not None else None}
+            # no camera specified -> the most-recently-active camera (back-compat)
+            latest = max(ACTIVE.items(), key=lambda kv: kv[1], default=(None, 0.0))
+            return {"camera": latest[0], "active": latest[0] is not None}
 
     def _post_active(self, b):
+        cam = b.get("camera")
         with DET_LOCK:
-            ACTIVE["camera"] = b.get("camera")    # None clears it
-            ACTIVE["ts"] = time.time()
-        return self._json({"ok": True, "camera": b.get("camera")})
+            if cam is None:
+                ACTIVE.clear()              # explicit "no camera viewed" clears all
+            elif b.get("active") is False:  # this viewer stopped watching THIS camera
+                ACTIVE.pop(str(cam), None)
+            else:
+                ACTIVE[str(cam)] = time.time()  # viewing / heartbeat
+        return self._json({"ok": True, "camera": cam})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
@@ -1167,6 +1352,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._post_detections(self._body())
         if path == "/api/cameras/active":
             return self._post_active(self._body())
+        if path == "/api/cameras/detect":     # start/stop the in-process YOLO detector
+            b = self._body(); cam = b.get("camera")
+            if not cam:
+                return self._json({"error": "need camera"}, 400)
+            return self._json(start_detector(cam) if b.get("on") else stop_detector(cam))
         if WORLD is None and path.startswith("/api/world"):
             return self._json({"error": "world not running"}, 503)
         if path == "/api/world/spawn":
@@ -1177,22 +1367,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._json({"error": str(e)}, 400)
         if path.startswith("/api/world/agents"):
             aid, action = self._agent_id(path)
-            a = WORLD.get(aid) if aid is not None else None
-            if not a:
-                return self._json({"error": "no such agent"}, 404)
             b = self._body()
-            if action == "controls":
-                a.set_controls(b)
-            elif action == "driveTo":
-                a.drive_to(b)
-            elif action == "stop":
-                a.stop()
-            elif action == "pose":
-                if b.get("x") is None or b.get("z") is None:
-                    return self._json({"error": "pose needs x and z"}, 400)
-                a.set_pose(b["x"], b["z"], b.get("y"), b.get("heading"))
-            else:
-                return self._json({"error": "unknown action"}, 404)
+            # Hold the world lock across lookup+mutate so a pose/controls update can't
+            # interleave mid-tick (integrate -> snap_ground) and tear an agent's state.
+            # WORLD.lock is reentrant, so the mutators acquiring nothing extra is fine.
+            with WORLD.lock:
+                a = WORLD.get(aid) if aid is not None else None
+                if not a:
+                    return self._json({"error": "no such agent"}, 404)
+                if action == "controls":
+                    a.set_controls(b)
+                elif action == "driveTo":
+                    a.drive_to(b)
+                elif action == "stop":
+                    a.stop()
+                elif action == "pose":
+                    if b.get("x") is None or b.get("z") is None:
+                        return self._json({"error": "pose needs x and z"}, 400)
+                    a.set_pose(b["x"], b["z"], b.get("y"), b.get("heading"))
+                else:
+                    return self._json({"error": "unknown action"}, 404)
             return self._json({"ok": True})
         return self._json({"error": "unknown endpoint"}, 404)
 
@@ -1225,7 +1419,7 @@ def make_server(port, directory=WEB):
 
 
 def main():
-    global WORLD, RENDER, PROXY, CAMERAS
+    global WORLD, RENDER, PROXY, CAMERAS, DETECT_MODEL, DETECT_MAX_FPS, DETECT_CONF, SERVER_BASE
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--hz", type=int, default=50, help="simulation tick rate")
@@ -1243,7 +1437,18 @@ def main():
     ap.add_argument("--kinematic-ttl", type=float, default=5.0,
                     help="despawn kinematic agents (e.g. camera cars) after this many seconds "
                          "without a pose update (default 5; 0 disables the sweep)")
+    ap.add_argument("--detect-model", default="yolo26x.pt",
+                    help="YOLO weights for in-process per-camera detection (POST /api/cameras/detect). "
+                         "Default yolo26x (largest/most accurate); needs ultralytics+opencv in the server's venv.")
+    ap.add_argument("--detect-max-fps", type=float, default=8.0,
+                    help="detection pace per camera (frames/s)")
+    ap.add_argument("--detect-conf", type=float, default=0.30,
+                    help="detection confidence threshold")
     args = ap.parse_args()
+    DETECT_MODEL = args.detect_model
+    DETECT_MAX_FPS = args.detect_max_fps
+    DETECT_CONF = args.detect_conf
+    SERVER_BASE = f"http://127.0.0.1:{args.port}"   # in-process detector talks to ourselves
 
     print("loading world (terrain heightmap + building boxes) ...")
     WORLD = World(hz=args.hz)
@@ -1274,11 +1479,14 @@ def main():
     print(f"  sim:     {args.hz} Hz   ground:{'on' if WORLD.ground.ok else 'flat'}   "
           f"buildings:{len(WORLD.buildings.items)}")
     print(f"  camera:  {'ON (first-person /agents/<id>/camera; starting headless renderer…)' if args.render else 'off (use --render)'}")
+    print(f"  detect:  {'ready' if _have_detector_deps() else 'deps missing (ultralytics+opencv) — install in this venv to enable'}"
+          f"  ->  POST /api/cameras/detect (per-camera YOLO, model {DETECT_MODEL}); start it from the camera PiP")
     print("  Ctrl-C to stop")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+        stop_all_detectors()
         stop_evt.set()
         httpd.shutdown()
 
