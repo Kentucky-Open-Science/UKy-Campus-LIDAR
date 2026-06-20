@@ -98,17 +98,23 @@ def main():
 
         ok = (c1 == "miss" and c2 == "hit" and b1 == b2 and len(b1) > 0 and ncache >= 1)
 
-        # SSRF guard: a non-Google host must be refused.
-        bad = f"http://127.0.0.1:{PORT}/api/gtile?u=" + quote("https://example.com/x", safe="")
-        try:
-            urllib.request.urlopen(bad, timeout=10)
-            ssrf_ok = False
-        except urllib.error.HTTPError as e:
-            ssrf_ok = e.code == 403
-        except Exception:
-            ssrf_ok = False
-        print("SSRF guard (non-google host rejected 403):", ssrf_ok)
-        ok = ok and ssrf_ok
+        # SSRF guard: a non-Google host AND a Google host with a non-tile path must both be
+        # refused (the proxy rebuilds the URL from a hardcoded host + /v1/3dtiles/ path).
+        def rejected(target):
+            url = f"http://127.0.0.1:{PORT}/api/gtile?u=" + quote(target, safe="")
+            try:
+                urllib.request.urlopen(url, timeout=10)
+                return False
+            except urllib.error.HTTPError as e:
+                return e.code == 403
+            except Exception:
+                return False
+        ssrf_host = rejected("https://example.com/x")
+        ssrf_userinfo = rejected("https://tile.googleapis.com@example.com/v1/3dtiles/x")
+        ssrf_path = rejected("https://tile.googleapis.com/../evil")
+        print("SSRF guard 403s -> off-host:", ssrf_host, "| userinfo@evil:", ssrf_userinfo,
+              "| bad-path:", ssrf_path)
+        ok = ok and ssrf_host and ssrf_userinfo and ssrf_path
 
         # Browser pass: the real viewer must load tiles THROUGH the proxy and render them,
         # growing the on-disk cache (proves the tiles3d.js proxy plugin is wired).

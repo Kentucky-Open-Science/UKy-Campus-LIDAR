@@ -1273,8 +1273,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not u:
             return self._send_bytes(b"missing u", 400, "text/plain")
         p = urlparse(u)
-        if p.scheme != "https" or p.hostname != "tile.googleapis.com":
-            return self._send_bytes(b"forbidden host", 403, "text/plain")  # no open proxy
+        # SSRF defense: validate, then REBUILD the request URL from a HARDCODED scheme+host
+        # and an allow-listed path. The value sent to urlopen() therefore never carries a
+        # user-controlled authority — userinfo/parser-confusion tricks like
+        # "https://tile.googleapis.com@evil.com" (hostname is rejected anyway) or path/query
+        # injection cannot redirect the request off Google's tile host.
+        if p.scheme != "https" or p.hostname != "tile.googleapis.com" \
+                or not p.path.startswith("/v1/3dtiles/"):
+            return self._send_bytes(b"forbidden", 403, "text/plain")
+        fetch_url = "https://tile.googleapis.com" + p.path + (("?" + p.query) if p.query else "")
 
         qd = parse_qs(p.query)
         qd.pop("key", None)
@@ -1298,7 +1305,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 pass
 
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": "uky-twin/1.0"})
+            # fetch_url has a constant, validated scheme+host (built above) — not raw `u`.
+            req = urllib.request.Request(fetch_url, headers={"User-Agent": "uky-twin/1.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 body = r.read()
                 ctype = r.headers.get("Content-Type", "application/octet-stream")
