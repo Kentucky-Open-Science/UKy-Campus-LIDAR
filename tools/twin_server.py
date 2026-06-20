@@ -53,6 +53,7 @@ Transit data (c) Lextran (Transit Authority of Lexington).
 import argparse
 import base64
 import functools
+import hashlib
 import http.server
 import json
 import math
@@ -61,12 +62,58 @@ import queue
 import threading
 import time
 import urllib.request
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import numpy as np
 
 from tools.extract_roads import DATA, load_mesh, build_heightmap
 from tools.transit_common import Projector
+
+_REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+# Operational cache for photorealistic tiles (gitignored; see README on Google's terms).
+TILECACHE = os.path.join(DATA, "tilecache")
+TILECACHE_TTL = 14 * 24 * 3600  # seconds; refresh after this
+
+
+def save_key_to_env(key, var="GOOGLE_MAPS_API_KEY", path=None):
+    """Persist an API key into the repo-root .env (gitignored), preserving other lines.
+    Updates the existing var line in place, or appends it. Returns the .env path."""
+    path = path or os.path.join(_REPO_ROOT, ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = ["# Local secrets — NEVER commit (gitignored)."]
+    out, found = [], False
+    for ln in lines:
+        if ln.strip().startswith(var + "="):
+            out.append(var + "=" + key)
+            found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append(var + "=" + key)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    return path
+
+
+def load_dotenv(path=None):
+    """Minimal .env loader (no dependency): populate os.environ from repo-root .env,
+    without overriding values already set in the real environment."""
+    path = path or os.path.join(_REPO_ROOT, ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except FileNotFoundError:
+        pass
 
 SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_transit_samples")
 
@@ -1197,8 +1244,90 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(CAMERAS.get())
         return self._json({"error": "unknown endpoint", "path": self.path}, 404)
 
+    def _send_bytes(self, body, status=200, ctype="application/octet-stream", cached=False):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Tile-Cache", "hit" if cached else "miss")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _gtile(self):
+        """Operational disk cache for Google Photorealistic 3D Tiles. The viewer routes
+        tile-content fetches here (preprocessURL in tiles3d.js) so repeated local sessions
+        reuse already-downloaded tiles instead of re-fetching. Strictly a temporary
+        performance cache for googleapis.com ONLY — NOT a redistributable offline mirror;
+        respect Google Maps Platform terms. root.json is never cached (keeps the session
+        fresh); the cache key drops the volatile key/session params so it hits across
+        sessions."""
+        q = parse_qs(urlparse(self.path).query)
+        u = (q.get("u") or [None])[0]
+        if not u:
+            return self._send_bytes(b"missing u", 400, "text/plain")
+        p = urlparse(u)
+        if p.scheme != "https" or p.hostname != "tile.googleapis.com":
+            return self._send_bytes(b"forbidden host", 403, "text/plain")  # no open proxy
+
+        qd = parse_qs(p.query)
+        qd.pop("key", None)
+        qd.pop("session", None)
+        sig = p.path + "?" + urlencode(sorted(qd.items()), doseq=True)
+        cacheable = not p.path.endswith("/root.json")
+        base = os.path.join(TILECACHE, hashlib.sha1(sig.encode("utf-8")).hexdigest())
+
+        if cacheable:
+            try:
+                age = time.time() - os.path.getmtime(base)
+                if age < TILECACHE_TTL:
+                    with open(base, "rb") as f:
+                        body = f.read()
+                    ctype = "application/octet-stream"
+                    if os.path.exists(base + ".ct"):
+                        with open(base + ".ct") as f:
+                            ctype = f.read().strip() or ctype
+                    return self._send_bytes(body, 200, ctype, cached=True)
+            except OSError:
+                pass
+
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "uky-twin/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read()
+                ctype = r.headers.get("Content-Type", "application/octet-stream")
+        except Exception as e:  # noqa: BLE001 - surface any fetch failure to the client
+            return self._send_bytes(("tile fetch failed: " + str(e)).encode(), 502, "text/plain")
+
+        if cacheable:
+            try:
+                os.makedirs(TILECACHE, exist_ok=True)
+                with open(base, "wb") as f:
+                    f.write(body)
+                with open(base + ".ct", "w") as f:
+                    f.write(ctype)
+            except OSError:
+                pass
+        return self._send_bytes(body, 200, ctype, cached=False)
+
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/api/photoreal":
+            # Photorealistic-basemap key, supplied via the GOOGLE_MAPS_API_KEY env var (or
+            # a gitignored .env) so it never lives in the repo. Returns {"key": null} when
+            # unset (no 404 noise); the viewer falls back to its in-browser key entry. Set
+            # PHOTOREAL_PROVIDER=ion to use a Cesium ion token instead. `cache:true` tells
+            # the viewer it can route tile fetches through the on-disk cache proxy below.
+            return self._json({
+                "key": os.environ.get("GOOGLE_MAPS_API_KEY")
+                or os.environ.get("PHOTOREAL_KEY") or None,
+                "provider": os.environ.get("PHOTOREAL_PROVIDER", "google"),
+                "cache": True,
+            })
+        if path == "/api/gtile":
+            return self._gtile()
         if path.startswith("/api/transit"):
             return self._transit(path)
         if path == "/api/cameras/calib":     # works without the live camera proxy
@@ -1346,6 +1475,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/api/photoreal":
+            # Persist a key entered in the web UI to the gitignored .env so it survives
+            # restarts (and is reused without re-prompting). Local dev convenience.
+            b = self._body()
+            k = (b.get("key") or "").strip()
+            if not k:
+                return self._json({"error": "need key"}, 400)
+            try:
+                save_key_to_env(k)
+                os.environ["GOOGLE_MAPS_API_KEY"] = k
+                if b.get("provider"):
+                    save_key_to_env(b["provider"], var="PHOTOREAL_PROVIDER")
+                    os.environ["PHOTOREAL_PROVIDER"] = b["provider"]
+                return self._json({"ok": True, "persisted": ".env"})
+            except OSError as e:
+                return self._json({"error": "could not write .env: " + str(e)}, 500)
         if path == "/api/cameras/calib":
             return self._calib_post(self._body())
         if path == "/api/cameras/detections":
@@ -1420,6 +1565,7 @@ def make_server(port, directory=WEB):
 
 def main():
     global WORLD, RENDER, PROXY, CAMERAS, DETECT_MODEL, DETECT_MAX_FPS, DETECT_CONF, SERVER_BASE
+    load_dotenv()   # pick up GOOGLE_MAPS_API_KEY etc. from a gitignored .env
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--hz", type=int, default=50, help="simulation tick rate")
