@@ -10,5 +10,9 @@
 // vehicle can never be at a different height than the road it's on. The campus relief
 // is intentionally discarded; restore it with ?flat=0.
 const _p = new URLSearchParams(location.search);
-export const FLAT_WORLD = _p.get('flat') !== '0';   // on by default; ?flat=0 keeps real terrain
+// Default is now REAL elevation: the photorealistic basemap is on by default and has true
+// 3D terrain, so roads/labels/traffic must use real elevation to drape onto it (in flat
+// mode they'd be buried under the terrain). Pass ?flat=1 to restore the old single-plane
+// mode (useful when the photoreal layer is off and you want buses pinned to one height).
+export const FLAT_WORLD = _p.get('flat') === '1';
 export const FLAT_Y = 285;                            // the single ground elevation (scene metres)

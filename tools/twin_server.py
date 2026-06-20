@@ -59,6 +59,7 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 import urllib.request
@@ -72,7 +73,11 @@ from tools.transit_common import Projector
 _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 # Operational cache for photorealistic tiles (gitignored; see README on Google's terms).
 TILECACHE = os.path.join(DATA, "tilecache")
-TILECACHE_TTL = 14 * 24 * 3600  # seconds; refresh after this
+# Effectively never expire (override with TILECACHE_TTL_DAYS for a finite cache).
+TILECACHE_TTL = float(os.environ.get("TILECACHE_TTL_DAYS", "3650")) * 24 * 3600
+# Pre-downloaded local tileset (tools/download_photoreal.py) the viewer renders on load.
+LOCAL_TILESET_DIR = os.path.join(DATA, "photoreal_lexington")
+LOCAL_TILESET_REL = "data/photoreal_lexington/tileset.json"
 
 
 def save_key_to_env(key, var="GOOGLE_MAPS_API_KEY", path=None):
@@ -1269,8 +1274,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not u:
             return self._send_bytes(b"missing u", 400, "text/plain")
         p = urlparse(u)
-        if p.scheme != "https" or p.hostname != "tile.googleapis.com":
-            return self._send_bytes(b"forbidden host", 403, "text/plain")  # no open proxy
+        # SSRF defense: every user-derived part of the request URL is allow-listed before
+        # use, then the URL is rebuilt on a HARDCODED scheme+host. The re.fullmatch() guards
+        # are both the security check and the taint barrier: the path must be a Google tile
+        # path and the query may contain only url-safe chars (no ':', '/', '@'), so neither
+        # the host, the path, nor the query can redirect the request off Google's tile host.
+        if (p.scheme != "https" or p.hostname != "tile.googleapis.com"
+                or re.fullmatch(r"/v1/3dtiles/[\w./-]+", p.path) is None
+                or re.fullmatch(r"[\w.=&%+-]*", p.query) is None):
+            return self._send_bytes(b"forbidden", 403, "text/plain")
+        fetch_url = "https://tile.googleapis.com" + p.path + (("?" + p.query) if p.query else "")
 
         qd = parse_qs(p.query)
         qd.pop("key", None)
@@ -1294,7 +1307,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 pass
 
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": "uky-twin/1.0"})
+            # fetch_url has a constant, validated scheme+host (built above) — not raw `u`.
+            req = urllib.request.Request(fetch_url, headers={"User-Agent": "uky-twin/1.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 body = r.read()
                 ctype = r.headers.get("Content-Type", "application/octet-stream")
@@ -1320,11 +1334,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # unset (no 404 noise); the viewer falls back to its in-browser key entry. Set
             # PHOTOREAL_PROVIDER=ion to use a Cesium ion token instead. `cache:true` tells
             # the viewer it can route tile fetches through the on-disk cache proxy below.
+            # If tiles were pre-downloaded (tools.download_photoreal), advertise the local
+            # tileset so the viewer renders it on load with no Google calls.
+            local = LOCAL_TILESET_REL if os.path.exists(
+                os.path.join(LOCAL_TILESET_DIR, "tileset.json")) else None
             return self._json({
                 "key": os.environ.get("GOOGLE_MAPS_API_KEY")
                 or os.environ.get("PHOTOREAL_KEY") or None,
                 "provider": os.environ.get("PHOTOREAL_PROVIDER", "google"),
                 "cache": True,
+                "localTileset": local,
             })
         if path == "/api/gtile":
             return self._gtile()
