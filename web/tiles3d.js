@@ -59,13 +59,14 @@ async function loadKey(dataDir) {
 	if (!key) { try { key = localStorage.getItem(KEY_LS) || null; } catch (_) {} }
 	// Ask the server: it provides the key (twin_server reads GOOGLE_MAPS_API_KEY / .env)
 	// and advertises whether the tile-cache proxy is available. 200 {key:null} when unset.
-	let cache = false;
+	let cache = false, local = null;
 	for (const url of ['/api/photoreal', dataDir + 'photoreal.json']) {
 		try {
 			const r = await fetch(url, { cache: 'no-store' });
 			if (r.ok) {
 				const j = await r.json();
 				if (j && j.cache) cache = true;
+				if (j && j.localTileset) local = j.localTileset;   // pre-downloaded offline tiles
 				if (j && j.key && !key) {
 					if (j.provider) { try { localStorage.setItem(PROVIDER_LS, j.provider); } catch (_) {} }
 					key = j.key;
@@ -74,7 +75,7 @@ async function loadKey(dataDir) {
 			}
 		} catch (_) {}
 	}
-	return { key, cache };
+	return { key, cache, local };
 }
 
 function loadCalib() {
@@ -247,13 +248,19 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 	async function init() {
 		if (initStarted || disposed) return;
 		initStarted = true;
-		const { key, cache } = await loadKey(dataDir);
+		const { key, cache, local } = await loadKey(dataDir);
+		serverCache = !!cache;
+		// Prefer pre-downloaded local tiles (render on load, zero Google calls, no key).
+		if (local) {
+			setStatus('loading saved photorealistic tiles…');
+			await buildTiles(local, null);
+			return;
+		}
 		if (!key) {
 			setStatus('no API key — add a Google Maps key below');
 			initStarted = false;       // allow retry once a key is provided
 			return;
 		}
-		serverCache = !!cache;
 		setStatus('loading photorealistic tiles…');
 		await buildTiles(null, key);
 	}

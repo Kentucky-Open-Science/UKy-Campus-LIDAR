@@ -1169,8 +1169,10 @@ state.photoreal?.probeKey?.().then((r) => {
     $('photoreal-key').placeholder = 'key loaded from .env — just tick "visible"';
   }
 }).catch(() => {});
-// ?photoreal=1 auto-enables the layer on load (used by the Real-elevation button).
-if (params.get('photoreal') === '1') {
+// Photorealistic basemap is ON by default (load Google tiles + overlays on initial load);
+// pass ?photoreal=0 to start with it off. It prefers pre-downloaded local tiles, then a
+// server/.env key, and degrades gracefully if neither is present.
+if (params.get('photoreal') !== '0') {
   const cb = $('photoreal-visible');
   if (cb) cb.checked = true;
   if (state.photoreal) state.photoreal.setVisible(true);

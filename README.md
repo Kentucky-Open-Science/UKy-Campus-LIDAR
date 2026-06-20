@@ -216,25 +216,39 @@ in the Cloud console). Provide it any of these ways:
 A Cesium ion token works too (it serves the same Google dataset as asset `2275207`):
 pass `?ionkey=…`, or set `PHOTOREAL_PROVIDER=ion` with the token in `GOOGLE_MAPS_API_KEY`.
 
-**Viewing it.** Toggle **visible** under *Photorealistic 3D (Google)* (or load with
-`?photoreal=1` to auto-enable). The photoreal mesh has **real elevation**, but the default
-**flat mode** pins our roads/labels/traffic to one height — so they get buried under the
-terrain. Click **Real-elevation mode** (reloads with `?flat=0&photoreal=1`) to drape the
-overlays on the photoreal ground, like the reference map. The **detail** slider sets the
-target screen-space error in pixels (lower = sharper, more tiles, more bandwidth); LOD
-naturally refines as you zoom in.
+**Viewing it.** The photoreal basemap is **on by default** (loads with the rest of the map
+on initial load; pass `?photoreal=0` to start with it off). The default is now **real
+elevation** so roads/labels/traffic drape onto the photoreal terrain (pass `?flat=1` for
+the old single-plane mode). The **detail** slider sets the target screen-space error in
+pixels (lower = sharper, more tiles); LOD refines as you zoom in.
 
-**Tile caching.** When served by `tools.twin_server`, the viewer routes tile fetches
-through an on-disk cache proxy (`/api/gtile` → `web/data/tilecache/`, gitignored), so
-repeated local sessions reuse already-downloaded tiles instead of re-fetching them. This
-is a *temporary operational cache for performance only* — Google Maps Platform's terms do
-**not** permit building a permanent offline mirror or redistributing the tiles, so the
-cache is TTL'd (14 days) and host-locked to `tile.googleapis.com`; don't commit or share
-its contents. `root.json` is always fetched live to keep the session valid. To make an
-area effectively "offline" within terms: turn **detail** up and orbit/zoom that area once
-— every tile you view is cached, so subsequent loads serve from disk without re-calling
-Google. (A scripted bulk download of a whole region at max detail is mass-downloading and
-is intentionally **not** provided.)
+**Offline tiles — download & save (`tools/download_photoreal.py`).** You can pre-download
+the Lexington tiles to disk so the viewer renders them **on page load with zero Google
+calls** (no streaming from Google as the camera moves):
+
+```sh
+python -m tools.download_photoreal                 # default fidelity (min-error 12)
+python -m tools.download_photoreal --min-error 0   # MAXIMUM fidelity (large + slow)
+python -m tools.download_photoreal --min-error 40 --max-tiles 60   # quick sample
+```
+
+It is **bbox-limited to Lexington** (from `city.json`), walks the 3D-Tiles tree, prunes to
+that bbox, downloads each tile (glTF + nested tilesets), and writes a self-contained local
+tileset to `web/data/photoreal_lexington/` (gitignored) with every URI rewritten to a flat
+local filename. The server then advertises it (`/api/photoreal` `localTileset`) and the
+viewer auto-loads it on startup — no key needed, nothing fetched from Google. Re-running
+resumes (already-saved tiles are skipped); lower `--min-error` for more detail (larger).
+
+> ⚠️ Google Maps Platform's **standard** terms do **not** permit a permanent offline copy.
+> Run the downloader **only** if your agreement with Google allows storing the tiles (e.g.
+> a private, area-scoped contract). It is intentionally bbox-limited to Lexington for that
+> licensed, private use.
+
+**Live tile caching.** Without a local download, when served by `tools.twin_server` the
+viewer routes tile fetches through an on-disk cache proxy (`/api/gtile` →
+`web/data/tilecache/`, gitignored, host-locked to `tile.googleapis.com`) so repeat sessions
+reuse tiles. The cache does not expire by default (set `TILECACHE_TTL_DAYS` for a finite
+cache). `root.json` is always fetched live to keep the session valid.
 
 **Alignment.** The tiles arrive in geocentric ECEF; `tools/fit_tiles_align.py` bakes a
 similarity transform (`web/lib/tiles_align.json`) from the *exact* pipeline projection

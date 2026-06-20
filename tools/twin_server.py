@@ -72,7 +72,11 @@ from tools.transit_common import Projector
 _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 # Operational cache for photorealistic tiles (gitignored; see README on Google's terms).
 TILECACHE = os.path.join(DATA, "tilecache")
-TILECACHE_TTL = 14 * 24 * 3600  # seconds; refresh after this
+# Effectively never expire (override with TILECACHE_TTL_DAYS for a finite cache).
+TILECACHE_TTL = float(os.environ.get("TILECACHE_TTL_DAYS", "3650")) * 24 * 3600
+# Pre-downloaded local tileset (tools/download_photoreal.py) the viewer renders on load.
+LOCAL_TILESET_DIR = os.path.join(DATA, "photoreal_lexington")
+LOCAL_TILESET_REL = "data/photoreal_lexington/tileset.json"
 
 
 def save_key_to_env(key, var="GOOGLE_MAPS_API_KEY", path=None):
@@ -1320,11 +1324,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # unset (no 404 noise); the viewer falls back to its in-browser key entry. Set
             # PHOTOREAL_PROVIDER=ion to use a Cesium ion token instead. `cache:true` tells
             # the viewer it can route tile fetches through the on-disk cache proxy below.
+            # If tiles were pre-downloaded (tools.download_photoreal), advertise the local
+            # tileset so the viewer renders it on load with no Google calls.
+            local = LOCAL_TILESET_REL if os.path.exists(
+                os.path.join(LOCAL_TILESET_DIR, "tileset.json")) else None
             return self._json({
                 "key": os.environ.get("GOOGLE_MAPS_API_KEY")
                 or os.environ.get("PHOTOREAL_KEY") or None,
                 "provider": os.environ.get("PHOTOREAL_PROVIDER", "google"),
                 "cache": True,
+                "localTileset": local,
             })
         if path == "/api/gtile":
             return self._gtile()
