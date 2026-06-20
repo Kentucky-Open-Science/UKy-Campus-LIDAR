@@ -10,21 +10,26 @@ one draw call at 60 fps.
 
 ## Gallery
 
-![Full-city aerial of Lexington](screenshots/lexington-overview.png)
+![Photorealistic aerial of Lexington](screenshots/lexington-photoreal-overview.png)
 
-*The full Lextran service area — ~114k OSM building footprints extruded to real
-KYAPED LiDAR roof heights over the city ground plane, with the arterial road
-network, rendered in a single draw call at 60 fps.*
+*Google Photorealistic 3D Tiles streamed into the Three.js twin — the whole city in
+real, textured 3D (campus, downtown skyline, the Lextran service area). On by default;
+renders from a saved local copy with zero Google calls once downloaded.*
+
+![Downtown Lexington in photorealistic 3D](screenshots/lexington-photoreal-downtown.png)
+
+*Oblique over campus toward the downtown skyline — real building textures, trees, and
+terrain, with the live overlays (roads, signals, cameras, buses) draped on top.*
+
+![Roads and overlays draped on the photorealistic terrain](screenshots/lexington-photoreal-street.png)
+
+*Top-down: the generated road network, intersections and signals draped onto the
+photorealistic surface at real elevation (so overpasses stay above the roads beneath).*
 
 ![Following a live Lextran bus at street level](screenshots/lexington-transit.png)
 
-*Street level, following a live Route 7 bus — real lane markings, crosswalks, and
-signalized intersections derived from the LFUCG traffic-signal data.*
-
-![Downtown Lexington with 3D buildings, live signals, and an agent camera](screenshots/lexington-downtown.png)
-
-*Downtown — extruded 3D buildings, live traffic signals, street-name labels, and a
-first-person agent camera (inset).*
+*The earlier OSM/LiDAR base map (still available): street level following a live Route 7
+bus — real lane markings, crosswalks, and signalized intersections from LFUCG data.*
 
 ## Quick start
 

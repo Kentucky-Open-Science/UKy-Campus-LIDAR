@@ -31,11 +31,19 @@ const params = new URLSearchParams(location.search);
 // ':' in a scheme and (with the leading-slash strip) any protocol-relative or absolute
 // authority — so the result can only ever resolve against our own origin.
 function sanitizeDataDir(raw) {
-  const cleaned = String(raw || '')
+  let cleaned = String(raw || '')
     .replace(/[^A-Za-z0-9_\-/]/g, '')   // path-safe chars only (no ':', '.', '\\', etc.)
     .replace(/^\/+/, '')                 // no absolute or '//authority' leading slash
     .replace(/\/+$/, '');                // trailing slash is re-added below
-  return (cleaned || 'data') + '/';
+  // Hard allowlist: a relative path of safe segments ONLY — no scheme, no '//' authority,
+  // no '..'. The positive regex test is also the sanitizing barrier that proves to static
+  // analysis (CodeQL js/client-side-request-forgery) that every `fetch(DATA_DIR + …)` stays
+  // same-origin — DATA_DIR is the sole user-derived input the data layers put in request
+  // URLs. Anything not matching falls back to the default directory.
+  if (/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(cleaned)) {
+    return cleaned + '/';
+  }
+  return 'data/';
 }
 const DATA_DIR = sanitizeDataDir(params.get('data'));
 const CM_TO_M = 0.01;
