@@ -59,6 +59,7 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 import urllib.request
@@ -1273,13 +1274,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not u:
             return self._send_bytes(b"missing u", 400, "text/plain")
         p = urlparse(u)
-        # SSRF defense: validate, then REBUILD the request URL from a HARDCODED scheme+host
-        # and an allow-listed path. The value sent to urlopen() therefore never carries a
-        # user-controlled authority — userinfo/parser-confusion tricks like
-        # "https://tile.googleapis.com@evil.com" (hostname is rejected anyway) or path/query
-        # injection cannot redirect the request off Google's tile host.
-        if p.scheme != "https" or p.hostname != "tile.googleapis.com" \
-                or not p.path.startswith("/v1/3dtiles/"):
+        # SSRF defense: every user-derived part of the request URL is allow-listed before
+        # use, then the URL is rebuilt on a HARDCODED scheme+host. The re.fullmatch() guards
+        # are both the security check and the taint barrier: the path must be a Google tile
+        # path and the query may contain only url-safe chars (no ':', '/', '@'), so neither
+        # the host, the path, nor the query can redirect the request off Google's tile host.
+        if (p.scheme != "https" or p.hostname != "tile.googleapis.com"
+                or re.fullmatch(r"/v1/3dtiles/[\w./-]+", p.path) is None
+                or re.fullmatch(r"[\w.=&%+-]*", p.query) is None):
             return self._send_bytes(b"forbidden", 403, "text/plain")
         fetch_url = "https://tile.googleapis.com" + p.path + (("?" + p.query) if p.query else "")
 

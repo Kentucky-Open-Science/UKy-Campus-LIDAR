@@ -112,9 +112,10 @@ def main():
         ssrf_host = rejected("https://example.com/x")
         ssrf_userinfo = rejected("https://tile.googleapis.com@example.com/v1/3dtiles/x")
         ssrf_path = rejected("https://tile.googleapis.com/../evil")
+        ssrf_query = rejected("https://tile.googleapis.com/v1/3dtiles/x?u=http://evil.com/")
         print("SSRF guard 403s -> off-host:", ssrf_host, "| userinfo@evil:", ssrf_userinfo,
-              "| bad-path:", ssrf_path)
-        ok = ok and ssrf_host and ssrf_userinfo and ssrf_path
+              "| bad-path:", ssrf_path, "| query-inject:", ssrf_query)
+        ok = ok and ssrf_host and ssrf_userinfo and ssrf_path and ssrf_query
 
         # Browser pass: the real viewer must load tiles THROUGH the proxy and render them,
         # growing the on-disk cache (proves the tiles3d.js proxy plugin is wired).
