@@ -23,10 +23,23 @@ tools/_transit_samples/osm_city.json
 node_modules/
 web/node_modules/
 
+# Transient offline test tileset (tools/make_test_tileset.py; built + torn down by
+# tools/verify_photoreal.py)
+web/_testtileset/
+
 # Editor/OS cruft
 .vscode/
 Thumbs.db
 .DS_Store
+
+# Local secrets (API keys etc.) — never commit
+.env
+.env.*
+!.env.example
+
+# Photoreal tile cache (operational cache populated by tools/twin_server.py; transient,
+# regenerable, and must not be redistributed — see README on Google's caching terms)
+web/data/tilecache/
 
 # Local scratch (not part of the project)
 CLAUDE-FABLE-5.md

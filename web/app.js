@@ -16,6 +16,7 @@ import { createCameraSystem } from './cameras.js';
 import { createCitySystem } from './city.js';
 import { createStreetLabels } from './labels.js';
 import { createNetAgents } from './netagents.js';
+import { createPhotorealTiles } from './tiles3d.js';
 import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 // ---------------------------------------------------------------- config ---
@@ -57,6 +58,7 @@ const state = {
   transit: null,       // live Lextran transit layer (transit.js)
   cameras: null,       // live traffic-camera layer (cameras.js)
   agents: null,        // autonomous-agent simulation layer (agents.js)
+  photoreal: null,     // opt-in Google Photorealistic 3D Tiles basemap (tiles3d.js)
   helpers: null,
   hasRealData: false,
 };
@@ -140,6 +142,14 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Photorealistic basemap (Google 3D Tiles) — opt-in, OFF by default, so the existing
+// viewer is untouched until the user enables it AND supplies a key. See tiles3d.js.
+state.photoreal = createPhotorealTiles({
+  scene, camera, renderer, dataDir: DATA_DIR,
+  onStatus: (s) => { const n = $('photoreal-status'); if (n) setStatus(n, 'photoreal: ' + s); },
+  onCredits: (c) => { const n = $('photoreal-credits'); if (n) n.textContent = c; },
 });
 
 // ------------------------------------------------------------ coordinates ---
@@ -1023,8 +1033,8 @@ function updateRoadStatus() {
 
 // ------------------------------------------------------------------- UI ---
 
-$('terrain-visible').addEventListener('change', (e) => {
-  state.terrain.group.visible = e.target.checked;
+$('terrain-visible').addEventListener('change', () => {
+  applyBaseLayerVis();   // AND with the photoreal "replace" hide so they can't desync
 });
 $('lidar-visible').addEventListener('change', (e) => {
   state.lidar.group.visible = e.target.checked;
@@ -1090,12 +1100,82 @@ for (const lg of document.querySelectorAll('#panel fieldset legend')) {
 $('city-visible')?.addEventListener('change', (e) => {
   if (state.city) state.city.group.visible = e.target.checked;
 });
-$('city-ground')?.addEventListener('change', (e) => {
-  if (state.city) state.city.layers.ground.visible = e.target.checked;
+$('city-ground')?.addEventListener('change', () => {
+  applyBaseLayerVis();   // AND with the photoreal "replace" hide so they can't desync
 });
 $('city-streets')?.addEventListener('change', (e) => {
   if (state.city) state.city.layers.streets.visible = e.target.checked;
 });
+
+// ----------------------------------------------------- photorealistic 3D ---
+// When the Google photoreal mesh is on (with "replace" checked) our grey OSM extrusions
+// + ground duplicate what the mesh already shows, so hide them. Overlays — roads,
+// cameras, agents, transit, labels — stay on top, exactly like the reference map.
+// Base-layer visibility = (its own checkbox) AND NOT (photoreal hiding the base), so the
+// per-layer checkboxes and the photoreal hide can't fight each other in either direction.
+function baseHidden() {
+  return !!($('photoreal-visible')?.checked && $('photoreal-replace')?.checked);
+}
+function applyBaseLayerVis() {
+  const hide = baseHidden();
+  const checked = (id) => ($(id) ? $(id).checked : true);
+  if (state.buildings?.group) state.buildings.group.visible = checked('buildings-visible') && !hide;
+  if (state.terrain?.group) state.terrain.group.visible = checked('terrain-visible') && !hide;
+  if (state.city?.layers?.ground) state.city.layers.ground.visible = checked('city-ground') && !hide;
+}
+$('photoreal-visible')?.addEventListener('change', (e) => {
+  if (state.photoreal) state.photoreal.setVisible(e.target.checked);
+  applyBaseLayerVis();
+});
+$('photoreal-opacity')?.addEventListener('input', (e) => {
+  const v = parseFloat(e.target.value);
+  $('photoreal-opacity-val').textContent = v.toFixed(2);
+  if (state.photoreal) state.photoreal.setOpacity(v);
+});
+$('photoreal-replace')?.addEventListener('change', applyBaseLayerVis);
+$('photoreal-detail')?.addEventListener('input', (e) => {
+  const v = parseFloat(e.target.value);
+  $('photoreal-detail-val').textContent = String(v);
+  if (state.photoreal) state.photoreal.setDetail(v);   // lower px err = higher fidelity
+});
+// The photorealistic mesh has REAL elevation; in flat mode our overlays are pinned to
+// FLAT_Y and get buried under it. This reloads in real-elevation mode (?flat=0) with the
+// layer auto-on, so roads/labels/traffic drape on the photoreal ground.
+$('photoreal-realelev')?.addEventListener('click', () => {
+  const p = new URLSearchParams(location.search);
+  p.set('flat', '0');
+  p.set('photoreal', '1');
+  location.search = p.toString();
+});
+$('photoreal-key-save')?.addEventListener('click', () => {
+  const k = ($('photoreal-key')?.value || '').trim();
+  if (!k || !state.photoreal) return;
+  state.photoreal.setKey(k);   // stores locally + persists to .env via the server
+  const cb = $('photoreal-visible');
+  if (cb && !cb.checked) {
+    cb.checked = true;
+    state.photoreal.setVisible(true);
+    applyBaseLayerVis();
+  }
+  $('photoreal-key').value = '';
+});
+// Reflect the persisted detail value + a configured key so we don't re-prompt.
+if ($('photoreal-detail') && state.photoreal && state.photoreal.detail != null) {
+  $('photoreal-detail').value = String(state.photoreal.detail);
+  $('photoreal-detail-val').textContent = String(state.photoreal.detail);
+}
+state.photoreal?.probeKey?.().then((r) => {
+  if (r && r.key && $('photoreal-key')) {
+    $('photoreal-key').placeholder = 'key loaded from .env — just tick "visible"';
+  }
+}).catch(() => {});
+// ?photoreal=1 auto-enables the layer on load (used by the Real-elevation button).
+if (params.get('photoreal') === '1') {
+  const cb = $('photoreal-visible');
+  if (cb) cb.checked = true;
+  if (state.photoreal) state.photoreal.setVisible(true);
+  applyBaseLayerVis();
+}
 
 // --------------------------------------------------------------- transit ---
 // Live Lextran layer (transit.js). Master + per-layer toggles null-guard on
@@ -1619,8 +1699,8 @@ const camDetect = (() => {
 })();
 window.__camDetect = camDetect;
 
-$('buildings-visible').addEventListener('change', (e) => {
-  state.buildings.group.visible = e.target.checked;
+$('buildings-visible').addEventListener('change', () => {
+  applyBaseLayerVis();   // AND with the photoreal "replace" hide so they can't desync
 });
 $('buildings-wireframe').addEventListener('change', (e) => {
   if (state.buildings.packed) {
@@ -2182,6 +2262,7 @@ function animate() {
   if (drive.agent) updateChaseCamera(dt);  // follow AFTER the agent moved this frame
   if (follow.id != null) updateFollowCamera(dt); // follow AFTER the target moved this frame
   if (state.labels) state.labels.tick(camera, controls.target); // cull labels around the look-at point
+  if (state.photoreal) state.photoreal.update();  // stream/LOD the photorealistic basemap (no-op when off)
   renderer.render(scene, camera);
 
   frames++;
@@ -2204,6 +2285,7 @@ animate();
 // debug hook (handy for screenshots / console poking; harmless in production)
 window.__viewer = { THREE, scene, camera, controls, state, resetView,
                     get agents() { return state.agents; },
+                    get photoreal() { return state.photoreal; },
                     get follow() { return follow; } };
 
 // ---------------------------------------------- first-person POV rendering ---

@@ -186,6 +186,95 @@ so coplanar routes never z-fight the road or each other. If you target a low-end
 restricting `osm_roads` to the arterial classes (leaving residential as the lightweight
 `city.json` lines) roughly halves the triangle count.
 
+## Photorealistic basemap — Google 3D Tiles (opt-in)
+
+The viewer can stream **Google Photorealistic 3D Tiles** (the same textured-mesh data
+Google Earth uses, and the same source reference Cesium-ion twins pull from) directly
+into the Three.js scene as an optional basemap — real building textures, trees, and
+terrain under the live overlays (cameras, buses, agents, signals). It is rendered with
+the vendored NASA-AMMOS [`3d-tiles-renderer`](https://github.com/NASA-AMMOS/3DTilesRendererJS)
+(`web/lib/3d-tiles-renderer.module.js`, pinned to a build compatible with the viewer's
+three r160) and `web/tiles3d.js`.
+
+It is **off by default and fully self-contained**: nothing is fetched and there is no
+per-frame cost until you enable it *and* provide a key, so the rest of the twin is
+untouched. Toggle it under **Photorealistic 3D (Google)** in the panel.
+
+**You need a key.** Google's tiles require a Google Maps Platform API key with the
+**Map Tiles API** enabled (it has a free monthly tier; restrict the key to your domain
+in the Cloud console). Provide it any of these ways:
+
+- **`.env` (recommended):** `cp .env.example .env` and set `GOOGLE_MAPS_API_KEY=…`. The
+  file is gitignored; `tools/twin_server.py` loads it and serves the key to the viewer via
+  `/api/photoreal` (it is never written into the repo or a tracked file); or
+- paste it into the panel's *"Google Maps API key"* box and click **Use & save key** — the
+  server writes it to `.env` for you, so you only enter it once (it's reused on restart and
+  never re-prompted); or
+- export it inline — `GOOGLE_MAPS_API_KEY=… python -m tools.twin_server`; or
+- append `?gkey=YOUR_KEY` to the viewer URL.
+
+A Cesium ion token works too (it serves the same Google dataset as asset `2275207`):
+pass `?ionkey=…`, or set `PHOTOREAL_PROVIDER=ion` with the token in `GOOGLE_MAPS_API_KEY`.
+
+**Viewing it.** Toggle **visible** under *Photorealistic 3D (Google)* (or load with
+`?photoreal=1` to auto-enable). The photoreal mesh has **real elevation**, but the default
+**flat mode** pins our roads/labels/traffic to one height — so they get buried under the
+terrain. Click **Real-elevation mode** (reloads with `?flat=0&photoreal=1`) to drape the
+overlays on the photoreal ground, like the reference map. The **detail** slider sets the
+target screen-space error in pixels (lower = sharper, more tiles, more bandwidth); LOD
+naturally refines as you zoom in.
+
+**Tile caching.** When served by `tools.twin_server`, the viewer routes tile fetches
+through an on-disk cache proxy (`/api/gtile` → `web/data/tilecache/`, gitignored), so
+repeated local sessions reuse already-downloaded tiles instead of re-fetching them. This
+is a *temporary operational cache for performance only* — Google Maps Platform's terms do
+**not** permit building a permanent offline mirror or redistributing the tiles, so the
+cache is TTL'd (14 days) and host-locked to `tile.googleapis.com`; don't commit or share
+its contents. `root.json` is always fetched live to keep the session valid. To make an
+area effectively "offline" within terms: turn **detail** up and orbit/zoom that area once
+— every tile you view is cached, so subsequent loads serve from disk without re-calling
+Google. (A scripted bulk download of a whole region at max detail is mass-downloading and
+is intentionally **not** provided.)
+
+**Alignment.** The tiles arrive in geocentric ECEF; `tools/fit_tiles_align.py` bakes a
+similarity transform (`web/lib/tiles_align.json`) from the *exact* pipeline projection
+(pyproj UTM-16N, the same `Projector` the OSM/transit bakers use), so the photoreal mesh
+lines up with the OSM extrusions to **~2 m RMS (≤5 m) horizontally across the whole
+city**. It absorbs the UTM grid convergence (~1.5°) and point scale automatically. The
+vertical datum (NAVD88 ↔ WGS84 geoid, ≈ −33.5 m here) carries a few metres of residual;
+nudge it live from the console:
+
+```js
+window.__viewer.photoreal.calibrate({ dy: 3, dx: 0, dz: 0, yaw: 0, scaleMul: 1 });
+```
+
+**Custom / Cesium-ion tilesets.** `window.__viewer.photoreal.loadTileset(url)` loads any
+same-origin or CORS-enabled `tileset.json` through the same alignment + render path — for
+your own 3D-Tiles exports.
+
+Reproduce / regenerate from a clone (the vendored bundle + align matrix are committed, so
+this is only needed if you bump versions or move the georef anchor):
+
+```sh
+cd web && npm install && node lib/_vendor.mjs      # rebuild bundle + vendor DRACO decoder
+python -m tools.fit_tiles_align                    # rebuild lib/tiles_align.json
+python -m tools.verify_photoreal                   # headless (no key): regression + alignment + render
+node tools/verify_tiles_align.mjs                  # offline alignment-matrix check
+# with a key in .env (these hit the real Google API):
+python -m tools.verify_photoreal_live              # real Google tiles fetch + render + vertical probe
+python -m tools.verify_tilecache                   # cache proxy: download once, serve from disk
+```
+
+`node lib/_vendor.mjs` (`npm run vendor:tiles`) produces both `web/lib/3d-tiles-renderer.module.js`
+and `web/lib/draco/gltf/` (the DRACO decoder real Google tiles need), version-locked to the
+pinned `three`. All three — bundle, decoder, and `tiles_align.json` — are committed, so a
+plain clone runs without this step.
+
+Performance note: the photoreal mesh is many draw calls (like any streamed 3D-Tiles
+basemap), unlike the single-draw-call OSM city — which is why it is opt-in and off by
+default. Enabling *"hide our buildings & ground"* (default) drops the now-redundant grey
+extrusions so the overlays read cleanly on top of the mesh.
+
 ## Viewer controls
 
 | Control | Action |

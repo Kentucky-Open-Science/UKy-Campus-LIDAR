@@ -80,6 +80,30 @@
   </fieldset>
 
   <fieldset class="collapsed">
+    <legend>Photorealistic 3D (Google)</legend>
+    <label class="row"><input type="checkbox" id="photoreal-visible"> visible</label>
+    <label class="row">opacity
+      <input type="range" id="photoreal-opacity" min="0" max="1" step="0.05" value="1">
+      <span id="photoreal-opacity-val">1.00</span>
+    </label>
+    <label class="row">detail
+      <input type="range" id="photoreal-detail" min="1" max="32" step="1" value="8">
+      <span id="photoreal-detail-val">8</span>
+    </label>
+    <label class="row"><input type="checkbox" id="photoreal-replace" checked> hide our buildings &amp; ground when on</label>
+    <div class="row"><button id="photoreal-realelev" title="Reload with real terrain elevation so roads, labels and traffic sit on the photorealistic ground (in flat mode they're buried under it)">Real-elevation mode</button></div>
+    <input type="text" id="photoreal-key" class="cam-filter" placeholder="Google Maps API key (Map Tiles API)&hellip;">
+    <div class="row"><button id="photoreal-key-save">Use &amp; save key</button></div>
+    <div id="photoreal-status" class="status">photoreal: off</div>
+    <div id="photoreal-credits" class="status mono">&nbsp;</div>
+    <div class="hint">Same source as the reference map: <b>Google Photorealistic 3D Tiles</b>.
+      Needs a Google Maps Platform key with the <b>Map Tiles API</b> enabled. The key is
+      saved to a gitignored <code>.env</code> by the server, so you enter it once.
+      <b>detail</b> = screen-space error in px (lower = sharper, heavier). For roads/labels
+      to sit on the terrain, use <b>Real-elevation mode</b>. See <code>README.md</code>.</div>
+  </fieldset>
+
+  <fieldset class="collapsed">
     <legend>Transit (Lextran)</legend>
     <label class="row"><input type="checkbox" id="transit-visible" checked> visible</label>
     <label class="row"><input type="checkbox" id="transit-routes" checked> route lines</label>
