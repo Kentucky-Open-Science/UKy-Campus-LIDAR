@@ -113,31 +113,51 @@ class Downloader:
         with urllib.request.urlopen(req, timeout=60) as r:
             return r.read()
 
+    def _write(self, fname, data):
+        """Atomic write (temp file + os.replace). The resume check trusts that a file on
+        disk is COMPLETE, so a download must never leave a half-written file behind if the
+        process is killed mid-write — temp+rename guarantees the final name only ever points
+        at fully-written bytes."""
+        path = os.path.join(self.out, fname)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+
     def fetch_and_save(self, url):
         """Download a tile content URL; save glb or (recursively) a nested tileset. Returns
-        the flat local filename to reference, or None if over the tile budget."""
+        the flat local filename to reference, or None if over the tile budget.
+
+        Resume: filenames are a deterministic hash of the tile URL, so a previously saved
+        tile is reused without re-fetching. A present file always means a COMPLETE prior
+        download — leaves are written atomically, and a nested tileset's .json is written
+        only AFTER its whole subtree finished (and with its child URIs already rewritten to
+        local names), so an existing .json needs no re-walk."""
         if url in self.seen:
             return self.seen[url]
+        h = hashlib.sha1(urlparse(url).path.encode()).hexdigest()[:16]
+        glb, js = h + ".glb", h + ".json"
+        if os.path.exists(os.path.join(self.out, glb)):     # resume: leaf already downloaded
+            self.seen[url] = glb
+            return glb
+        if os.path.exists(os.path.join(self.out, js)):      # resume: subtree already complete
+            self.seen[url] = js
+            return js
         if self.max_tiles and self.n_tiles >= self.max_tiles:
             return None
-        h = hashlib.sha1(urlparse(url).path.encode()).hexdigest()[:16]
         data = self._fetch(url)
         if data[:4] == b"glTF":                     # binary glTF leaf content
-            fname = h + ".glb"
-            with open(os.path.join(self.out, fname), "wb") as f:
-                f.write(data)
-            self.seen[url] = fname
+            self._write(glb, data)
+            self.seen[url] = glb
             self.n_tiles += 1; self.n_bytes += len(data)
             if self.n_tiles % 25 == 0:
                 print("  %d tiles, %.1f MB" % (self.n_tiles, self.n_bytes / 1e6))
-            return fname
+            return glb
         sub = json.loads(data)                       # nested external tileset
-        fname = h + ".json"
-        self.seen[url] = fname
-        self.walk(sub["root"], url, 0)
-        with open(os.path.join(self.out, fname), "w", encoding="utf-8") as f:
-            json.dump(sub, f)
-        return fname
+        self.seen[url] = js
+        self.walk(sub["root"], url, 0)               # downloads subtree + rewrites URIs local
+        self._write(js, json.dumps(sub).encode("utf-8"))   # written last = subtree complete
+        return js
 
     def walk(self, tile, base_url, depth):
         """Prune+rewrite a tile subtree in place. Returns True to keep, False to drop."""
