@@ -25,8 +25,9 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, urlunparse
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path = [p for p in sys.path if os.path.abspath(p or ".") != _HERE]
@@ -90,6 +91,10 @@ def overlaps(a, b):
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 
 
+_RETRY_HTTP = {408, 429, 500, 502, 503, 504}     # transient throttle/server -> backoff+retry
+_SESSION_HTTP = {400, 401, 403}                   # usually an expired/invalid session token
+
+
 class Downloader:
     def __init__(self, key, out, bbox, min_error, max_tiles):
         self.key, self.out, self.bbox = key, out, bbox
@@ -100,18 +105,69 @@ class Downloader:
         os.makedirs(out, exist_ok=True)
 
     def _auth(self, url):
+        """Attach the API key and CURRENT session token, REPLACING any already in the URL.
+        Child URIs from the tree embed the session that was live when we walked them, so after
+        a mid-crawl refresh we must override that stale token. Done by string surgery (not
+        parse_qs/urlencode) to avoid re-encoding the opaque token text."""
         p = urlparse(url)
-        q = parse_qs(p.query)
-        if "key" not in q:
-            url += ("&" if p.query else "?") + "key=" + self.key
-        if self.session and "session" not in q:
-            url += "&session=" + self.session
-        return url
+        kept = [kv for kv in p.query.split("&")
+                if kv and not kv.startswith("key=") and not kv.startswith("session=")]
+        kept.append("key=" + self.key)
+        if self.session:
+            kept.append("session=" + self.session)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, "&".join(kept), p.fragment))
+
+    def _refresh_session(self):
+        """Fetch a fresh session token from root.json (with no session param). The token is
+        time-limited, so a long crawl eventually fails with 400 INVALID_ARGUMENT; refreshing
+        recovers it. Returns True if a new token was obtained. Fetched directly (not via
+        _fetch) to avoid recursion."""
+        try:
+            req = urllib.request.Request(
+                "https://%s/v1/3dtiles/root.json?key=%s" % (TILES_HOST, self.key),
+                headers={"User-Agent": "uky-twin/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                blob = r.read().decode("utf-8", "replace")
+        except Exception:
+            return False
+        i = blob.find("session=")
+        tok = blob[i + 8:].split('"')[0].split("&")[0] if i >= 0 else None
+        if tok and tok != self.session:
+            self.session = tok
+            print("  refreshed session token ->", tok[:14])
+            return True
+        return False
 
     def _fetch(self, url):
-        req = urllib.request.Request(self._auth(url), headers={"User-Agent": "uky-twin/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return r.read()
+        """GET a tile, resilient to the failure modes of a long unattended crawl. Transient
+        errors (timeouts, 429, 5xx) back off and retry; a 400/401/403 — almost always an
+        expired session on this API — triggers ONE session refresh and a retry. A persistent
+        client error raises, stopping the crawl cleanly (it is resumable: re-run to continue)."""
+        last = None
+        refreshed = False
+        for attempt in range(6):
+            try:
+                req = urllib.request.Request(self._auth(url),
+                                             headers={"User-Agent": "uky-twin/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    return r.read()
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code in _SESSION_HTTP and not refreshed and self._refresh_session():
+                    refreshed = True
+                    continue                          # retry immediately with fresh session
+                if e.code not in _RETRY_HTTP:
+                    body = ""
+                    try:
+                        body = e.read().decode("utf-8", "replace")[:160].replace("\n", " ")
+                    except Exception:
+                        pass
+                    print("  HTTP %d on ...%s | %s" % (e.code, urlparse(url).path[-48:], body))
+                    raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                last = e                              # network blip / timeout -> retry
+            time.sleep(min(2 ** attempt, 30))         # 1,2,4,8,16,30s
+        raise last
 
     def _write(self, fname, data):
         """Atomic write (temp file + os.replace). The resume check trusts that a file on
@@ -226,7 +282,12 @@ def main():
     bbox = (bb[0] - dlon, bb[1] - dlat, bb[2] + dlon, bb[3] + dlat)
 
     t0 = time.time()
-    n, nb = Downloader(key, args.out, bbox, args.min_error, args.max_tiles).run()
+    try:
+        n, nb = Downloader(key, args.out, bbox, args.min_error, args.max_tiles).run()
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        print("STOPPED (network): %s" % e)
+        print("Downloaded tiles are kept — re-run the SAME command to resume where it left off.")
+        return 1
     # small manifest the viewer/tools can read
     with open(os.path.join(args.out, "_manifest.json"), "w") as f:
         json.dump({"tiles": n, "bytes": nb, "bbox": bbox, "min_error": args.min_error}, f)
