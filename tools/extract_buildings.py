@@ -58,60 +58,14 @@ BOX_MIN_Y = -170396.5
 
 
 def load_lidar_chunks(lidar_dir):
-    """Read all lidar chunk files into a single (N, 4) numpy array [x, y, z, cls].
-    Handles cross-chunk buildings by loading everything first."""
-    import glob
-    all_xyz = []
-    all_cls = []
-    files = sorted(glob.glob(os.path.join(lidar_dir, 'chunk_*.bin')))
-    if not files:
-        raise FileNotFoundError(
-            f'No lidar chunks found in {lidar_dir}. '
-            'Run tools/build_all.py first.')
+    """Load building-class LiDAR points for the campus extractor.
 
-    for path in files:
-        with open(path, 'rb') as f:
-            raw = f.read()
-        count = struct.unpack_from('<I', raw, 0)[0]
-        if count == 0:
-            continue
-        # Records: 16 bytes = 4 x f32 (x,y,z,rgba_as_f32) per spec
-        stride = 16
-        expected = 4 + count * stride
-        if len(raw) < expected:
-            print(f'  WARNING: {os.path.basename(path)} truncated '
-                  f'(expected {expected}, got {len(raw)})', file=sys.stderr)
-            count = (len(raw) - 4) // stride
-            if count <= 0:
-                continue
-        # xyz as float32 view
-        recs = np.frombuffer(raw, dtype=np.float32, count=count * 4, offset=4)
-        recs = recs.reshape(count, 4)
-        xyz = recs[:, :3].copy()
-        # The 4th float32 contains RGBA packed; classification is not in this
-        # format. We need to parse raw bytes to get the classification byte.
-        # The lidar extract_lidar.py stores x,y,z,r,g,b,a where r,g,b are u8.
-        # Classification is NOT stored in the chunk files (it was used during
-        # lidar extraction for stats but not persisted). 
-        # 
-        # However, the original LiDAR had classification byte at offset 17.
-        # Since the chunk files only store xyz+rgb, we need to re-read
-        # the original .uasset or use a different strategy.
-        #
-        # APPROACH: Use the raw byte-level parsing directly.
-        # Each point in the chunk files is 16 bytes (contra spec):
-        # Actually let me check the extract_lidar.py output format more carefully.
-        #
-        # From extract_lidar.py line 170-188: the record is:
-        #   rec_dt = [('x','<f4'),('y','<f4'),('z','<f4'),
-        #             ('r','u1'),('g','u1'),('b','u1'),('a','u1')]
-        # That's a 12+4=16 byte record stored as numpy structured array, so the
-        # file is u32 count then count * 16 bytes with x,y,z as floats and
-        # r,g,b,a as u8. Classification is NOT stored in output chunks.
-        #
-        # We need classification. The original LiDAR had it at byte 17 of each
-        # 18-byte point record. We must go back to the source .uasset.
-        
+    The on-disk chunk files (web/data/lidar/chunk_*.bin) store only x,y,z,rgba —
+    NOT the classification byte the building extractor needs (class 6). So rather
+    than read chunks we cannot filter, we go straight to the source LiDAR octree
+    (.uasset) which retains classification. (The previous version read every chunk
+    file, parsed it, then discarded the result and returned load_from_source_uasset
+    anyway — that dead work is removed here.)"""
     return load_from_source_uasset()
 
 
@@ -273,15 +227,60 @@ def generate_mesh(polygon, z_min, z_max):
         # Wall quad: bottom[a], bottom[b], top[b]; bottom[a], top[b], top[a]
         tri_list.append([a, b, b + n])
         tri_list.append([a, b + n, a + n])
-    # Roof cap: fan triangulation from center
-    center_idx = len(verts)
-    center = np.array([[ring[:, 0].mean(), ring[:, 1].mean(), z_max]], dtype=np.float32)
-    verts = np.vstack([verts, center])
-    for i in range(n):
-        tri_list.append([center_idx, n + i, n + ((i + 1) % n)])
+    # Roof cap: a centroid FAN is only correct for convex footprints — for a concave
+    # OSM footprint (L-shape, courtyard, …) the centroid can fall OUTSIDE the polygon
+    # and the fan triangles cross the notch, producing geometry outside the building.
+    # Triangulate the polygon properly: Delaunay over the ring, keep only the triangles
+    # whose centroid is inside the polygon (drops the convex-hull "filler" triangles),
+    # and map each triangle vertex back to the top-ring index (no new vertices needed).
+    roof_tris = _triangulate_footprint(ring)
+    for t in roof_tris:
+        tri_list.append([n + t[0], n + t[1], n + t[2]])
 
     indices = np.array(tri_list, dtype=np.uint32).flatten()
     return verts, indices
+
+
+def _triangulate_footprint(ring):
+    """Return a list of (i, j, k) index triples into `ring` that tile the (possibly
+    concave) polygon. Uses shapely's Delaunay triangulation of the ring points and
+    keeps only triangles interior to the polygon — correct for concave footprints,
+    where a centroid fan would produce overlapping/exterior geometry."""
+    from shapely.geometry import Polygon
+    from shapely.ops import triangulate
+    poly = Polygon(ring)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty or poly.area < 1e-6:
+        # Degenerate: fall back to a fan so we still emit *some* cap (matches old
+        # behaviour for the tiny convex case) rather than a hole in the roof.
+        n = len(ring)
+        return [(0, i, (i + 1) % n) for i in range(1, n - 1)]
+    # Dedup ring points to stable indices so each Delaunay vertex maps back to a
+    # top-ring index. Triangulate includes the convex-hull filler triangles; filter
+    # by centroid-in-polygon to keep only the footprint interior.
+    pts = {(float(x), float(y)): i for i, (x, y) in enumerate(ring)}
+    tris = []
+    for tri in triangulate(poly):
+        cx, cy = tri.centroid.x, tri.centroid.y
+        # representative_point is reliably inside for a triangle; use it for the
+        # containment test (centroid of a triangle is always inside the triangle,
+        # but we need inside-the-POLYGON, which this tests).
+        if not poly.contains(tri.representative_point()):
+            continue
+        idx = []
+        for x, y in tri.exterior.coords[:-1]:
+            key = (float(x), float(y))
+            if key not in pts:        # Delaunay introduced a non-ring vertex (rare)
+                idx = None
+                break
+            idx.append(pts[key])
+        if idx and len(idx) == 3:
+            tris.append(tuple(idx))
+    if not tris:                      # empty after filtering -> convex fan fallback
+        n = len(ring)
+        return [(0, i, (i + 1) % n) for i in range(1, n - 1)]
+    return tris
 
 
 def compute_tile_name(centroid_x, centroid_y):

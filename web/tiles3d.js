@@ -30,6 +30,12 @@ const KEY_LS = 'twin.photoreal.key';
 const PROVIDER_LS = 'twin.photoreal.provider';
 const CALIB_LS = 'twin.photoreal.calib';
 const DETAIL_LS = 'twin.photoreal.detail';   // errorTarget px (lower = higher fidelity)
+// Default streaming fidelity (target screen-space error in px). Tiles are pulled LIVE
+// from the Map Tiles API at this detail; lower => the renderer subdivides to finer tiles.
+// 4 px is high fidelity (close to the native resolution of Google's mesh) while staying
+// at 60 fps over the whole city; the panel's detail slider can push to 1–2 for maximum
+// detail or raise it for performance. Kept in sync with web/index.html #photoreal-detail.
+const DEFAULT_DETAIL = 4;
 const ION_GOOGLE_ASSET = 2275207; // Cesium ion's Google Photorealistic 3D Tiles asset
 
 // Baked ECEF->scene transform (fallback if lib/tiles_align.json can't be fetched).
@@ -59,14 +65,13 @@ async function loadKey(dataDir) {
 	if (!key) { try { key = localStorage.getItem(KEY_LS) || null; } catch (_) {} }
 	// Ask the server: it provides the key (twin_server reads GOOGLE_MAPS_API_KEY / .env)
 	// and advertises whether the tile-cache proxy is available. 200 {key:null} when unset.
-	let cache = false, local = null;
+	let cache = false;
 	for (const url of ['/api/photoreal', dataDir + 'photoreal.json']) {
 		try {
 			const r = await fetch(url, { cache: 'no-store' });
 			if (r.ok) {
 				const j = await r.json();
 				if (j && j.cache) cache = true;
-				if (j && j.localTileset) local = j.localTileset;   // pre-downloaded offline tiles
 				if (j && j.key && !key) {
 					if (j.provider) { try { localStorage.setItem(PROVIDER_LS, j.provider); } catch (_) {} }
 					key = j.key;
@@ -75,7 +80,7 @@ async function loadKey(dataDir) {
 			}
 		} catch (_) {}
 	}
-	return { key, cache, local };
+	return { key, cache };
 }
 
 function loadCalib() {
@@ -138,8 +143,9 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 	let mode = provider === 'ion' ? 'ion' : 'google';   // 'google' | 'ion' | 'custom'
 	let gen = 0;   // build generation; guards against concurrent (re)build races
 	let serverCache = false;   // twin_server present -> route tiles through /api/gtile cache
-	let detail = (() => { try { const v = parseFloat(localStorage.getItem(DETAIL_LS)); return Number.isFinite(v) ? v : null; } catch (_) { return null; } })();
+	let detail = (() => { try { const v = parseFloat(localStorage.getItem(DETAIL_LS)); return Number.isFinite(v) ? v : DEFAULT_DETAIL; } catch (_) { return DEFAULT_DETAIL; } })();
 	let buildAt = 0, gotTileset = false, gotModel = false, watchdogFired = false;
+	let creditsAt = 0;
 
 	const setStatus = (s) => { if (onStatus) onStatus(s); };
 	const decoderURL = new URL('lib/draco/gltf/', document.baseURI).href;
@@ -248,14 +254,10 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 	async function init() {
 		if (initStarted || disposed) return;
 		initStarted = true;
-		const { key, cache, local } = await loadKey(dataDir);
+		const { key, cache } = await loadKey(dataDir);
 		serverCache = !!cache;
-		// Prefer pre-downloaded local tiles (render on load, zero Google calls, no key).
-		if (local) {
-			setStatus('loading saved photorealistic tiles…');
-			await buildTiles(local, null);
-			return;
-		}
+		// Stream LIVE from the Map Tiles API (routed through the twin server's bounded
+		// disk cache when present — see installFetchCache). No offline copy is kept.
 		if (!key) {
 			setStatus('no API key — add a Google Maps key below');
 			initStarted = false;       // allow retry once a key is provided
@@ -280,11 +282,19 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 			setStatus('no tiles loaded — check the API key, that the Map Tiles API is enabled, and your network');
 		}
 		if (onCredits) {
-			const list = tiles.getAttributions ? tiles.getAttributions([]) : [];
-			const txt = list.map((a) => a && a.value).filter(Boolean).join(' · ');
-			const lead = mode === 'google' ? 'Imagery © Google' : mode === 'ion' ? 'Cesium ion' : '';
-			const next = [lead, txt].filter(Boolean).join(' · ');
-			if (next !== credits) { credits = next; onCredits(credits); }
+			// Attribution text changes rarely (only when new tiles stream in), so
+			// throttle the getAttributions + string build to ~2 Hz instead of every
+			// frame — the unthrottled path allocated ~5 arrays/strings per frame for
+			// a UI string that is almost always identical to the previous frame.
+			const now = (typeof performance !== 'undefined' ? performance.now() : 0);
+			if (now - creditsAt >= 500) {
+				creditsAt = now;
+				const list = tiles.getAttributions ? tiles.getAttributions([]) : [];
+				const txt = list.map((a) => a && a.value).filter(Boolean).join(' · ');
+				const lead = mode === 'google' ? 'Imagery © Google' : mode === 'ion' ? 'Cesium ion' : '';
+				const next = [lead, txt].filter(Boolean).join(' · ');
+				if (next !== credits) { credits = next; onCredits(credits); }
+			}
 		}
 	}
 

@@ -56,10 +56,13 @@ sys.path = [p for p in sys.path
             if os.path.abspath(p if p else '.') != _here]
 import numpy as np  # noqa: E402
 
-ROOT = r'C:/Users/sear234/Desktop/CAMPUS'
-PATH = ROOT + '/LIDAR/POINT_CLOUD_2019.uasset'
-OUT_DIR = ROOT + '/web/data/lidar'
-EXTRACTED = ROOT + '/extracted'
+# Repo root (the CAMPUS/ layout: LIDAR/, MESHES/, tools/, extracted/ live at the
+# same level as this file's parent). Was a hardcoded dev-machine path; resolved
+# relative to the repo so the tool works on any checkout.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PATH = os.path.join(ROOT, 'LIDAR', 'POINT_CLOUD_2019.uasset')
+OUT_DIR = os.path.join(ROOT, 'web', 'data', 'lidar')
+EXTRACTED = os.path.join(ROOT, 'extracted')
 EXPORT_END = 448664675
 ROOT_EXTENT = 170396.5
 BOX = (-91525.0, -170396.5, -16872.5, 91525.0, 170396.5, 16872.5)

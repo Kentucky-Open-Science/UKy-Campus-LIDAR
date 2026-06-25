@@ -776,8 +776,16 @@ async function loadBuildingsPacked(meta) {
       b.min[1] += shift; b.max[1] += shift;
     }
   }
-  const heights = blds.map((b) => b.heightM);
-  const minH = Math.min(...heights), maxH = Math.max(...heights);
+  // Single-pass min/max (not Math.min(...heights)): the full-city pack is ~114k
+  // buildings, and spreading an array that large into a call throws RangeError
+  // ("Maximum call stack size exceeded") once it exceeds the engine's argument
+  // ceiling. A loop is O(N), allocates nothing, and is the only safe form here.
+  let minH = Infinity, maxH = -Infinity;
+  for (const b of blds) {
+    const h = b.heightM;
+    if (h < minH) minH = h;
+    if (h > maxH) maxH = h;
+  }
   const mode = $('buildings-color-mode').value;
   const col = new Float32Array(tv * 3);
   const c = new THREE.Color();
@@ -820,10 +828,13 @@ async function loadBuildingsPerTile(blds) {
   updateBuildingsStatus();
   if (!blds.length) return;
 
-  // Compute height range for color mapping
-  const heights = blds.map((b) => b.heightCm / 100);
-  const minH = Math.min(...heights);
-  const maxH = Math.max(...heights);
+  // Compute height range for color mapping (single-pass — see packed-path note re: RangeError)
+  let minH = Infinity, maxH = -Infinity;
+  for (const b of blds) {
+    const h = b.heightCm / 100;
+    if (h < minH) minH = h;
+    if (h > maxH) maxH = h;
+  }
 
   let firstLoad = true;
   for (const bld of blds) {
@@ -1177,9 +1188,9 @@ state.photoreal?.probeKey?.().then((r) => {
     $('photoreal-key').placeholder = 'key loaded from .env — just tick "visible"';
   }
 }).catch(() => {});
-// Photorealistic basemap is ON by default (load Google tiles + overlays on initial load);
-// pass ?photoreal=0 to start with it off. It prefers pre-downloaded local tiles, then a
-// server/.env key, and degrades gracefully if neither is present.
+// Photorealistic basemap is ON by default (stream Google tiles + overlays on initial
+// load); pass ?photoreal=0 to start with it off. Tiles are pulled LIVE from the Map Tiles
+// API using a server/.env key (or one entered in the panel); degrades gracefully if none.
 if (params.get('photoreal') !== '0') {
   const cb = $('photoreal-visible');
   if (cb) cb.checked = true;
@@ -1739,9 +1750,12 @@ $('buildings-color-mode').addEventListener('change', () => {
     col.needsUpdate = true;
     return;
   }
-  const heights = state.buildings.tiles.map((b) => b.heightCm / 100);
-  const minH = Math.min(...heights);
-  const maxH = Math.max(...heights);
+  let minH = Infinity, maxH = -Infinity;
+  for (const b of state.buildings.tiles) {
+    const h = b.heightCm / 100;
+    if (h < minH) minH = h;
+    if (h > maxH) maxH = h;
+  }
   for (const t of state.buildings.tiles) {
     if (!t.object) continue;
     const oldMat = t.object.material;

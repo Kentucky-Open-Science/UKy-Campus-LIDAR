@@ -484,33 +484,49 @@ export function createRoadNetwork(data, opts = {}) {
       tick(dt) { this.t += (dt || 0); this._apply(); },
       update(dt) { this.tick(dt); },
       _apply() {
-        const t = this.t, dirty = new Set();
+        const t = this.t;
+        let vDirty = false, pDirty = false;
         for (const it of model.intersections) {
           if (it.control !== 'signal' || !it.phasePlan) continue;
           const ov = this.overrides.get(it.id);
           if (ov) it._state = { groupStates: ov.groupStates, pedStates: ov.pedStates || { A: 'dont', B: 'dont' } };
           else { const s = statesAt(it.phasePlan, t); it._state = { groupStates: s.phase.groupStates, pedStates: s.phase.pedStates || {} }; }
         }
+        // Vehicle lamps: aspects only flip at phase boundaries (seconds-scale), so skip
+        // the setColorAt + GPU re-upload when a lamp's colour is unchanged. Tracking the
+        // last written hex per lamp drops steady-state work from ~5500 writes + a full
+        // instanceColor buffer re-upload EVERY frame to a handful of writes on the frame
+        // a phase actually changes.
         if (vlamps.mesh) {
           for (const r of vehReg) {
             const st = byId.get(r.intId)._state; if (!st) continue;
             const g = st.groupStates[r.group];
             const onAsp = g === 'green' ? 'G' : g === 'yellow' ? 'Y' : 'R';
-            vlamps.mesh.setColorAt(r.index, _tmpcol.setHex(r.aspect === onAsp ? r.on : r.off));
+            const hex = r.aspect === onAsp ? r.on : r.off;
+            if (r.last === hex) continue;
+            r.last = hex;
+            vlamps.mesh.setColorAt(r.index, _tmpcol.setHex(hex));
+            vDirty = true;
           }
-          dirty.add(vlamps.mesh);
         }
+        // Pedestrian lamps: 'walk'/'dont' states are also phase-boundary-bound; only the
+        // 'flash' dont-kind blinks (~1.4 Hz). Recompute the flashing ones each frame but
+        // still only mark dirty on an actual toggle.
         if (plamps.mesh) {
           for (const r of pedReg) {
             const st = byId.get(r.intId)._state; if (!st) continue;
             const p = st.pedStates[r.group] || 'dont';
             let lit = r.kind === 'walk' ? (p === 'walk') : (p !== 'walk');
             if (r.kind === 'dont' && p === 'flash') lit = (Math.floor(t * 1.4) % 2 === 0);
-            plamps.mesh.setColorAt(r.index, _tmpcol.setHex(lit ? r.on : r.off));
+            const hex = lit ? r.on : r.off;
+            if (r.last === hex) continue;
+            r.last = hex;
+            plamps.mesh.setColorAt(r.index, _tmpcol.setHex(hex));
+            pDirty = true;
           }
-          dirty.add(plamps.mesh);
         }
-        for (const m of dirty) if (m.instanceColor) m.instanceColor.needsUpdate = true;
+        if (vDirty && vlamps.mesh?.instanceColor) vlamps.mesh.instanceColor.needsUpdate = true;
+        if (pDirty && plamps.mesh?.instanceColor) plamps.mesh.instanceColor.needsUpdate = true;
       },
       // ---- agent-facing query / control API ----
       getLegState(intId, legIdx) {
