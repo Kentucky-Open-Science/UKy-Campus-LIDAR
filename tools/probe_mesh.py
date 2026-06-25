@@ -1,10 +1,14 @@
 """Exploratory probe of FMeshDescription payload in DTM mesh packages."""
-import sys, struct
-sys.path.insert(0, 'c:/Users/sear234/Desktop/CAMPUS/tools')
+import os
+import sys
+import struct
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
 from uasset import Package, Reader, decompress_chunked
 
+_REPO = os.path.dirname(_HERE)
 PATH = sys.argv[1] if len(sys.argv) > 1 else \
-    'c:/Users/sear234/Desktop/CAMPUS/MESHES/DTM_GRID/Meshes/15626E185064N.uasset'
+    os.path.join(_REPO, 'MESHES', 'DTM_GRID', 'Meshes', '15626E185064N.uasset')
 
 p = Package(PATH)
 blob = p.data[p.bulk_data_start_offset:len(p.data) - 4]

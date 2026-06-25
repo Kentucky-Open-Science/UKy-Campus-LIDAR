@@ -201,9 +201,9 @@ the vendored NASA-AMMOS [`3d-tiles-renderer`](https://github.com/NASA-AMMOS/3DTi
 (`web/lib/3d-tiles-renderer.module.js`, pinned to a build compatible with the viewer's
 three r160) and `web/tiles3d.js`.
 
-It is **off by default and fully self-contained**: nothing is fetched and there is no
-per-frame cost until you enable it *and* provide a key, so the rest of the twin is
-untouched. Toggle it under **Photorealistic 3D (Google)** in the panel.
+It is **fully self-contained**: nothing is fetched and there is no per-frame cost until
+the layer is enabled *and* a key is present, so the rest of the twin is untouched. Toggle
+it under **Photorealistic 3D (Google)** in the panel.
 
 **You need a key.** Google's tiles require a Google Maps Platform API key with the
 **Map Tiles API** enabled (it has a free monthly tier; restrict the key to your domain
@@ -224,36 +224,19 @@ pass `?ionkey=…`, or set `PHOTOREAL_PROVIDER=ion` with the token in `GOOGLE_MA
 **Viewing it.** The photoreal basemap is **on by default** (loads with the rest of the map
 on initial load; pass `?photoreal=0` to start with it off). The default is now **real
 elevation** so roads/labels/traffic drape onto the photoreal terrain (pass `?flat=1` for
-the old single-plane mode). The **detail** slider sets the target screen-space error in
-pixels (lower = sharper, more tiles); LOD refines as you zoom in.
+the old single-plane mode). Tiles are **streamed live from the Map Tiles API at the highest
+fidelity** the data supports — the **detail** slider sets the target screen-space error in
+pixels (lower = sharper, more tiles; default **4**, drop to **1–2** for maximum detail or
+raise it for performance) and LOD refines as you zoom in.
 
-**Offline tiles — download & save (`tools/download_photoreal.py`).** You can pre-download
-the Lexington tiles to disk so the viewer renders them **on page load with zero Google
-calls** (no streaming from Google as the camera moves):
-
-```sh
-python -m tools.download_photoreal                 # default fidelity (min-error 12)
-python -m tools.download_photoreal --min-error 0   # MAXIMUM fidelity (large + slow)
-python -m tools.download_photoreal --min-error 40 --max-tiles 60   # quick sample
-```
-
-It is **bbox-limited to Lexington** (from `city.json`), walks the 3D-Tiles tree, prunes to
-that bbox, downloads each tile (glTF + nested tilesets), and writes a self-contained local
-tileset to `web/data/photoreal_lexington/` (gitignored) with every URI rewritten to a flat
-local filename. The server then advertises it (`/api/photoreal` `localTileset`) and the
-viewer auto-loads it on startup — no key needed, nothing fetched from Google. Re-running
-resumes (already-saved tiles are skipped); lower `--min-error` for more detail (larger).
-
-> ⚠️ Google Maps Platform's **standard** terms do **not** permit a permanent offline copy.
-> Run the downloader **only** if your agreement with Google allows storing the tiles (e.g.
-> a private, area-scoped contract). It is intentionally bbox-limited to Lexington for that
-> licensed, private use.
-
-**Live tile caching.** Without a local download, when served by `tools.twin_server` the
-viewer routes tile fetches through an on-disk cache proxy (`/api/gtile` →
-`web/data/tilecache/`, gitignored, host-locked to `tile.googleapis.com`) so repeat sessions
-reuse tiles. The cache does not expire by default (set `TILECACHE_TTL_DAYS` for a finite
-cache). `root.json` is always fetched live to keep the session valid.
+**Tile caching.** When served by `tools.twin_server` the viewer routes tile fetches through
+a bounded on-disk cache proxy (`/api/gtile` → `web/data/tilecache/`, gitignored,
+host-locked to `tile.googleapis.com`) so repeat sessions reuse already-streamed tiles
+instead of re-fetching them. This is a **transient performance cache, not an offline
+mirror**: it is size-capped (LRU-trimmed at `TILECACHE_MAX_GB`, default 4 GB) and
+`root.json` is always fetched live to keep the session valid. Set `TILECACHE_TTL_DAYS` for
+a finite expiry, or `TILECACHE_MAX_GB=0` to disable the cap. Delete `web/data/tilecache/`
+any time to clear it.
 
 **Alignment.** The tiles arrive in geocentric ECEF; `tools/fit_tiles_align.py` bakes a
 similarity transform (`web/lib/tiles_align.json`) from the *exact* pipeline projection

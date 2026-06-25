@@ -1,7 +1,9 @@
 """Hexdump arbitrary windows of the LiDAR uasset. Usage: lidar_hex.py off len [off len ...]"""
+import os
 import sys
 
-PATH = r'C:/Users/sear234/Desktop/CAMPUS/LIDAR/POINT_CLOUD_2019.uasset'
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PATH = os.path.join(_REPO, 'LIDAR', 'POINT_CLOUD_2019.uasset')
 
 def hexdump(data, base, n):
     for i in range(0, n, 16):

@@ -28,6 +28,7 @@ const _v3d = new THREE.Vector3(), _v3scl = new THREE.Vector3();
 const _box3 = new THREE.Box3();
 const _mat4 = new THREE.Matrix4();
 const _quat = new THREE.Quaternion();
+const _qYaw = new THREE.Quaternion(), _qTilt = new THREE.Quaternion();  // _finalizeMesh scratch
 const _prevClear = new THREE.Color();
 const _ray = new THREE.Raycaster();
 const _DOWN = Object.freeze(new THREE.Vector3(0, -1, 0));
@@ -193,10 +194,23 @@ export function createAgentSystem(deps) {
     };
     mesh.userData.surfaceClass = 'building';
     grid.items.push(item);
-    const gx = Math.floor(item.cx / grid.cell), gz = Math.floor(item.cz / grid.cell);
-    const k = gx + ',' + gz;
-    let cell = grid.map.get(k); if (!cell) grid.map.set(k, cell = []);
-    cell.push(item);
+    _insertBoxAllCells(item);
+  }
+  // Insert a box into EVERY grid cell its XZ AABB overlaps, not just the centre cell.
+  // The old single-cell (centre) binning meant an agent standing inside a building
+  // wider than one cell (64 m) but whose own cell was >1 from the building's centre
+  // cell never saw that building as a collision candidate — so agents drove through
+  // large buildings (big-box retail, warehouses, long dorms: ~1700 of them city-wide)
+  // with no contact event. Multi-cell insertion fixes that; the collision loop's
+  // `seen` Set (keyed on 'b:'+name) dedups the resulting duplicate candidates.
+  function _insertBoxAllCells(item) {
+    const gx0 = Math.floor(item.min[0] / grid.cell), gx1 = Math.floor(item.max[0] / grid.cell);
+    const gz0 = Math.floor(item.min[2] / grid.cell), gz1 = Math.floor(item.max[2] / grid.cell);
+    for (let gx = gx0; gx <= gx1; gx++) for (let gz = gz0; gz <= gz1; gz++) {
+      const k = gx + ',' + gz;
+      let cell = grid.map.get(k); if (!cell) grid.map.set(k, cell = []);
+      cell.push(item);
+    }
   }
   // Buildings stream in one-per-frame over several seconds (app.js loadBuildings).
   // Bin only the NEWLY-added meshes each frame (append-only fast path) instead of
@@ -204,10 +218,7 @@ export function createAgentSystem(deps) {
   function addBoxToGrid(b) {
     const item = { mesh: null, min: b.min, max: b.max, cx: b.cx, cz: b.cz, name: b.name, id: b.id };
     grid.items.push(item);
-    const gx = Math.floor(item.cx / grid.cell), gz = Math.floor(item.cz / grid.cell);
-    const k = gx + ',' + gz;
-    let cell = grid.map.get(k); if (!cell) grid.map.set(k, cell = []);
-    cell.push(item);
+    _insertBoxAllCells(item);
   }
   function rebuildGridIfNeeded() {
     // packed buildings: one merged render mesh, but per-building AABBs are provided
@@ -671,9 +682,9 @@ class Agent {
       _v3a.set(this.groundNormal[0], this.groundNormal[1], this.groundNormal[2]);
       _v3b.set(0, 1, 0);
       _mat4.makeRotationY(this.yaw);
-      const qYaw = new THREE.Quaternion().setFromRotationMatrix(_mat4);
-      const qTilt = new THREE.Quaternion().setFromUnitVectors(_v3b, _v3a);
-      this.object.quaternion.copy(qTilt).multiply(qYaw);
+      _qYaw.setFromRotationMatrix(_mat4);
+      _qTilt.setFromUnitVectors(_v3b, _v3a);
+      this.object.quaternion.copy(_qTilt).multiply(_qYaw);
     } else {
       this.object.rotation.set(0, this.yaw, 0);
     }

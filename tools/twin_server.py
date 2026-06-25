@@ -75,9 +75,13 @@ _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__fil
 TILECACHE = os.path.join(DATA, "tilecache")
 # Effectively never expire (override with TILECACHE_TTL_DAYS for a finite cache).
 TILECACHE_TTL = float(os.environ.get("TILECACHE_TTL_DAYS", "3650")) * 24 * 3600
-# Pre-downloaded local tileset (tools/download_photoreal.py) the viewer renders on load.
-LOCAL_TILESET_DIR = os.path.join(DATA, "photoreal_lexington")
-LOCAL_TILESET_REL = "data/photoreal_lexington/tileset.json"
+# Soft cap on total cache size. A long-running server whose viewers fly around the
+# whole city would otherwise accumulate tiles forever (thousands of LOD nodes, each a
+# blob + .ct sidecar). When the cache exceeds this, oldest-mtime files are pruned.
+# 0 = no cap. Override with TILECACHE_MAX_GB.
+TILECACHE_MAX_BYTES = float(os.environ.get("TILECACHE_MAX_GB", "4")) * (1 << 30)
+_TILECACHE_TRIM_LOCK = threading.Lock()
+_TILECACHE_LAST_TRIM = 0.0
 
 
 def save_key_to_env(key, var="GOOGLE_MAPS_API_KEY", path=None):
@@ -152,6 +156,68 @@ DETECT_MODEL = "yolo26x.pt"     # overridden by --detect-model in main()
 DETECT_MAX_FPS = 8.0            # overridden by --detect-max-fps
 DETECT_CONF = 0.30              # overridden by --detect-conf
 SERVER_BASE = None              # "http://127.0.0.1:<port>", set in main() (in-process client)
+
+# Hard cap on a POST body. Every API endpoint takes a tiny JSON object; a payload
+# larger than this is never legitimate and an uncapped Content-Length would let a
+# client force the server to buffer an arbitrary blob (OOM on a shared box).
+MAX_BODY_BYTES = 1 << 20        # 1 MiB
+
+
+class BodyTooLarge(Exception):
+    """Raised by Handler._body when a POST's Content-Length exceeds MAX_BODY_BYTES.
+    Caught at the top of do_POST so a 413 is sent cleanly instead of the handler
+    proceeding with an empty body and writing a second response on the connection."""
+
+
+def _reject_constant(_c):
+    # json.loads accepts NaN/Infinity/-Infinity by default (mapping to float). The JSON
+    # spec forbids them and they would bypass finite() at the value level, so reject at
+    # the parse boundary. Used as json.loads(..., parse_constant=_reject_constant).
+    raise ValueError("NaN/Infinity are not valid JSON")
+
+
+def _maybe_trim_tilecache():
+    """Best-effort LRU trim of the photoreal tile cache so it can't grow unbounded on
+    a long-running server. Throttled to at most once per 5 min (the scan is a single
+    os.scandir + stat over the cache dir; cheap, but no reason to do it per tile).
+    Runs on the calling thread but returns fast under the throttle guard; failures are
+    swallowed — a trim error must never break tile serving."""
+    global _TILECACHE_LAST_TRIM
+    if not TILECACHE_MAX_BYTES:
+        return
+    now = time.time()
+    if not _TILECACHE_TRIM_LOCK.acquire(blocking=False):
+        return
+    try:
+        if now - _TILECACHE_LAST_TRIM < 300:        # at most one trim per 5 min
+            return
+        _TILECACHE_LAST_TRIM = now
+        entries = []                                  # (mtime, size, path)
+        total = 0
+        for name in os.scandir(TILECACHE):
+            try:
+                st = name.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, name.path))
+            total += st.st_size
+        if total <= TILECACHE_MAX_BYTES:
+            return
+        # evict oldest-mtime first (the .ct sidecar sits next to its blob; both are
+        # keyed by the same hash so both get pruned as they age together)
+        entries.sort(key=lambda e: e[0])
+        for mtime, size, path in entries:
+            if total <= TILECACHE_MAX_BYTES:
+                break
+            try:
+                os.remove(path)
+                total -= size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    finally:
+        _TILECACHE_TRIM_LOCK.release()
 
 
 def load_calib():
@@ -404,6 +470,11 @@ class Buildings:
         print(f"[buildings] {len(self.items)} collision boxes loaded")
 
     def nearby(self, x, z):
+        # Guard NaN/inf: int(NaN // cell) raises ValueError, which would propagate out of
+        # World.tick() (under the lock) and kill the sim thread. A non-finite query can
+        # never match a real AABB, so return nothing rather than crash.
+        if not (math.isfinite(x) and math.isfinite(z)):
+            return []
         gx, gz = int(x // self.cell), int(z // self.cell)
         out = []
         for dx in (-1, 0, 1):
@@ -488,12 +559,19 @@ class Agent:
         self.controls = self._sanitize(c or {})
 
     def drive_to(self, g):
+        x = float(g["x"]); z = float(g["z"])
+        if not finite(x, z):
+            raise ValueError("driveTo x and z must be finite numbers")
+        speed = float(g.get("speed", 0.6 * self.maxSpeed))
+        arrive = float(g.get("arriveRadius", 2.0))
+        if not finite(speed, arrive) or speed < 0 or arrive < 0:
+            raise ValueError("driveTo speed and arriveRadius must be finite >= 0")
         self.goal = {
-            "x": float(g["x"]),
+            "x": x,
             "y": (float(g["y"]) if g.get("y") is not None else None),
-            "z": float(g["z"]),
-            "speed": float(g.get("speed", 0.6 * self.maxSpeed)),
-            "arriveRadius": float(g.get("arriveRadius", 2.0)),
+            "z": z,
+            "speed": speed,
+            "arriveRadius": arrive,
             "stop": bool(g.get("stop", True)),
         }
 
@@ -507,15 +585,21 @@ class Agent:
         for k, lo, hi in (("throttle", 0, 1), ("brake", 0, 1), ("steer", -1, 1),
                           ("left", -1, 1), ("right", -1, 1), ("thrust", 0, 1), ("climb", -1, 1)):
             if c.get(k) is not None:
-                out[k] = clamp(float(c[k]), lo, hi)
+                v = float(c[k])
+                if not math.isfinite(v):
+                    continue              # drop non-finite (NaN/inf) -> integrator's default 0
+                out[k] = clamp(v, lo, hi)
         if c.get("yawRate") is not None:
-            out["yawRate"] = float(c["yawRate"])
+            yr = float(c["yawRate"])
+            if math.isfinite(yr):
+                out["yawRate"] = yr
         for b in ("reverse", "handbrake"):
             if c.get(b) is not None:
                 out[b] = bool(c[b])
         if isinstance(c.get("move"), (list, tuple)):
             m = c["move"]
-            out["move"] = [float(m[0] or 0), float(m[1] or 0), float(m[2] or 0)]
+            mv = [float(m[i]) if i < len(m) and m[i] is not None else 0.0 for i in range(3)]
+            out["move"] = [v if math.isfinite(v) else 0.0 for v in mv]
         return out
 
     # ---- goal -> controls (server-side driveTo controller, ported) ----
@@ -807,10 +891,18 @@ class World:
                     "agents": [a.state() for a in self.agents.values()]}
 
     def run(self, stop_evt):
+        # The authoritative world thread is the one process that must NEVER die: every
+        # connected viewer and script depends on it. tick() holds the lock and touches
+        # network-derived agent state, so a stray exception (e.g. a NaN that slipped
+        # past an input guard) would otherwise unwind out of here and silently freeze
+        # the whole world. Log + keep stepping so a transient fault is survivable.
         dt = 1.0 / self.hz
         nxt = time.time()
         while not stop_evt.is_set():
-            self.tick(dt)
+            try:
+                self.tick(dt)
+            except Exception as e:  # noqa: BLE001 — never let the sim thread die
+                print(f"[world] tick raised, skipped frame {self.frame}: {e!r}")
             nxt += dt
             slp = nxt - time.time()
             if slp > 0:
@@ -1207,11 +1299,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
+        # Cap the body size: every endpoint here takes a small JSON object (spawn,
+        # controls, pose, calib, detections) — a multi-MB POST is never legitimate,
+        # and an uncapped Content-Length would let a client force the server to buffer
+        # an arbitrary blob (OOM). Reject overflows with 413 before allocating.
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
             return {}
+        if n > MAX_BODY_BYTES:
+            raise BodyTooLarge()
         try:
-            return json.loads(self.rfile.read(n) or b"{}")
+            # parse_constant rejects the NaN/Infinity/-Infinity tokens that the JSON
+            # spec forbids but Python's json.loads ACCEPTS by default. Those would
+            # otherwise sail past finite() at the value level and poison the sim.
+            return json.loads(self.rfile.read(n) or b"{}",
+                              parse_constant=_reject_constant)
+        except BodyTooLarge:
+            raise
         except Exception:
             return {}
 
@@ -1324,6 +1428,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     f.write(ctype)
             except OSError:
                 pass
+            _maybe_trim_tilecache()   # throttle-guarded; never throws
         return self._send_bytes(body, 200, ctype, cached=False)
 
     def do_GET(self):
@@ -1334,16 +1439,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # unset (no 404 noise); the viewer falls back to its in-browser key entry. Set
             # PHOTOREAL_PROVIDER=ion to use a Cesium ion token instead. `cache:true` tells
             # the viewer it can route tile fetches through the on-disk cache proxy below.
-            # If tiles were pre-downloaded (tools.download_photoreal), advertise the local
-            # tileset so the viewer renders it on load with no Google calls.
-            local = LOCAL_TILESET_REL if os.path.exists(
-                os.path.join(LOCAL_TILESET_DIR, "tileset.json")) else None
+            # Tiles are always streamed LIVE from the Map Tiles API (no offline copy); the
+            # /api/gtile proxy is just a bounded, transient performance cache.
             return self._json({
                 "key": os.environ.get("GOOGLE_MAPS_API_KEY")
                 or os.environ.get("PHOTOREAL_KEY") or None,
                 "provider": os.environ.get("PHOTOREAL_PROVIDER", "google"),
                 "cache": True,
-                "localTileset": local,
             })
         if path == "/api/gtile":
             return self._gtile()
@@ -1384,16 +1486,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 })
             if path.startswith("/api/world/agents"):
                 aid, action = self._agent_id(path)
-                a = WORLD.get(aid) if aid is not None else None
-                if not a:
-                    return self._json({"error": "no such agent"}, 404)
+                # Hold the world lock across lookup + state read: the sim thread mutates
+                # agent fields every tick, so reading them unlocked (the old code) is a
+                # data race that can tear a pose mid-update. For the camera action we
+                # capture the pose under the lock, then release before the blocking
+                # RENDER call (don't hold the lock across a headless-browser round-trip).
+                with WORLD.lock:
+                    a = WORLD.get(aid) if aid is not None else None
+                    if not a:
+                        return self._json({"error": "no such agent"}, 404)
+                    if action == "camera":
+                        cam = a.camera_pose()
+                    else:
+                        st = a.state()
                 if action == "camera":
-                    return self._send_camera(a)
-                return self._json(a.state())
+                    return self._send_camera(a, cam)
+                return self._json(st)
             return self._json({"error": "unknown endpoint", "path": self.path}, 404)
         return super().do_GET()
 
-    def _send_camera(self, a):
+    def _send_camera(self, a, cam=None):
         if RENDER is None:
             return self._json({"error": "camera feed off — start the server with --render"}, 503)
         q = parse_qs(urlparse(self.path).query)
@@ -1401,7 +1513,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             w = int(float(q.get("w", [320])[0])); h = int(float(q.get("h", [240])[0]))
         except (TypeError, ValueError):
             return self._json({"error": "w and h must be numbers"}, 400)
-        (ex, ey, ez), (fx, fy, fz) = a.camera_pose()
+        # cam (eye/forward) is captured under the world lock by the caller; only fall
+        # back to an unlocked read if called directly (defensive — no current caller).
+        (ex, ey, ez), (fx, fy, fz) = cam if cam is not None else a.camera_pose()
         data, err = RENDER.render([a.id, ex, ey, ez, fx, fy, fz, w, h])
         if err or not data:
             return self._json({"error": err or "no frame"}, 503)
@@ -1421,7 +1535,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         """Upsert one (cameraId, quad) homography into calibration/cameras.json, or
         replace the whole document with {full:{...}}."""
         if isinstance(b.get("full"), dict):
-            save_calib(b["full"])
+            full = b["full"]
+            # The `full` branch overwrites the git-tracked calibration/cameras.json
+            # verbatim, so sanity-check the shape before clobbering authored config:
+            # it must be a dict with a 'cameras' dict. Rejects an accidental {} or a
+            # malformed payload that would otherwise wipe everyone's calibration.
+            if not isinstance(full.get("cameras"), dict):
+                return self._json({"error": "full must have a 'cameras' object"}, 400)
+            save_calib(full)
             return self._json({"ok": True, "mode": "full"})
         cid, quad = b.get("cameraId"), b.get("quad")
         if not cid or quad is None:
@@ -1493,6 +1614,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return self._json({"ok": True, "camera": cam})
 
     def do_POST(self):
+        try:
+            return self._do_post()
+        except BodyTooLarge:
+            return self._json({"error": "body too large"}, 413)
+
+    def _do_post(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/api/photoreal":
             # Persist a key entered in the web UI to the gitignored .env so it survives
@@ -1532,25 +1659,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if path.startswith("/api/world/agents"):
             aid, action = self._agent_id(path)
             b = self._body()
+            # Validate the action-specific payload BEFORE taking the world lock, so a
+            # malformed body returns a clean 400 (matching /pose and /spawn) instead of
+            # raising KeyError/ValueError out of the mutator, which would close the
+            # connection without an HTTP response.
+            if action in ("driveTo", "pose"):
+                if b.get("x") is None or b.get("z") is None:
+                    return self._json({"error": f"{action} needs x and z"}, 400)
+                if not finite(b["x"], b["z"]):
+                    return self._json({"error": f"{action} x and z must be finite"}, 400)
+            elif action not in ("controls", "stop", None):
+                return self._json({"error": "unknown action"}, 404)
             # Hold the world lock across lookup+mutate so a pose/controls update can't
             # interleave mid-tick (integrate -> snap_ground) and tear an agent's state.
             # WORLD.lock is reentrant, so the mutators acquiring nothing extra is fine.
-            with WORLD.lock:
-                a = WORLD.get(aid) if aid is not None else None
-                if not a:
-                    return self._json({"error": "no such agent"}, 404)
-                if action == "controls":
-                    a.set_controls(b)
-                elif action == "driveTo":
-                    a.drive_to(b)
-                elif action == "stop":
-                    a.stop()
-                elif action == "pose":
-                    if b.get("x") is None or b.get("z") is None:
-                        return self._json({"error": "pose needs x and z"}, 400)
-                    a.set_pose(b["x"], b["z"], b.get("y"), b.get("heading"))
-                else:
-                    return self._json({"error": "unknown action"}, 404)
+            try:
+                with WORLD.lock:
+                    a = WORLD.get(aid) if aid is not None else None
+                    if not a:
+                        return self._json({"error": "no such agent"}, 404)
+                    if action == "controls":
+                        a.set_controls(b)
+                    elif action == "driveTo":
+                        a.drive_to(b)
+                    elif action == "stop":
+                        a.stop()
+                    elif action == "pose":
+                        a.set_pose(b["x"], b["z"], b.get("y"), b.get("heading"))
+            except (KeyError, ValueError, TypeError) as e:
+                return self._json({"error": "bad body: " + str(e)}, 400)
             return self._json({"ok": True})
         return self._json({"error": "unknown endpoint"}, 404)
 

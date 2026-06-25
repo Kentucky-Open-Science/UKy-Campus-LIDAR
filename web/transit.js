@@ -285,7 +285,7 @@ export function createTransitSystem(deps = {}) {
       id: v.id, object: root, body, bodyMat, sprite: spr, label: busLabel(v),
       cur: new THREE.Vector3(v.x, 0, v.z), tgt: new THREE.Vector3(v.x, 0, v.z),
       yaw: yawFromBearing(v.bearing), tgtYaw: yawFromBearing(v.bearing),
-      data: v, lastSeen: performance.now(), lastGroundY: null,
+      data: v, lastSeen: performance.now(), lastGroundY: cityGroundY,
     };
     bus.object.position.copy(bus.cur);
     bus.object.rotation.y = bus.yaw;
@@ -379,7 +379,12 @@ export function createTransitSystem(deps = {}) {
       // terrain under them) ride the flat city plane / their last known elevation,
       // so they stay visible at street level instead of dropping to y=0.
       const gy = groundY(bus.cur.x, bus.cur.z);
-      if (gy != null) { bus.lastGroundY = gy; refGroundY = gy; }
+      if (gy != null) bus.lastGroundY = gy;
+      // Off-campus buses (no terrain tile) ride the flat city plane (refGroundY, seeded
+      // to cityGroundY) or their last known terrain elevation. refGroundY is a CONSTANT
+      // city-plane fallback — it must NOT be overwritten with a campus bus's hillside
+      // elevation (the old `refGroundY = gy`), or every off-campus bus would snap to
+      // whatever height the last on-campus bus happened to be at and float/sink.
       const y = (gy != null ? gy : (bus.lastGroundY != null ? bus.lastGroundY : refGroundY)) + BUS_LIFT;
       bus.object.position.set(bus.cur.x, y, bus.cur.z);
       bus.yaw += shortestAngle(bus.yaw, bus.tgtYaw) * k;

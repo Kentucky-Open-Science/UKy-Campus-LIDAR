@@ -41,10 +41,12 @@ from uasset import Package, Reader  # noqa: E402
 import PIL.Image  # noqa: E402
 PIL.Image.MAX_IMAGE_PIXELS = None  # tiles up to ~16k x 16k
 
-ROOT = 'c:/Users/sear234/Desktop/CAMPUS'
-TEX_DIR = f'{ROOT}/MESHES/DTM_GRID/Textures'
-OUT_DIR = f'{ROOT}/web/data/textures'
-PARTS_DIR = f'{ROOT}/extracted/textures_parts'
+# Repo root (the CAMPUS/ layout). Was a hardcoded dev-machine path; resolved
+# relative to the repo so --all finds textures on any checkout.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEX_DIR = os.path.join(ROOT, 'MESHES', 'DTM_GRID', 'Textures')
+OUT_DIR = os.path.join(ROOT, 'web', 'data', 'textures')
+PARTS_DIR = os.path.join(ROOT, 'extracted', 'textures_parts')
 MAX_DIM = 4096
 THUMB_DIM = 512
 JPEG_QUALITY = 82
