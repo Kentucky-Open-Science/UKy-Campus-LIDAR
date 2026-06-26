@@ -37,6 +37,11 @@ import argparse, json, math, os, struct, array, hashlib
 import numpy as np
 from scipy import ndimage as ndi
 
+try:
+    from tools.ground_grid import sampler_cm        # python -m tools.smooth_roads
+except ImportError:
+    from ground_grid import sampler_cm              # python tools/smooth_roads.py
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.normpath(os.path.join(HERE, '..', 'web', 'data'))
 
@@ -365,6 +370,8 @@ def main():
     ap.add_argument('--r-merge', type=float, default=R_MERGE_M)
     ap.add_argument('--iters', type=int, default=CHAIKIN_ITERS)
     ap.add_argument('--qc', action='store_true', help='print extra QC diagnostics')
+    ap.add_argument('--city', action='store_true',
+                    help='drape on the KYAPED citywide ground grid (for citywide roads.json)')
     args = ap.parse_args()
 
     roads_path = os.path.join(DATA, 'roads.json')
@@ -375,8 +382,18 @@ def main():
     raw_inter = data.get('intersections', [])
     print(f'[1/6] loaded {len(roads)} roads, {len(raw_inter)} raw intersection nodes')
 
-    print('[2/6] building terrain heightmap (finer + blurred) ...')
-    elev = build_heightmap(manifest)
+    if args.city:
+        # Citywide roads.json spans the whole service area, so drape on the KYAPED ground
+        # grid (ground.f32) rather than the campus-only DTM heightmap — otherwise roads far
+        # from campus would snap to clamped edge elevations.
+        cy = json.load(open(os.path.join(DATA, 'city.json'))).get('groundY', 281.0)
+        elev = sampler_cm(DATA, cy)
+        if elev is None:
+            raise SystemExit('no ground.f32 — run: python -m tools.ky_lidar --heightmap')
+        print('[2/6] draping on the KYAPED citywide ground grid ...')
+    else:
+        print('[2/6] building terrain heightmap (finer + blurred) ...')
+        elev = build_heightmap(manifest)
 
     # ---- cluster raw junction nodes into real junction centres (XZ) ----
     print('[3/6] clustering junction nodes + deriving legs ...')

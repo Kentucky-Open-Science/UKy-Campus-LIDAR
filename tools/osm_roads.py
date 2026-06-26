@@ -24,6 +24,7 @@ import numpy as np
 from pyproj import Transformer
 
 from tools.extract_roads import DATA, load_mesh, build_heightmap
+from tools.ground_grid import sampler_cm
 
 # width (m) by OSM highway class
 WIDTH = {
@@ -65,6 +66,8 @@ def main():
     ap.add_argument('--osm-cache', help='use this OSM json instead of fetching')
     ap.add_argument('--service', action='store_true',
                     help='also keep service roads (parking aisles/driveways)')
+    ap.add_argument('--city', action='store_true',
+                    help='cover the full city.json extent, draped on the KYAPED ground grid')
     args = ap.parse_args()
 
     manifest = json.load(open(os.path.join(DATA, 'manifest.json')))
@@ -72,11 +75,26 @@ def main():
     A = (oc[0] + O[0]) / 100.0
     B = -(oc[1] + O[1]) / 100.0     # easting = A + sceneX ; northing = B - sceneZ
 
-    print('[1/5] terrain extent + elevation heightmap ...')
-    gx0, gz0, gx1, gz1 = terrain_extent(manifest)
-    mpp = 50.0
-    W = int(math.ceil((gx1 - gx0) / mpp)); H = int(math.ceil((gz1 - gz0) / mpp))
-    elev = build_heightmap(manifest, (gx0, gz0, mpp, W, H))
+    if args.city:
+        # Whole-city extent + elevation come from the open-data citywide layers, not the
+        # campus DTM: city.json (service-area bbox in scene metres, written by osm_city) and
+        # the KYAPED ground grid (ground.f32, written by ky_lidar --heightmap). gx/gz are in
+        # local cm: local_x = sceneX*100, local_z = -sceneZ*100.
+        cj = json.load(open(os.path.join(DATA, 'city.json')))
+        sxmn, szmn, sxmx, szmx = cj['bbox_scene']
+        gx0, gx1 = sxmn * 100, sxmx * 100
+        gz0, gz1 = -szmx * 100, -szmn * 100
+        print(f'[1/5] CITYWIDE extent {sxmn:.0f}..{sxmx:.0f} x {szmn:.0f}..{szmx:.0f} m; '
+              f'draping on the KYAPED ground grid ...')
+        elev = sampler_cm(DATA, cj.get('groundY', 281.0))
+        if elev is None:
+            raise SystemExit('no ground.f32 — run: python -m tools.ky_lidar --heightmap')
+    else:
+        print('[1/5] terrain extent + elevation heightmap ...')
+        gx0, gz0, gx1, gz1 = terrain_extent(manifest)
+        mpp = 50.0
+        W = int(math.ceil((gx1 - gx0) / mpp)); H = int(math.ceil((gz1 - gz0) / mpp))
+        elev = build_heightmap(manifest, (gx0, gz0, mpp, W, H))
 
     to_utm = Transformer.from_crs(4326, 32616, always_xy=True)   # lon/lat -> UTM16N
     to_ll = Transformer.from_crs(32616, 4326, always_xy=True)

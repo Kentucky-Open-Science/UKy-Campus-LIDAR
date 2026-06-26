@@ -89,10 +89,10 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
         subprocess.run([sys.executable, '-m', 'tools.build_city'], cwd=ROOT, check=True)
         print('\n--- City 4/8: pack_buildings -> one packed buffer / one draw call ---')
         subprocess.run([sys.executable, '-m', 'tools.pack_buildings'], cwd=ROOT, check=True)
-        print('\n--- City 5/8: osm_roads -> web/data/roads.json ---')
-        subprocess.run([sys.executable, '-m', 'tools.osm_roads'], cwd=ROOT, check=True)
-        print('\n--- City 6/8: smooth_roads -> smoothed roads.json + signals.json ---')
-        subprocess.run([sys.executable, '-m', 'tools.smooth_roads'], cwd=ROOT, check=True)
+        print('\n--- City 5/8: osm_roads --city -> web/data/roads.json (full service area) ---')
+        subprocess.run([sys.executable, '-m', 'tools.osm_roads', '--city'], cwd=ROOT, check=True)
+        print('\n--- City 6/8: smooth_roads --city -> smoothed roads.json + signals.json ---')
+        subprocess.run([sys.executable, '-m', 'tools.smooth_roads', '--city'], cwd=ROOT, check=True)
         # Live-data bakes. Best-effort: a flaky city site / feed warns but never fails the
         # whole city build. lex_cameras snaps cameras to signals.json junctions, so it must
         # run AFTER smooth_roads; --scrape pulls the live camera list off the city map.

@@ -71,6 +71,8 @@ class Twin:
         except urllib.error.URLError as e:
             raise TwinError(f"cannot reach twin server at {self.base} ({e.reason}). "
                             f"Is `python -m tools.twin_server` running?") from None
+        except OSError as e:        # socket/read timeout etc. aren't URLError subclasses
+            raise TwinError(f"{method} {path}: {e}") from None
 
     # ---- world ----
     def meta(self):
@@ -89,7 +91,11 @@ class Twin:
         b = self._req("GET", f"/api/world/nearest_building?x={x}&z={z}")
         return b or None
 
-    def spawn(self, type="car", position=None, heading=0, color=None, name=None, owner=None):
+    def spawn(self, type="car", position=None, heading=0, color=None, name=None,
+              owner=None, kinematic=False, source=None):
+        """Spawn an agent. kinematic=True makes it a pose-driven 'ghost' (no physics /
+        no collisions) you move with Agent.pose() — used to mirror an external sim into
+        the shared world. Kinematic agents auto-despawn after ~5 s without a pose update."""
         body = {"type": type, "heading": heading}
         if position is not None:
             body["position"] = list(position)
@@ -97,6 +103,10 @@ class Twin:
             body["color"] = color
         if name is not None:
             body["name"] = name
+        if kinematic:
+            body["kinematic"] = True
+        if source is not None:
+            body["source"] = source
         body["owner"] = owner if owner is not None else self.owner
         st = self._req("POST", "/api/world/spawn", body)
         if st.get("error"):
@@ -146,6 +156,17 @@ class Agent:
         if arrive_radius is not None:
             body["arriveRadius"] = arrive_radius
         self.twin._req("POST", f"/api/world/agents/{self.id}/driveTo", body)
+        return self
+
+    def pose(self, x, z, y=None, heading=None):
+        """Teleport directly to a pose (heading in degrees). For kinematic agents — use it
+        to mirror an external sim's car into the shared world, frame by frame."""
+        body = {"x": x, "z": z}
+        if y is not None:
+            body["y"] = y
+        if heading is not None:
+            body["heading"] = heading
+        self.twin._req("POST", f"/api/world/agents/{self.id}/pose", body)
         return self
 
     def stop(self):

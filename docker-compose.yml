@@ -9,7 +9,11 @@
 services:
   twin:
     build: .
-    image: lexington-twin
+    # Build from the local Dockerfile every time; never pull from a registry. No `image:` name
+    # on purpose — a bare name like "lexington-twin" is read as a Docker Hub repo, so `up`/`pull`
+    # try to fetch it and fail with "pull access denied". pull_policy: build also forces a local
+    # rebuild when the image already exists.
+    pull_policy: build
     restart: unless-stopped
     init: true                 # forward SIGTERM/SIGINT to python; reap build + chromium children
     shm_size: "1gb"            # headless Chromium (--render) crashes with the default 64 MB /dev/shm

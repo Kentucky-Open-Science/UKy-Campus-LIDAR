@@ -25,14 +25,23 @@ imports campus_gym + tools from the repo root rather than being self-contained.
     python examples/car_rl_route.py                       # baseline + PPO before/after
     python examples/car_rl_route.py --timesteps 1000000 --n-envs 8 --save ppo_route
 
-Watch it drive live (top-down video stream in your browser; needs pillow):
-    python examples/car_rl_route.py --watch              # watch the route-follower
-    python examples/car_rl_route.py --watch --model ppo_route.zip   # watch a trained policy
+Watch it in the REAL 3-D digital twin (spawns the car in a running twin_server and
+mirrors it as you train + validate — open the viewer to watch):
+    python -m tools.twin_server                          # in another terminal (viewer on :8000)
+    python examples/car_rl_route.py --twin http://localhost:8000              # baseline -> train -> validate, in the twin
+    python examples/car_rl_route.py --twin http://localhost:8000 --baseline-only   # just watch the route-follower
+    python examples/car_rl_route.py --twin http://localhost:8000 --model ppo_route.zip  # watch a trained policy
+
+Also pull the FIRST-PERSON camera the car receives from the server (what it sees) and
+re-serve it as a video stream — needs the twin started with --render:
+    python -m tools.twin_server --render                 # camera feed on
+    python examples/car_rl_route.py --twin http://localhost:8000 --watch   # opens a stream at :8009
 """
 import argparse
 import math
 import os
 import sys
+import threading
 
 # run from anywhere: put the repo root on the path (campus_gym + tools live there)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -288,74 +297,283 @@ def summarize(label, rows):
           f"time={m('sim_s'):5.0f}s  return={m('return'):8.1f}  remaining={m('remaining'):5.0f}m")
 
 
-def watch_session(args):
-    """Spawn a live top-down video stream and drive the car so you can watch it.
-
-    Loops episodes forever (Ctrl-C to stop). Policy is the route-follower, or a saved
-    PPO model with --model. Playback is paced to --watch-speed x real time."""
-    import time
+def _parse_size(s):
     try:
-        from route_view import StreamServer, TopDownRenderer
-    except ImportError as e:
-        raise SystemExit(f"the viewer needs pillow:  pip install pillow   ({e})")
+        w, h = str(s).lower().split("x")
+        return int(w), int(h)
+    except Exception:  # noqa: BLE001
+        return 640, 480
 
+
+class CameraRelay(threading.Thread):
+    """Pull the mirrored car's FIRST-PERSON camera from the twin_server and republish it
+    to a local MJPEG StreamServer — the stream the car receives from the server. The
+    headless renderer is the bottleneck (~1-3 fps); we relay whatever it produces. Needs
+    the twin started with --render (else the camera endpoint 503s).
+
+    Uses its OWN twin client with a longer timeout so a slow render never stalls the fast
+    pose-mirroring loop (which uses a short timeout)."""
+
+    def __init__(self, mirror, stream, size=(640, 480), timeout=10):
+        super().__init__(daemon=True)
+        from twin import Twin
+        self.mirror = mirror
+        self.stream = stream
+        self.w, self.h = size
+        self._twin = Twin(mirror.twin.base, timeout=timeout)
+        self._stop = False
+        self.frames = 0
+        self._warned = False
+
+    def run(self):
+        import time
+        while not self._stop:
+            a = self.mirror.agent
+            if a is None:
+                time.sleep(0.1); continue
+            try:
+                self.stream.publish(self._twin.get(a.id).camera(self.w, self.h))
+                self.frames += 1
+            except Exception as e:  # noqa: BLE001 — keep relaying through transient errors
+                if "no such agent" in str(e):
+                    time.sleep(0.3)     # ghost TTL-reaped during a training pause; it'll respawn
+                    continue
+                if not self._warned:    # a genuine camera-off (no --render) or other fault
+                    print(f"[watch] camera unavailable: {e}\n"
+                          f"        is the twin started with --render?", flush=True)
+                    self._warned = True
+                time.sleep(0.5)
+
+    def stop(self):
+        self._stop = True
+
+
+# ----------------------------------------------------- watch in the real twin ---
+class MirrorTwin:
+    """Mirror the gym car's pose into a running twin_server as a kinematic 'ghost', so
+    you watch it drive in the real 3-D digital-twin viewer. The gym and the twin share
+    the same scene coordinates, so the ghost lands on the right roads. It carries no
+    physics (pose-driven) and auto-despawns ~5 s after updates stop, so we re-spawn it
+    if it was reaped (e.g. during a training pause)."""
+
+    def __init__(self, url, color=0xffd54a, owner="rl-route", timeout=3):
+        from twin import Twin, TwinError       # vendored client in this directory
+        self._Twin, self._TwinError = Twin, TwinError
+        # short timeout so a slow/hung server can't stall the real-time pose loop for long
+        # (transport timeouts now surface as TwinError, see twin.py _req)
+        self.twin = Twin(url, owner=owner, timeout=timeout)
+        self.color = color
+        self.agent = None
+        self._fail = 0
+        try:
+            self.twin.meta()                    # fail fast with a clear message if it's down
+        except TwinError as e:
+            raise SystemExit(f"can't reach the twin at {url} — start it first with\n"
+                             f"    python -m tools.twin_server\n({e})")
+        self.url = self.twin.base
+
+    def _spawn(self, x, y, z, heading_deg):
+        self.agent = self.twin.spawn("car", position=[x, y, z], heading=heading_deg,
+                                     color=self.color, kinematic=True,
+                                     source={"sim": "campus_gym", "task": "rl-route"})
+
+    def update(self, x, y, z, heading_deg):
+        """Push the current pose; (re)spawn the ghost if it's missing or was TTL-reaped.
+        Swallows transport/HTTP errors (a momentarily slow/hung server mustn't crash the
+        run or the SB3 training callback); warns the first time and periodically after."""
+        try:
+            if self.agent is None:
+                self._spawn(x, y, z, heading_deg)
+            else:
+                try:
+                    self.agent.pose(x, z, y=y, heading=heading_deg)
+                except (self._TwinError, OSError):
+                    # likely a TTL reap (or a hiccup): drop the stale handle (best-effort
+                    # despawn so we don't leave a duplicate) and respawn a fresh ghost.
+                    stale, self.agent = self.agent, None
+                    try:
+                        stale.despawn()
+                    except (self._TwinError, OSError):
+                        pass
+                    self._spawn(x, y, z, heading_deg)
+            self._fail = 0
+        except (self._TwinError, OSError) as e:
+            self.agent = None
+            self._fail += 1
+            if self._fail == 1 or self._fail % 60 == 0:
+                print(f"[twin] mirror update failed ({e}); retrying ...", flush=True)
+
+    def close(self):
+        try:
+            if self.agent is not None:
+                self.agent.despawn()
+        except (self._TwinError, OSError):
+            pass
+        self.agent = None
+
+
+def mirror_rollout(env, policy, mirror, speed=1.0, episodes=1, loop=False,
+                   step_cap=None, label="drive", push_hz=30.0):
+    """Roll out policy(obs, info) and mirror each pose into the twin, paced to
+    `speed` x real time so it looks natural in the viewer."""
+    import time
+    step_dt = env.dt / max(speed, 1e-6)
+    push_dt = 1.0 / max(push_hz, 1e-6)
+    ep = 0
+    while True:
+        obs, info = env.reset(seed=ep)
+        ep += 1
+        done, last_push, steps = False, 0.0, 0
+        next_t = time.perf_counter()
+        while not done:
+            obs, r, term, trunc, info = env.step(policy(obs, info))
+            steps += 1
+            done = term or trunc or (step_cap is not None and steps >= step_cap)
+            now = time.perf_counter()
+            if now - last_push >= push_dt or done:
+                a = env.agent
+                mirror.update(a.x, a.y, a.z, math.degrees(a.yaw))
+                last_push = now
+            # pace against an absolute schedule so a slow push is amortized, not compounded
+            next_t += step_dt
+            sleep = next_t - time.perf_counter()
+            if sleep > 0:
+                time.sleep(sleep)
+            elif sleep < -step_dt:
+                next_t = time.perf_counter()    # fell far behind; reset rather than sprint
+        print(f"  [{label}] ep {ep}: reached={info['reached_goal']}  "
+              f"time={info['steps'] * env.dt:.0f}s  remaining={info['route_remaining']:.0f} m  "
+              f"on-road={info['on_road_frac']:.0%}")
+        if not loop and ep >= episodes:
+            return
+
+
+def _twin_eval_callback(eval_env, mirror, speed, freq, step_cap):
+    """SB3 callback: every `freq` timesteps, mirror one eval episode of the CURRENT
+    policy into the twin so you watch the agent improve while it trains."""
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class _CB(BaseCallback):
+        def __init__(self):
+            super().__init__()
+            self._next = freq
+
+        def _on_step(self):
+            if self.num_timesteps >= self._next:
+                self._next += freq
+                pol = lambda obs, info: self.model.predict(obs, deterministic=True)[0]
+                print(f"\n[twin] mirroring the policy at {self.num_timesteps:,} steps "
+                      f"— watch the viewer ...", flush=True)
+                mirror_rollout(eval_env, pol, mirror, speed=speed, episodes=1,
+                               step_cap=step_cap, label=f"train@{self.num_timesteps}")
+            return True
+
+    return _CB()
+
+
+def twin_session(args):
+    """Spawn the car in the REAL digital twin and drive it there: watch a policy
+    (validation) or train with periodic mirrored evals — all visible in the 3-D viewer.
+    With --watch, also re-serve the car's first-person camera (what it sees) as a stream."""
+    mirror = MirrorTwin(args.twin)
     env = RoadRouteEnv(max_episode_steps=args.max_steps, corridor=args.corridor,
                        terminate_on_crash=args.strict_collision, spawn_jitter=0.0)
-    if args.model:
-        from stable_baselines3 import PPO
-        model = PPO.load(args.model)
-        def policy(obs, info):
-            return model.predict(obs, deterministic=True)[0]
-        label = f"PPO: {os.path.basename(args.model)}"
-    else:
-        policy = route_follow_policy(env)
-        label = "route-follower"
+    venv = eval_env = model = stream = relay = None
 
-    srv = StreamServer()
-    url = srv.start(args.watch_host, args.watch_port)
-    rend = TopDownRenderer(env.route.pts, env.buildings, GOAL, corridor=args.corridor)
+    cam_url = None
+    if args.watch:                              # pull the car's first-person camera feed
+        from route_view import StreamServer
+        if not mirror.twin.meta().get("camera"):
+            raise SystemExit("the twin has no first-person camera feed — restart it with:\n"
+                             "    python -m tools.twin_server --render")
+        stream = StreamServer()
+        try:
+            cam_url = stream.start(args.watch_host, args.watch_port)
+        except OSError as e:
+            raise SystemExit(f"could not bind {args.watch_host}:{args.watch_port} ({e}); "
+                             f"pick another with --watch-port")
+        relay = CameraRelay(mirror, stream, _parse_size(args.watch_size))
+        relay.start()
 
     print("\n" + "=" * 64)
-    print(f"  watching the car ({label}) — open this in your browser:\n\n      {url}\n")
-    print(f"  route {env.route.total:.0f} m, playback {args.watch_speed:g}x real time."
+    print(f"  the car is driving in the digital twin. Open:\n")
+    print(f"    3-D viewer (third person) : {mirror.url}/")
+    if cam_url:
+        print(f"    car camera (first person) : {cam_url}")
+    print(f"\n  route {env.route.total:.0f} m, playback {args.twin_speed:g}x real time."
           "  Ctrl-C to stop.")
-    print("=" * 64 + "\n", flush=True)      # show the URL immediately, before the run loop
-
-    step_dt = env.dt / max(args.watch_speed, 1e-6)
-    frame_dt = 1.0 / 30.0
-    ep = 0
+    print("=" * 64 + "\n", flush=True)
     try:
-        while True:
-            obs, info = env.reset(seed=ep)
-            ep += 1
-            ret, done, last_frame = 0.0, False, 0.0
-            while not done:
-                t0 = time.perf_counter()
-                obs, r, term, trunc, info = env.step(policy(obs, info))
-                ret += r
-                done = term or trunc
-                now = time.perf_counter()
-                if now - last_frame >= frame_dt or done:
-                    a = env.agent
-                    hud = {"title": f"{label}  (episode {ep})",
-                           "progress": 1.0 - info["route_remaining"] / max(env.route.total, 1.0),
-                           "remaining": info["route_remaining"], "speed": a.speed,
-                           "sim_s": info["steps"] * env.dt, "on_road": info["on_road"],
-                           "in_bldg": info["crashed"], "reached": info["reached_goal"], "ret": ret}
-                    srv.publish(rend.render_jpeg({"x": a.x, "z": a.z, "yaw": a.yaw}, hud))
-                    last_frame = now
-                sleep = step_dt - (time.perf_counter() - t0)
-                if sleep > 0:
-                    time.sleep(sleep)
-            outcome = ("ARRIVED" if info["reached_goal"] else "crashed-out"
-                       if info["crashed"] and env.terminate_on_crash else "timed out")
-            print(f"  episode {ep}: {outcome}  return={ret:.0f}  "
-                  f"time={info['steps'] * env.dt:.0f}s  remaining={info['route_remaining']:.0f} m")
-            time.sleep(1.2)                    # hold the final frame a beat before resetting
+        if args.model:
+            m = _load_ppo(args.model)
+            pol = lambda obs, info: m.predict(obs, deterministic=True)[0]
+            print(f"watching {os.path.basename(args.model)} in the twin (loops; Ctrl-C to stop)\n")
+            mirror_rollout(env, pol, mirror, speed=args.twin_speed, loop=True,
+                           label=os.path.basename(args.model))
+            return
+        if args.baseline_only:
+            print("watching the route-follower in the twin (loops; Ctrl-C to stop)\n")
+            mirror_rollout(env, route_follow_policy(env), mirror, speed=args.twin_speed,
+                           loop=True, label="route-follower")
+            return
+
+        try:
+            from stable_baselines3 import PPO
+            from stable_baselines3.common.env_util import make_vec_env
+        except ImportError:
+            raise SystemExit("Install the RL trainer:  pip install stable-baselines3")
+
+        print("1/3  baseline route-follower (validation) — watch it in the twin\n")
+        mirror_rollout(env, route_follow_policy(env), mirror, speed=args.twin_speed,
+                       episodes=1, label="baseline")
+
+        def make_env():
+            return RoadRouteEnv(max_episode_steps=args.max_steps, corridor=args.corridor,
+                                terminate_on_crash=args.strict_collision)
+        print(f"\n2/3  training PPO ({args.timesteps:,} steps); mirroring the policy "
+              f"every {args.twin_eval_freq:,} steps\n", flush=True)
+        venv = make_vec_env(make_env, n_envs=args.n_envs, seed=0)
+        model = PPO("MlpPolicy", venv, verbose=0, n_steps=1024, batch_size=256, gamma=0.999)
+        eval_env = RoadRouteEnv(max_episode_steps=args.max_steps, corridor=args.corridor,
+                                terminate_on_crash=args.strict_collision, spawn_jitter=0.0)
+        cb = _twin_eval_callback(eval_env, mirror, args.twin_speed, args.twin_eval_freq,
+                                 step_cap=min(args.max_steps, 2500))
+        model.learn(total_timesteps=args.timesteps, callback=cb)
+
+        print("\n3/3  trained policy (validation) — watch it in the twin\n")
+        pol = lambda obs, info: model.predict(obs, deterministic=True)[0]
+        mirror_rollout(eval_env, pol, mirror, speed=args.twin_speed, episodes=2, label="trained")
     except KeyboardInterrupt:
-        print("\nstopping the stream.")
+        print("\nstopping.")
     finally:
-        srv.close(); env.close()
+        # save the (possibly partially-) trained model even on Ctrl-C, if requested
+        if args.save and model is not None:
+            try:
+                model.save(args.save)
+                print(f"saved model -> {args.save}.zip", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"could not save model: {e}", flush=True)
+        if relay is not None:
+            relay.stop()
+        if stream is not None:
+            stream.close()
+        for closeable in (venv, eval_env):
+            if closeable is not None:
+                try:
+                    closeable.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        mirror.close(); env.close()
+
+
+def _load_ppo(path):
+    try:
+        from stable_baselines3 import PPO
+    except ImportError:
+        raise SystemExit("--model needs the RL trainer:  pip install stable-baselines3")
+    if not (os.path.exists(path) or os.path.exists(path + ".zip")):
+        raise SystemExit(f"no such model file: {path}")
+    return PPO.load(path)
 
 
 def main():
@@ -370,16 +588,26 @@ def main():
     ap.add_argument("--baseline-only", action="store_true",
                     help="just run the route-follower baseline (no training)")
     ap.add_argument("--save", default=None, help="path to save the trained PPO model")
+    ap.add_argument("--twin", default=None, metavar="URL",
+                    help="watch in the REAL 3-D digital twin: mirror the car into a running "
+                         "twin_server (e.g. http://localhost:8000). Trains + validates there.")
     ap.add_argument("--watch", action="store_true",
-                    help="spawn a live top-down video stream and drive the car (no training)")
-    ap.add_argument("--model", default=None, help="saved PPO .zip to drive with --watch")
-    ap.add_argument("--watch-host", default="127.0.0.1", help="stream bind host")
-    ap.add_argument("--watch-port", type=int, default=8009, help="stream port")
-    ap.add_argument("--watch-speed", type=float, default=3.0, help="playback speed x real time")
+                    help="with --twin: also stream the car's FIRST-PERSON camera (what it sees "
+                         "from the server; needs the twin started with --render)")
+    ap.add_argument("--model", default=None, help="saved PPO .zip to drive with --twin")
+    ap.add_argument("--twin-speed", type=float, default=1.0, help="twin playback speed x real time")
+    ap.add_argument("--twin-eval-freq", type=int, default=20_000,
+                    help="during training, mirror an eval episode into the twin every N steps")
+    ap.add_argument("--watch-host", default="127.0.0.1", help="first-person stream bind host")
+    ap.add_argument("--watch-port", type=int, default=8009, help="first-person stream port")
+    ap.add_argument("--watch-size", default="640x480", help="first-person stream frame size WxH")
     args = ap.parse_args()
 
-    if args.watch:
-        watch_session(args); return
+    if args.watch and not args.twin:
+        raise SystemExit("--watch streams the car's camera from the twin server; also pass "
+                         "--twin http://HOST:8000 (started with --render).")
+    if args.twin:
+        twin_session(args); return
 
     def make_env():
         return RoadRouteEnv(max_episode_steps=args.max_steps, corridor=args.corridor,
