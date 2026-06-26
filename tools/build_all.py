@@ -27,7 +27,8 @@ class Args:
 
 
 def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
-                   skip_pack=False, with_city=False, with_transit=False):
+                   skip_pack=False, with_city=False, with_transit=False,
+                   skip_scene=False):
     """Run extraction steps (these may be no-ops if data already exists)."""
     print('=' * 60)
     print(' Lexington Digital Twin — full data extraction pipeline')
@@ -48,40 +49,56 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
             args=Args(paths=[], all=True,
                       manifest=os.path.join(ROOT, 'extracted', 'manifest-meshes.json')))
 
+    if not skip_scene:
+        # Scene transforms (origin_node -> origin_cm, per-tile placement) come from the
+        # GRID blueprint. merge_manifests() needs extracted/manifest-scene.json, and the
+        # buildings extractor needs the origin_cm it carries — so this must run before both.
+        # Run as a module so tools.* imports resolve and tools/inspect.py doesn't shadow
+        # the stdlib inspect.
+        print('\n--- Step 3: Scene (blueprint -> manifest-scene.json) ---')
+        subprocess.run([sys.executable, '-m', 'tools.extract_scene'], cwd=ROOT, check=True)
+
     if not skip_lidar:
-        print('\n--- Step 3: LiDAR (uasset -> chunked .bin) ---')
+        print('\n--- Step 4: LiDAR (uasset -> chunked .bin) ---')
         subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'extract_lidar.py')],
                        cwd=ROOT, check=True)
 
+    # Merge BEFORE buildings: web/data/manifest.json carries the scene<->UTM georef that
+    # tools/extract_buildings_hybrid reads. (This merge previously ran AFTER buildings, so a
+    # from-scratch build had no manifest for the buildings extractor to read — it only ever
+    # worked when a manifest from an earlier run happened to be lying around.)
+    print('\n--- Step 5: Merge manifests -> web/data/manifest.json (georef + terrain) ---')
+    merge_manifests()
+
     if not skip_buildings:
-        print('\n--- Step 4: Buildings (lidar + OSM -> .bin) ---')
+        print('\n--- Step 6: Buildings (lidar + OSM -> .bin) ---')
         # Hybrid extractor: OSM footprints split/bound the LiDAR, LiDAR gives
         # shape + height. Run as a module so tools.* imports resolve and the
         # stdlib `inspect` isn't shadowed by tools/inspect.py.
         subprocess.run([sys.executable, '-m', 'tools.extract_buildings_hybrid'],
                        cwd=ROOT, check=True)
-
-    print('\n--- Step 5: Merge manifests -> web/data/manifest.json ---')
-    merge_manifests()
+        # Re-merge to fold the freshly-extracted buildings into the manifest.
+        print('\n--- Step 7: Merge manifests again (fold in buildings) ---')
+        merge_manifests()
 
     # Step 6: pack the per-building meshes into ONE buffer for fast loading
     # (3,109 fetches + draw calls -> 1). Local, no network; runs whenever the
     # buildings exist. See tools/pack_buildings.py.
     if not skip_pack and not skip_buildings:
-        print('\n--- Step 6: Pack buildings (3,109 meshes -> one buffer) ---')
+        print('\n--- Step 8: Pack buildings (3,109 meshes -> one buffer) ---')
         subprocess.run([sys.executable, '-m', 'tools.pack_buildings'], cwd=ROOT, check=True)
 
     # Steps 7-8 (opt-in; need network): the city-wide OSM context + the Lextran
     # transit layer. Best-effort — a network failure warns but never fails the build.
     # Order matters: city first, so the transit baker reads its ground elevation.
     if with_city:
-        print('\n--- Step 7: City-wide OSM streets + ground plane ---')
+        print('\n--- Step 9: City-wide OSM streets + ground plane ---')
         try:
             subprocess.run([sys.executable, '-m', 'tools.osm_city'], cwd=ROOT, check=True)
         except subprocess.CalledProcessError as e:
             print(f'  [warn] osm_city failed ({e}); skipping city layer')
     if with_transit:
-        print('\n--- Step 8: Lextran static GTFS -> transit.json ---')
+        print('\n--- Step 10: Lextran static GTFS -> transit.json ---')
         try:
             subprocess.run([sys.executable, '-m', 'tools.lextran_gtfs'], cwd=ROOT, check=True)
         except subprocess.CalledProcessError as e:
@@ -253,6 +270,8 @@ if __name__ == '__main__':
     ap.add_argument('--skip-meshes', action='store_true')
     ap.add_argument('--skip-lidar', action='store_true')
     ap.add_argument('--skip-buildings', action='store_true')
+    ap.add_argument('--skip-scene', action='store_true',
+                    help='skip blueprint/scene extraction (reuse extracted/manifest-scene.json)')
     ap.add_argument('--skip-pack', action='store_true',
                     help='skip packing buildings into one buffer (keep per-building .bins)')
     ap.add_argument('--with-city', action='store_true',
@@ -268,4 +287,5 @@ if __name__ == '__main__':
         sys.exit(0 if ok else 1)
 
     run_extraction(args.skip_textures, args.skip_meshes, args.skip_lidar,
-                   args.skip_buildings, args.skip_pack, args.with_city, args.with_transit)
+                   args.skip_buildings, args.skip_pack, args.with_city, args.with_transit,
+                   skip_scene=args.skip_scene)
