@@ -1053,6 +1053,11 @@ RENDER = None  # RenderService when --render is on
 PROXY = None   # TransitProxy when the live bus proxy is on (default; --no-transit disables)
 CAMERAS = None  # CameraProxy when the live traffic-camera proxy is on (default; --no-cameras disables)
 
+# Per-request render budget (seconds). Headless software WebGL (SwiftShader) in a GPU-less
+# container is far slower than a GPU, so allow overriding the 8 s default via env — Docker sets
+# TWIN_RENDER_TIMEOUT higher to absorb the first-frame shader-compile spike.
+RENDER_TIMEOUT = float(os.environ.get("TWIN_RENDER_TIMEOUT", "8"))
+
 
 class RenderService:
     """Headless-browser render service for first-person agent cameras.
@@ -1081,8 +1086,12 @@ class RenderService:
             return
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True,
-                                            args=["--use-gl=angle", "--ignore-gpu-blocklist"])
+                # Base GPU/ANGLE flags; let the container (or host) append more — e.g.
+                # --no-sandbox, which headless Chromium requires when running as root inside
+                # Docker — via the TWIN_CHROMIUM_ARGS env var, leaving normal runs unchanged.
+                _chromium_args = ["--use-gl=angle", "--ignore-gpu-blocklist"]
+                _chromium_args += os.environ.get("TWIN_CHROMIUM_ARGS", "").split()
+                browser = p.chromium.launch(headless=True, args=_chromium_args)
                 page = browser.new_page(viewport={"width": 640, "height": 480})
                 page.goto(f"http://127.0.0.1:{self.port}/")
                 page.wait_for_function(
@@ -1090,6 +1099,14 @@ class RenderService:
                     "window.__viewer.state.terrain.tiles.some(t => t.status === 'loaded')",
                     timeout=60000)
                 page.wait_for_timeout(1500)   # let buildings + a few tiles stream in
+                # Warm up the GL pipeline so the FIRST real request isn't stuck behind shader
+                # compilation — slow under software rendering (SwiftShader) in a GPU-less
+                # container, where it can blow past the per-request render timeout. Compiling
+                # now (off the critical path) means "ready" really means "can render fast".
+                try:
+                    page.evaluate("() => window.__renderPOV(-1, 0,50,0, 0,0,1, 320,240)")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[render] warm-up render failed (continuing anyway): {e}")
                 self.ready.set()
                 print("[render] first-person camera service ready")
                 while True:
@@ -1107,7 +1124,9 @@ class RenderService:
             self.error = f"render service failed: {e}"
             print("[render] " + self.error)
 
-    def render(self, args, timeout=8.0):
+    def render(self, args, timeout=None):
+        if timeout is None:
+            timeout = RENDER_TIMEOUT
         if self.error:
             return None, self.error
         if not self.ready.is_set() and not self.ready.wait(timeout=timeout):
@@ -2180,6 +2199,47 @@ def maybe_bootstrap_world_data(mode="prompt"):
     return False
 
 
+def ensure_live_layers():
+    """Top up the quick 'best-effort' bakes the core gate ignores: cameras.json (traffic-
+    camera positions) and transit.json (Lextran routes/stops).
+
+    world_data_present() intentionally checks only the heavy core (manifest + ground +
+    buildings), so a box that already has the core but is missing these light live-data
+    bakes would never get them from the single server command — which is exactly how a
+    fully-built city can still show no camera markers. This fetches whichever file is
+    missing with a fast scrape, best-effort, so the marker layers fill in without re-running
+    the ~8 GB city build. The /api/cameras/* and /api/transit/* live proxies are separate and
+    already up; this only writes the static positions the viewer draws markers from, and it
+    never fails the server.
+    """
+    def _has(name):
+        return os.path.exists(os.path.join(DATA, name))
+
+    if not _has("cameras.json"):
+        if not _has("signals.json"):
+            print("  [layers] cameras.json missing, but signals.json isn't built yet "
+                  "(needs the city road build) — skipping camera scrape.")
+        else:
+            print("  [layers] cameras.json missing — scraping traffic-camera positions "
+                  "(python -m tools.lex_cameras --scrape) ...")
+            try:
+                subprocess.run([sys.executable, "-m", "tools.lex_cameras", "--scrape"],
+                               cwd=_REPO_ROOT, check=True)
+            except (subprocess.CalledProcessError, OSError) as e:
+                print(f"  [layers] camera scrape failed ({e}); the live stream proxy still "
+                      "works, but camera markers won't show until this succeeds (restart to retry).")
+
+    if not _has("transit.json"):
+        print("  [layers] transit.json missing — baking Lextran routes/stops "
+              "(python -m tools.lextran_gtfs) ...")
+        try:
+            subprocess.run([sys.executable, "-m", "tools.lextran_gtfs"],
+                           cwd=_REPO_ROOT, check=True)
+        except (subprocess.CalledProcessError, OSError) as e:
+            print(f"  [layers] transit bake failed ({e}); live buses still work, but route/"
+                  "stop overlays won't show until this succeeds.")
+
+
 def main():
     global WORLD, RENDER, PROXY, CAMERAS, DETECT_MODEL, DETECT_MAX_FPS, DETECT_INTERVAL, DETECT_CONF, SERVER_BASE
     load_dotenv()   # pick up GOOGLE_MAPS_API_KEY etc. from a gitignored .env
@@ -2230,6 +2290,11 @@ def main():
     # offer to build it from the UE assets before the world loads, so World() picks it up.
     boot_mode = "off" if args.no_bootstrap else ("yes" if args.bootstrap else "prompt")
     maybe_bootstrap_world_data(boot_mode)
+    # Top up the quick best-effort layers (camera positions, transit routes) the core gate
+    # ignores — so a box with the heavy world already built still gets cameras.json/transit.json
+    # from this one command instead of silently showing no markers.
+    if boot_mode != "off":
+        ensure_live_layers()
 
     print("loading world (terrain heightmap + building boxes) ...")
     WORLD = World(hz=args.hz)

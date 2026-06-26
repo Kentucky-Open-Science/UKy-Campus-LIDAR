@@ -1,0 +1,30 @@
+# Keep the build context small and the image lean. The excluded data dirs are supplied
+# at runtime via the repo bind mount in docker-compose.yml — never baked into the image.
+
+.git
+.venv
+**/__pycache__
+*.pyc
+*.log
+
+# UE source assets + generated/extracted data (multi-GB) — bind-mounted at runtime
+MESHES/
+LIDAR/
+web/data/
+extracted/
+
+# Model weights (the vision examples fetch these on demand)
+*.pt
+
+# Node / web dev
+node_modules/
+web/node_modules/
+
+# Editor / OS / scratch
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+screenshots/
+.specify/
+CLAUDE-FABLE-5.md

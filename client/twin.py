@@ -29,10 +29,16 @@ class TwinError(RuntimeError):
 
 
 class Twin:
-    def __init__(self, base_url="http://localhost:8000", owner=None, timeout=10):
+    def __init__(self, base_url="http://localhost:8000", owner=None, timeout=10,
+                 camera_timeout=40):
         self.base = base_url.rstrip("/")
         self.owner = owner
         self.timeout = timeout
+        # First-person camera frames render in a headless browser — far slower than a normal
+        # API call, especially software (no-GPU) WebGL in a container, where the first frame
+        # also compiles shaders. Give camera() its own, larger budget so a slow cold-start
+        # render doesn't trip the 10 s general-request timeout.
+        self.camera_timeout = camera_timeout
 
     # ---- low-level REST ----
     def _req(self, method, path, body=None):
@@ -144,7 +150,7 @@ class Agent:
         url = f"{self.twin.base}/api/world/agents/{self.id}/camera?w={int(w)}&h={int(h)}"
         req = urllib.request.Request(url, headers={"User-Agent": "twin-client"})
         try:
-            with urllib.request.urlopen(req, timeout=self.twin.timeout) as r:
+            with urllib.request.urlopen(req, timeout=self.twin.camera_timeout) as r:
                 data = r.read()
                 if (r.headers.get("Content-Type") or "").startswith("image"):
                     return data

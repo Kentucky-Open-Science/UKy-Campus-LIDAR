@@ -1,0 +1,41 @@
+# Lexington Digital Twin — server.
+#
+#   docker compose up -d          # first run downloads & builds ALL of Lexington, then serves
+#   docker compose logs -f        # watch the (long, ~8 GB) first-run city build stream by
+#
+# The whole repo is bind-mounted, so the local UE assets (MESHES/, LIDAR/) anchor the build
+# and the generated web/data + extracted persist on the host between runs. Restarting after
+# the first build is instant — the bootstrap short-circuits once the city is present.
+services:
+  twin:
+    build: .
+    image: lexington-twin
+    restart: unless-stopped
+    init: true                 # forward SIGTERM/SIGINT to python; reap build + chromium children
+    shm_size: "1gb"            # headless Chromium (--render) crashes with the default 64 MB /dev/shm
+    ports:
+      - "8000:8000"
+    environment:
+      # Headless first-person cameras (--render) drive Chromium's WebGL with no GPU, so:
+      #   --no-sandbox                 Chromium can't use its setuid sandbox as root in a container
+      #   --use-angle=swiftshader      force ANGLE onto its bundled software GL (no GPU/driver needed)
+      #   --enable-unsafe-swiftshader  newer Chromium gates software WebGL behind this switch
+      TWIN_CHROMIUM_ARGS: "--no-sandbox --use-angle=swiftshader --enable-unsafe-swiftshader"
+      # Software rendering of the whole-city POV is slow (esp. the first frame's shader compile);
+      # widen the per-frame render budget well past the 8 s GPU default.
+      TWIN_RENDER_TIMEOUT: "30"
+    env_file:
+      - path: .env             # GOOGLE_MAPS_API_KEY for the optional photoreal basemap
+        required: false
+    volumes:
+      - ./:/app                # live repo: code + MESHES/LIDAR + generated web/data + extracted
+    # Auto-download/build the whole city on start (idempotent), enable first-person agent
+    # cameras, and serve on the LAN. Drop --render if you don't need the agent camera feeds.
+    command:
+      - python
+      - -m
+      - tools.twin_server
+      - --host
+      - 0.0.0.0
+      - --render
+      - --bootstrap

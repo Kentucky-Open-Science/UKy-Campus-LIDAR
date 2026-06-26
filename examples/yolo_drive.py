@@ -2,8 +2,8 @@
 
 Pulls an agent's first-person camera from the twin server, runs a YOLO model on each
 frame, and steers to avoid whatever it sees — a minimal "drive by what the camera
-shows" loop. Each demo picks the model with --model (default yolov8n.pt, the smallest
-at ~6 MB). The twin server must be started with `--render` so the camera feed exists
+shows" loop. Each demo picks the model with --model (default yolo26n.pt, the smallest
+of the YOLO26 family). The twin server must be started with `--render` so the camera feed exists
 (`python -m tools.twin_server --render`).
 
 YOLO is pretrained on COCO, so it flags things like cars, trucks, and people — e.g.
@@ -17,10 +17,10 @@ _MODEL = None
 _MODEL_NAME = None
 
 
-def load_model(name="yolov8n.pt"):
+def load_model(name="yolo26n.pt"):
     """Load a YOLO model once and cache it (weights auto-download on first use).
 
-    `name` is any Ultralytics model id/path (e.g. "yolov8n.pt" .. "yolov8x.pt"). A bare
+    `name` is any Ultralytics model id/path (e.g. "yolo26n.pt" .. "yolo26x.pt"). A bare
     filename that sits next to this script is used directly, so the demos find their
     bundled weights no matter which directory you launch them from.
     """

@@ -9,7 +9,7 @@ and any browser — sees it drive.
 Start the server with the camera feed on, then run this:
     python -m tools.twin_server --render            # twin + first-person cameras on :8000
     python examples/robot_demo.py                    # this script (any machine: --url HOST:8000)
-    python examples/robot_demo.py --port 9000 --model yolov8x.pt
+    python examples/robot_demo.py --port 9000 --model yolo26x.pt
     # open http://localhost:8000/ to watch
 
 Runs standalone from this directory (twin.py + yolo_drive.py) plus third-party deps
@@ -29,8 +29,8 @@ def main():
     ap.add_argument("--port", type=int, default=None, help="override the port in --url")
     ap.add_argument("--owner", default=f"{TYPE}-demo")
     ap.add_argument("--seconds", type=int, default=60)
-    ap.add_argument("--model", default="yolov8n.pt",
-                    help="YOLO model id/path (e.g. yolov8n.pt .. yolov8x.pt)")
+    ap.add_argument("--model", default="yolo26n.pt",
+                    help="YOLO model id/path (e.g. yolo26n.pt .. yolo26x.pt)")
     args = ap.parse_args()
 
     url = with_port(args.url, args.port)

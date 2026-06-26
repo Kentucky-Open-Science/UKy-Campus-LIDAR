@@ -1,6 +1,6 @@
 # Extra deps for the vision examples (car_demo / truck_demo / robot_demo).
 # The twin client (vendored here as twin.py) and drone_demo need nothing beyond the stdlib.
-ultralytics>=8.0          # smallest model is yolov8n (~6 MB, auto-downloads); pulls in torch (CPU is fine)
+ultralytics>=8.4          # YOLO26 family (yolo26n..yolo26x); smallest is yolo26n, auto-downloads; pulls in torch (CPU is fine)
 pillow>=10.0              # decode the JPEG camera frames (already a project dep)
 # RL training example (train_ppo.py); the gym itself only needs gymnasium + pettingzoo
 stable-baselines3>=2.0    # PPO trainer (uses the same torch)
