@@ -314,12 +314,14 @@ class CameraRelay(threading.Thread):
     Uses its OWN twin client with a longer timeout so a slow render never stalls the fast
     pose-mirroring loop (which uses a short timeout)."""
 
-    def __init__(self, mirror, stream, size=(640, 480), timeout=10):
+    def __init__(self, mirror, stream, size=(640, 480), timeout=15):
         super().__init__(daemon=True)
         from twin import Twin
         self.mirror = mirror
         self.stream = stream
         self.w, self.h = size
+        # camera renders can be slow (esp. first-frame shader compile), so a generous
+        # timeout; the render is the bottleneck, not the wire.
         self._twin = Twin(mirror.twin.base, timeout=timeout)
         self._stop = False
         self.frames = 0
@@ -335,12 +337,21 @@ class CameraRelay(threading.Thread):
                 self.stream.publish(self._twin.get(a.id).camera(self.w, self.h))
                 self.frames += 1
             except Exception as e:  # noqa: BLE001 — keep relaying through transient errors
-                if "no such agent" in str(e):
+                msg = str(e)
+                if "no such agent" in msg:
                     time.sleep(0.3)     # ghost TTL-reaped during a training pause; it'll respawn
                     continue
-                if not self._warned:    # a genuine camera-off (no --render) or other fault
-                    print(f"[watch] camera unavailable: {e}\n"
-                          f"        is the twin started with --render?", flush=True)
+                if not self._warned:
+                    slow = "timed out" in msg or "render" in msg or "503" in msg
+                    if slow:
+                        print("[watch] the twin's first-person render is too slow / not completing.\n"
+                              "        This is expected with software GL in Docker (no GPU). For a fast\n"
+                              "        camera feed run the twin NATIVELY:  python -m tools.twin_server --render\n"
+                              "        (or raise TWIN_RENDER_TIMEOUT and/or use a smaller --watch-size).\n"
+                              f"        last error: {e}", flush=True)
+                    else:
+                        print(f"[watch] camera unavailable: {e}\n"
+                              f"        is the twin started with --render?", flush=True)
                     self._warned = True
                 time.sleep(0.5)
 
@@ -492,7 +503,8 @@ def twin_session(args):
         except OSError as e:
             raise SystemExit(f"could not bind {args.watch_host}:{args.watch_port} ({e}); "
                              f"pick another with --watch-port")
-        relay = CameraRelay(mirror, stream, _parse_size(args.watch_size))
+        relay = CameraRelay(mirror, stream, _parse_size(args.watch_size),
+                            timeout=args.watch_timeout)
         relay.start()
 
     print("\n" + "=" * 64)
@@ -601,6 +613,8 @@ def main():
     ap.add_argument("--watch-host", default="127.0.0.1", help="first-person stream bind host")
     ap.add_argument("--watch-port", type=int, default=8009, help="first-person stream port")
     ap.add_argument("--watch-size", default="640x480", help="first-person stream frame size WxH")
+    ap.add_argument("--watch-timeout", type=float, default=15.0,
+                    help="seconds to wait per camera frame (raise for slow software renderers)")
     args = ap.parse_args()
 
     if args.watch and not args.twin:
