@@ -37,7 +37,7 @@ function shortestAngle(a, b) { let d = (b - a) % (2 * Math.PI);
 const isCamCar = (a) => !!(a && a.source && a.source.cam != null);
 
 export function createNetAgents(deps = {}) {
-  const { scene, base = '', pollMs = 120 } = deps;
+  const { scene, base = '', pollMs = 120, drapeOffsetAt = () => 0 } = deps;
   const group = new THREE.Group(); group.name = 'netagents';
   const agents = new Map();                 // id -> { object, body, mat, sprite, cur, tgt, yaw, tgtYaw, hit, data }
   const status = { server: 'connecting', count: 0, t: 0 };
@@ -160,6 +160,7 @@ export function createNetAgents(deps = {}) {
     for (const o of agents.values()) {
       o.cur.lerp(o.tgt, k);
       o.object.position.copy(o.cur);
+      o.object.position.y += drapeOffsetAt(o.cur.x, o.cur.z);   // conform onto photoreal surface
       o.yaw += shortestAngle(o.yaw, o.tgtYaw) * k;
       o.object.rotation.y = o.yaw;
     }

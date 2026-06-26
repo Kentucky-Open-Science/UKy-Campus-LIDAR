@@ -1,4 +1,4 @@
-// Street-name labels for the UKy Campus / Lexington twin.
+// Street-name labels for the Lexington Digital Twin.
 //
 // Names already live in the data: data/roads.json (campus streets, OSM names) and
 // data/city.json (the wider OSM network). This builds one upright billboard label

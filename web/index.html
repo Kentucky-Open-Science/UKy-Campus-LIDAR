@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>UKy Campus Viewer</title>
+<title>Lexington Digital Twin</title>
 <link rel="stylesheet" href="style.css">
 <script type="importmap">
 {
@@ -16,8 +16,24 @@
 <body>
 <div id="viewport"></div>
 
+<!-- Quick-access toolbar (top-center, outside the sidebar): the most-used layer toggles
+     plus a sidebar show/hide and reset. Each button mirrors the matching checkbox in the
+     sidebar (which keeps every detailed control); wired in toolbar.js. -->
+<div id="toolbar">
+  <button class="tb-btn on" id="tb-panel" title="show / hide the detailed sidebar">Panel</button>
+  <span class="tb-sep"></span>
+  <button class="tb-btn" id="tb-buildings" title="buildings">Buildings</button>
+  <button class="tb-btn" id="tb-roads" title="road network">Roads</button>
+  <button class="tb-btn" id="tb-signals" title="traffic &amp; pedestrian signals">Signals</button>
+  <button class="tb-btn" id="tb-transit" title="Lextran transit (routes, stops, live buses)">Transit</button>
+  <button class="tb-btn" id="tb-cameras" title="traffic-camera markers">Cameras</button>
+  <button class="tb-btn" id="tb-detections" title="live YOLO traffic detections">Detections</button>
+  <span class="tb-sep"></span>
+  <button class="tb-btn tb-action" id="tb-reset" title="reset the camera view">Reset view</button>
+</div>
+
 <div id="panel">
-  <h1>UKy Campus</h1>
+  <h1>Lexington Digital Twin</h1>
   <div id="manifest-status" class="status">manifest: loading&hellip;</div>
 
   <fieldset class="collapsed">
@@ -81,7 +97,7 @@
 
   <fieldset class="collapsed">
     <legend>Photorealistic 3D (Google)</legend>
-    <label class="row"><input type="checkbox" id="photoreal-visible" checked> visible</label>
+    <label class="row"><input type="checkbox" id="photoreal-visible"> visible</label>
     <label class="row">opacity
       <input type="range" id="photoreal-opacity" min="0" max="1" step="0.05" value="1">
       <span id="photoreal-opacity-val">1.00</span>
@@ -90,6 +106,7 @@
       <input type="range" id="photoreal-detail" min="1" max="32" step="1" value="4">
       <span id="photoreal-detail-val">4</span>
     </label>
+    <label class="row"><input type="checkbox" id="photoreal-adaptive" checked> adaptive quality (auto-hold ~60fps)</label>
     <label class="row"><input type="checkbox" id="photoreal-replace" checked> hide our buildings &amp; ground when on</label>
     <div class="row"><button id="photoreal-realelev" title="Reload with real terrain elevation so roads, labels and traffic sit on the photorealistic ground (in flat mode they're buried under it)">Real-elevation mode</button></div>
     <input type="text" id="photoreal-key" class="cam-filter" placeholder="Google Maps API key (Map Tiles API)&hellip;">
@@ -184,6 +201,7 @@
       <button id="cam-det-run" title="run the YOLO detector for this camera on the server — spawns live detected vehicles/pedestrians into the twin">Run&nbsp;YOLO</button>
       <button id="cam-det-toggle" title="overlay the live detection boxes on the video">Detect</button>
       <button id="cam-cal-toggle" title="calibrate this camera's sub-views to the twin">Calibrate</button>
+      <button id="cam-analysis" title="auto-assist: watch traffic ~12s, infer the flow direction per quad, and propose a calibration seed aligned to the nearest road">Analysis</button>
       <button id="cam-pip-native" title="browser picture-in-picture">PiP</button>
       <button id="cam-pip-close" title="close">&times;</button>
     </span>
@@ -197,6 +215,7 @@
     <span id="cam-cal-status">calibrate</span>
     <span class="cam-cal-actions">
       <button id="cam-cal-undo" title="remove last point">Undo</button>
+      <button id="cam-cal-accept" class="hidden" title="load the Analysis-proposed image↔scene points into this quad's calibration session, then nudge in the 3D view and Solve & Save">Accept&nbsp;seed</button>
       <button id="cam-cal-save" title="solve + save homography for this quad">Solve&nbsp;&amp;&nbsp;Save</button>
       <button id="cam-cal-spawn" title="click the video to drop a twin car (needs a calibrated quad)">Spawn&nbsp;mode</button>
       <button id="cam-cal-clearcars" title="remove cars spawned from clicks">Clear&nbsp;cars</button>
@@ -209,5 +228,6 @@
      native HLS. Classic script so window.Hls exists before the app module runs. -->
 <script src="lib/hls.min.js"></script>
 <script type="module" src="app.js"></script>
+<script type="module" src="toolbar.js"></script>
 </body>
 </html>

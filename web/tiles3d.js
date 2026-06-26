@@ -49,6 +49,13 @@ const ALIGN_FALLBACK = [
 
 const DEFAULT_CALIB = { dx: 0, dy: 0, dz: 0, yaw: 0, scaleMul: 1 };
 
+// Scratch objects for sampleGroundY() — the vertical ground probe used to drape our
+// overlays (roads/labels/traffic) onto the photoreal surface. Module-level so the probe
+// allocates nothing per call (it can run several times a second from the render loop).
+const _groundRay = new THREE.Raycaster();
+const _groundFrom = new THREE.Vector3();
+const _groundDown = new THREE.Vector3(0, -1, 0);
+
 // Resolve an API key/token without ever committing one. Priority: explicit ?gkey=,
 // then localStorage (set via the panel), then a gitignored data/photoreal.json (which
 // the twin server can populate from the GOOGLE_MAPS_API_KEY env var).
@@ -140,6 +147,7 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 	let calib = loadCalib();
 	const align = new THREE.Matrix4().fromArray(ALIGN_FALLBACK);
 	let credits = '';
+	let maxAniso = 0;   // lazily set from renderer caps; sharpens tile textures at grazing angles
 	let mode = provider === 'ion' ? 'ion' : 'google';   // 'google' | 'ion' | 'custom'
 	let gen = 0;   // build generation; guards against concurrent (re)build races
 	let serverCache = false;   // twin_server present -> route tiles through /api/gtile cache
@@ -173,11 +181,15 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 
 	function styleModel(model) {
 		const translucent = opacity < 1;
+		if (!maxAniso) { try { maxAniso = renderer.capabilities.getMaxAnisotropy() || 1; } catch (_) { maxAniso = 1; } }
 		model.traverse((o) => {
 			if (!o.material) return;
 			const mats = Array.isArray(o.material) ? o.material : [o.material];
 			for (const m of mats) {
 				m.side = THREE.DoubleSide;            // belt-and-braces vs winding/normals
+				// Max anisotropic filtering: keeps the photoreal imagery crisp at the grazing
+				// angles you see most of the city at, instead of blurring into mush.
+				if (m.map && m.map.anisotropy !== maxAniso) { m.map.anisotropy = maxAniso; m.map.needsUpdate = true; }
 				// Two-way: raising opacity back to 1 must restore opaque/depthWrite, not
 				// leave tiles stuck translucent. r160 needs needsUpdate when `transparent` flips.
 				m.transparent = translucent;
@@ -224,6 +236,21 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 		// Fidelity: errorTarget is the target screen-space error in px; lower => the
 		// renderer keeps subdividing to finer tiles (more detail, more bandwidth/memory).
 		if (detail != null) t.errorTarget = detail;
+
+		// City-scale fidelity/streaming tuning. Keep far more tiles resident so flying around
+		// doesn't constantly re-fetch (steadier detail, fewer pop-ins), stream them in with
+		// more concurrency, and never cap subdivision depth — errorTarget alone governs how
+		// fine we go. Guarded so a vendored-renderer API change can't throw the whole layer.
+		try {
+			if (t.lruCache) {
+				t.lruCache.minSize = Math.max(t.lruCache.minSize || 0, 900);
+				t.lruCache.maxSize = Math.max(t.lruCache.maxSize || 0, 1500);
+				if ('maxBytesSize' in t.lruCache) t.lruCache.maxBytesSize = Math.max(t.lruCache.maxBytesSize || 0, 6.0e8);
+			}
+			if (t.downloadQueue) t.downloadQueue.maxJobs = Math.max(t.downloadQueue.maxJobs || 0, 12);
+			if (t.parseQueue) t.parseQueue.maxJobs = Math.max(t.parseQueue.maxJobs || 0, 6);
+			t.maxDepth = Infinity;
+		} catch (_) {}
 
 		// Superseded while we were awaiting (e.g. setKey)? throw this renderer away.
 		if (disposed || myGen !== gen) { try { t.dispose(); } catch (_) {} return; }
@@ -304,6 +331,27 @@ export function createPhotorealTiles({ scene, camera, renderer, dataDir = 'data/
 		get tiles() { return tiles; },
 		get calib() { return calib; },
 		update,
+		// Probe the photoreal SURFACE elevation (scene Y) straight below (x,z), used to
+		// drape our overlays onto the Google mesh. Casts a ray straight down from high
+		// above and returns the hit whose Y is closest to `refY` — i.e. the GROUND under
+		// the point, ignoring building roofs / tree canopy (far above) and the antipodal
+		// backface of the earth-scale mesh (far below). Returns null when the layer is off
+		// or no tile is loaded there yet (caller keeps its last offset).
+		sampleGroundY(x, z, refY) {
+			if (!tiles || !enabled || !wrapper.visible) return null;
+			const ref = Number.isFinite(refY) ? refY : 0;
+			_groundFrom.set(x, ref + 4000, z);
+			_groundRay.set(_groundFrom, _groundDown);
+			const hits = _groundRay.intersectObject(wrapper, true);
+			if (!hits.length) return null;
+			let best = null, bd = Infinity;
+			for (const h of hits) {
+				if (h.point.y < ref - 2000) continue;     // skip the antipodal backface
+				const d = Math.abs(h.point.y - ref);
+				if (d < bd) { bd = d; best = h.point.y; }
+			}
+			return best;
+		},
 		setVisible(on) {
 			enabled = !!on;
 			wrapper.visible = enabled;

@@ -10,9 +10,11 @@
 // vehicle can never be at a different height than the road it's on. The campus relief
 // is intentionally discarded; restore it with ?flat=0.
 const _p = new URLSearchParams(location.search);
-// Default is now REAL elevation: the photorealistic basemap is on by default and has true
-// 3D terrain, so roads/labels/traffic must use real elevation to drape onto it (in flat
-// mode they'd be buried under the terrain). Pass ?flat=1 to restore the old single-plane
-// mode (useful when the photoreal layer is off and you want buses pinned to one height).
-export const FLAT_WORLD = _p.get('flat') === '1';
+// Default is now FLAT (no elevation): the digital twin is a clean, stylised 3D city on a
+// single ground plane — terrain, roads, ground plane, buildings, buses, agents, and camera
+// markers all share FLAT_Y, so a vehicle can never sit at a different height than its road,
+// and the whole city reads as one coherent 3D model rather than a photoreal surface. The
+// campus relief + the (now opt-in) Google photoreal basemap need real elevation: pass
+// ?flat=0 for those.
+export const FLAT_WORLD = _p.get('flat') !== '0';
 export const FLAT_Y = 285;                            // the single ground elevation (scene metres)

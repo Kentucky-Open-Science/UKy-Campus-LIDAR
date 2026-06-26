@@ -25,6 +25,7 @@ Camera feeds (c) City of Lexington, KY — personal/educational use; respect the
 import argparse
 import json
 import math
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -240,7 +241,7 @@ def tire_to_scene(H, sw, sh, x1, y1, x2, y2):
 
 class CameraDetector:
     def __init__(self, twin, camera_id, Hq, model="yolo26x.pt", conf=0.30, imgsz=640,
-                 max_det=50, publish=True, follow_active=False):
+                 max_det=50, publish=True, follow_active=False, analysis=False):
         self.twin = twin
         self.cam = camera_id
         self.Hq = Hq                  # {quad: H}
@@ -250,43 +251,92 @@ class CameraDetector:
         self.max_det = max_det
         self.publish = publish        # relay image boxes for the PiP overlay
         self.follow_active = follow_active  # only run inference while this camera is viewed
+        # analysis mode: run YOLO on EVERY quad (calibrated or not) and publish the raw
+        # image-space boxes for the PiP "Analysis" overlay, but only map+spawn scene cars
+        # for quads that actually have a homography. This lets an UNCALIBRATED camera be
+        # bootstrapped: the Analysis flow watches these raw boxes' motion to infer traffic
+        # flow and propose a calibration seed, without us spawning anything bogus.
+        self.analysis = analysis
         self.tracker = SceneTracker(twin, camera_id)
 
     def _stream_url(self):
         s = self.twin.streams().get(self.cam) or {}
         return s.get("hls")
 
-    def run(self, max_fps=8.0, stop=None, on_frame=None):
+    def run(self, max_fps=8.0, detect_interval=None, stop=None, on_frame=None):
         import cv2                       # lazy: only needed to actually stream
         from ultralytics import YOLO
         url = self._stream_url()
         if not url:
             raise SystemExit(f"no live HLS for {self.cam} — is the twin server running with the camera proxy?")
-        print(f"detector: {self.cam}  quads={sorted(self.Hq)}  model={self.model_name}")
+        # which quads to run inference on: in analysis mode, ALL four (so an uncalibrated
+        # camera still produces boxes for the whole frame); otherwise only calibrated ones.
+        quads = [0, 1, 2, 3] if self.analysis else sorted(self.Hq)
+        print(f"detector: {self.cam}  quads={quads}  calib={sorted(self.Hq)}"
+              f"  model={self.model_name}{'  [analysis]' if self.analysis else ''}")
         model = YOLO(self.model_name)
-        cap = cv2.VideoCapture(url)
         classes = list(DETECT_CLASSES)
-        frame, period = 0, (1.0 / max_fps if max_fps else 0)
-        was_idle = False
-        try:
-            while not (stop and stop()):
-                t0 = time.time()
+        # Always run YOLO on the FRESHEST frame and drop whatever piled up while the model was
+        # busy — so the twin tracks live traffic and automatically "skips more frames" exactly
+        # when the model is slower (no fixed pacing, no interpolation; the twin cars just jump
+        # to each new detection). A tiny background thread decodes the stream at its native
+        # rate into a single-slot latest-frame buffer (OpenCV + torch release the GIL, so it
+        # keeps draining during inference); this loop takes the latest frame, runs YOLO,
+        # publishes, repeats. detect_interval / max_fps, if > 0, impose an OPTIONAL minimum gap
+        # between inferences; 0 (the default) = as fast as the model can go on the live edge.
+        min_gap = (detect_interval if (detect_interval is not None and detect_interval >= 0)
+                   else (1.0 / max_fps if max_fps else 0.0))
+        latest = {"img": None, "seq": 0}
+        lk = threading.Lock()
+        grab_stop = threading.Event()
+
+        def grabber():
+            cap = cv2.VideoCapture(url)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)      # best-effort "keep only newest" hint
+            except Exception:
+                pass
+            seq = 0
+            while not grab_stop.is_set() and not (stop and stop()):
                 ok, img = cap.read()
                 if not ok or img is None:
-                    cap.release(); time.sleep(1.0); cap = cv2.VideoCapture(self._stream_url() or url); continue
+                    cap.release(); time.sleep(1.0)
+                    cap = cv2.VideoCapture(self._stream_url() or url)
+                    continue
+                seq += 1
+                with lk:
+                    latest["img"], latest["seq"] = img, seq
+            cap.release()
+
+        gth = threading.Thread(target=grabber, name=f"grab-{self.cam}", daemon=True)
+        gth.start()
+        frame, last_seq, last_infer, was_idle = 0, 0, 0.0, False
+        try:
+            while not (stop and stop()):
+                now = time.time()
                 # per-active-camera perf bounding: idle (no inference) while nobody views us
                 if self.follow_active and not self.twin.is_active(self.cam):
-                    self.tracker.update(frame, [])      # lets tracks age out -> despawn
-                    if self.publish and not was_idle:   # clear the PiP overlay on going idle
+                    self.tracker.update(frame, [])       # lets tracks age out -> despawn
+                    if self.publish and not was_idle:    # clear the PiP overlay on going idle
                         self.twin.publish_detections(self.cam, frame, [])  # else stale boxes linger up to DET_TTL
                     was_idle = True
                     frame += 1
                     time.sleep(0.4)
                     continue
                 was_idle = False
+                with lk:
+                    seq, img = latest["seq"], latest["img"]
+                # Wait for a frame NEWER than the one we already processed (and honour an
+                # optional minimum gap). Skipping straight to the latest seq is what drops
+                # every stale frame that arrived while the previous inference was running.
+                if img is None or seq == last_seq or (min_gap and (now - last_infer) < min_gap):
+                    time.sleep(0.005)
+                    continue
+                last_seq, last_infer = seq, now
                 h, w = img.shape[:2]
                 dets, raw = [], []
-                for q, H in self.Hq.items():
+                for q in quads:
+                    H = self.Hq.get(q)        # None in analysis mode for uncalibrated quads
                     col, row = q % 2, q // 2
                     sub = img[row * h // 2:(row + 1) * h // 2, col * w // 2:(col + 1) * w // 2]
                     sh, sw = sub.shape[:2]
@@ -297,6 +347,11 @@ class CameraDetector:
                         cls = int(box.cls[0])
                         raw.append({"quad": q, "box": [x1 / sw, y1 / sh, x2 / sw, y2 / sh],
                                     "cls": cls, "conf": round(float(box.conf[0]), 2)})
+                        # only map a tire point into the scene (and thus spawn a car) when this
+                        # quad is calibrated; analysis mode publishes raw boxes but spawns nothing
+                        # for uncalibrated quads (H is None).
+                        if H is None:
+                            continue
                         sc = tire_to_scene(H, sw, sh, x1, y1, x2, y2)
                         if sc:
                             dets.append({"x": sc[0], "z": sc[1], "quad": q, "cls": cls})
@@ -306,12 +361,10 @@ class CameraDetector:
                 if on_frame:
                     on_frame(frame, dets, stat, raw)
                 frame += 1
-                dt = time.time() - t0
-                if period > dt:
-                    time.sleep(period - dt)
         finally:
+            grab_stop.set()           # signal the grabber thread to stop, then wait for it
             self.tracker.clear()
-            cap.release()
+            gth.join(timeout=2.0)
 
 
 def main():
@@ -324,7 +377,12 @@ def main():
     ap.add_argument("--conf", type=float, default=0.30, help="detection confidence threshold")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--max-det", type=int, default=50)
-    ap.add_argument("--max-fps", type=float, default=8.0, help="detection pace (0 = uncapped)")
+    ap.add_argument("--max-fps", type=float, default=8.0,
+                    help="legacy detection pace cap (used only when --detect-interval < 0)")
+    ap.add_argument("--detect-interval", type=float, default=0.0,
+                    help="min seconds between YOLO inferences (default 0 = run on the freshest "
+                         "frame as fast as the model allows; stale frames are dropped so the twin "
+                         "never lags). Set e.g. 1.0 to cap GPU load. <0 falls back to --max-fps.")
     ap.add_argument("--no-publish", action="store_true",
                     help="don't relay image boxes for the PiP overlay (spawn cars only)")
     ap.add_argument("--follow-active", action="store_true",
@@ -340,7 +398,7 @@ def main():
                          imgsz=args.imgsz, max_det=args.max_det,
                          publish=not args.no_publish, follow_active=args.follow_active)
     try:
-        det.run(max_fps=args.max_fps)
+        det.run(max_fps=args.max_fps, detect_interval=args.detect_interval)
     except KeyboardInterrupt:
         print("\nstopping; clearing this camera's cars")
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Authoritative multiplayer server for the UKy campus digital twin.
+"""Authoritative multiplayer server for the Lexington Digital Twin.
 
 The twin runs HERE, on its own server. Scripts (any machine) connect over a small
 REST API to spawn agents, drive them, and read their sensors; browsers load the
@@ -153,7 +153,8 @@ ACTIVE_TTL = 12.0               # an active-camera signal is valid this long (s)
 DETECTORS = {}                  # camera_id -> {stop, thread, started, model, alive, error}
 DET_MGR_LOCK = threading.Lock()
 DETECT_MODEL = "yolo26x.pt"     # overridden by --detect-model in main()
-DETECT_MAX_FPS = 8.0            # overridden by --detect-max-fps
+DETECT_MAX_FPS = 8.0            # overridden by --detect-max-fps (legacy cap)
+DETECT_INTERVAL = 0.0          # min s between YOLO inferences; 0 = freshest frame at model speed
 DETECT_CONF = 0.30              # overridden by --detect-conf
 SERVER_BASE = None              # "http://127.0.0.1:<port>", set in main() (in-process client)
 
@@ -254,7 +255,7 @@ def _run_detector(det, stop_evt, camera):
     the server. The loop checks stop_evt each frame and clears its cars on exit."""
     err = None
     try:
-        det.run(max_fps=DETECT_MAX_FPS, stop=stop_evt.is_set)
+        det.run(max_fps=DETECT_MAX_FPS, detect_interval=DETECT_INTERVAL, stop=stop_evt.is_set)
     except (Exception, SystemExit) as e:  # noqa: BLE001 — surface to the UI, don't propagate
         err = str(e) or e.__class__.__name__
     finally:
@@ -266,7 +267,15 @@ def _run_detector(det, stop_evt, camera):
                     rec["error"] = err
 
 
-def start_detector(camera):
+# Analysis-mode detectors run alongside (never instead of) a normal detector for the same
+# camera, so we key them under a distinct slot in DETECTORS. This lets the PiP "Analysis"
+# button start/stop a raw image-space detector on an UNCALIBRATED camera without clobbering
+# (or being clobbered by) a normal "Run YOLO" detector on that same camera.
+def _det_key(camera, analysis=False):
+    return (str(camera) + "::analysis") if analysis else str(camera)
+
+
+def start_detector(camera, analysis=False):
     if SERVER_BASE is None:
         return {"error": "server base URL not set"}
     if not _have_detector_deps():
@@ -274,31 +283,39 @@ def start_detector(camera):
                          "venv that has them (e.g. the GPU detection env)"}
     from tools.camera_detect import CameraDetector, TwinClient, quad_homographies
     Hq = quad_homographies(load_calib(), camera)
-    if not Hq:
+    # Normal mode still needs at least one calibrated quad (nothing to map otherwise).
+    # Analysis mode is exactly the bootstrap case: allow an empty Hq — the detector runs
+    # YOLO on all quads and publishes raw boxes for the flow analysis, spawning nothing.
+    if not Hq and not analysis:
         return {"error": f"{camera} has no calibrated quads — calibrate it in the PiP first"}
+    key = _det_key(camera, analysis)
     with DET_MGR_LOCK:
-        rec = DETECTORS.get(camera)
+        rec = DETECTORS.get(key)
         if rec and rec.get("alive") and rec["thread"].is_alive():
-            return {"ok": True, "camera": camera, "running": True, "already": True}
+            return {"ok": True, "camera": camera, "running": True, "already": True,
+                    "analysis": analysis}
         twin = TwinClient(SERVER_BASE)
         det = CameraDetector(twin, camera, Hq, model=DETECT_MODEL, conf=DETECT_CONF,
-                             publish=True, follow_active=False)
+                             publish=True, follow_active=False, analysis=analysis)
         stop_evt = threading.Event()
-        th = threading.Thread(target=_run_detector, args=(det, stop_evt, camera),
-                              name=f"detect-{camera}", daemon=True)
-        DETECTORS[camera] = {"stop": stop_evt, "thread": th, "started": time.time(),
-                             "model": DETECT_MODEL, "alive": True, "error": None}
+        th = threading.Thread(target=_run_detector, args=(det, stop_evt, key),
+                              name=f"detect-{key}", daemon=True)
+        DETECTORS[key] = {"stop": stop_evt, "thread": th, "started": time.time(),
+                          "model": DETECT_MODEL, "alive": True, "error": None,
+                          "analysis": analysis}
         th.start()
-    return {"ok": True, "camera": camera, "running": True, "model": DETECT_MODEL}
+    return {"ok": True, "camera": camera, "running": True, "model": DETECT_MODEL,
+            "analysis": analysis}
 
 
-def stop_detector(camera):
+def stop_detector(camera, analysis=False):
+    key = _det_key(camera, analysis)
     with DET_MGR_LOCK:
-        rec = DETECTORS.get(camera)
+        rec = DETECTORS.get(key)
         if rec:
             rec["stop"].set()
             rec["alive"] = False
-    return {"ok": True, "camera": camera, "running": False}
+    return {"ok": True, "camera": camera, "running": False, "analysis": analysis}
 
 
 def stop_all_detectors():
@@ -320,24 +337,32 @@ def detector_status(camera=None):
         running = [c for c, r in DETECTORS.items() if r.get("alive") and r["thread"].is_alive()]
         return {"running": running, "model": DETECT_MODEL, "depsAvailable": _have_detector_deps()}
 
-# ---- per-type kinematic defs (scene metres), ported from web/agents.js TYPES ----
-# Footprints are deliberately a bit smaller than real-world so vehicles don't look
-# oversized against the twin's roads/buildings (≈70% scale for the larger vehicles).
+# ---- per-type kinematic defs (scene metres), aligned with web/agents.js TYPES ----
+# Footprints are REAL-WORLD sized so camera-detected (kinematic) vehicles render at a
+# believable scale against the twin's roads/buildings. L = along local +X (forward),
+# W = along +Z (width), H = up; the Agent.half / OBB footprint is derived as
+# [L/2, H/2, W/2] -- the same convention as the viewer's halfExtents. The earlier table
+# was ~70% scale (car 3.0x1.6, bus only 8.5 m), which rendered camera cars undersized
+# and the bus far short of a real ~12 m transit coach; corrected here to match
+# web/agents.js TYPES (car/truck) and realistic dimensions for the rest. The detector
+# (tools/camera_detect.py) maps COCO classes onto these keys, so every road user gets
+# its own honest footprint. wheelbase / trackWidth scale proportionally with the body so
+# the ackermann / differential turning radius stays sane at the larger sizes.
 DEFS = {
-    "car":   dict(L=3.0, W=1.6, H=1.3, wheelbase=1.9, kin="ackermann", ground=True,
+    "car":   dict(L=4.5, W=1.9, H=1.45, wheelbase=2.7, kin="ackermann", ground=True,
                   maxSpeed=25, maxAccel=6, maxSteerDeg=35),
-    "truck": dict(L=6.0, W=2.1, H=2.6, wheelbase=3.6, kin="ackermann", ground=True,
+    "truck": dict(L=8.0, W=2.5, H=3.0, wheelbase=4.8, kin="ackermann", ground=True,
                   maxSpeed=18, maxAccel=4, maxSteerDeg=28),
     # bus / motorcycle / bicycle / pedestrian: the rest of the road-user classes the
     # traffic-camera detector (tools/camera_detect.py) maps COCO detections onto, sized so
     # each renders at a believable footprint instead of a generic car box.
-    "bus":   dict(L=8.5, W=2.3, H=2.9, wheelbase=4.3, kin="ackermann", ground=True,
+    "bus":   dict(L=12.0, W=2.9, H=3.3, wheelbase=6.0, kin="ackermann", ground=True,
                   maxSpeed=18, maxAccel=3, maxSteerDeg=25),
-    "moto":  dict(L=1.8, W=0.7, H=1.4, wheelbase=1.2, kin="ackermann", ground=True,
+    "moto":  dict(L=2.2, W=0.9, H=1.3, wheelbase=1.5, kin="ackermann", ground=True,
                   maxSpeed=25, maxAccel=7, maxSteerDeg=40),
-    "bike":  dict(L=1.6, W=0.5, H=1.5, trackWidth=0.5, kin="differential", ground=True,
+    "bike":  dict(L=1.8, W=0.6, H=1.2, trackWidth=0.6, kin="differential", ground=True,
                   maxSpeed=8, maxAccel=3),
-    "ped":   dict(L=0.5, W=0.5, H=1.7, trackWidth=0.4, kin="differential", ground=True,
+    "ped":   dict(L=0.6, W=0.6, H=1.7, trackWidth=0.4, kin="differential", ground=True,
                   maxSpeed=2, maxAccel=3),
     "robot": dict(L=0.8, W=0.6, H=0.6, trackWidth=0.5, kin="differential", ground=True,
                   maxSpeed=3, maxAccel=4),
@@ -821,6 +846,35 @@ def _aabb(amin, amax, bmin, bmax):
     return (0.0, 1.0 if acz >= bcz else -1.0, oz)
 
 
+def obbObbXZ(acx, acz, aX, aZ, ahx, ahz, bcx, bcz, bX, bZ, bhx, bhz):
+    """SAT overlap of two oriented boxes on the XZ plane. Line-for-line port of
+    obbObbXZ() in web/agents.js: returns (nx, nz, pen) where the unit normal (nx,nz)
+    points from B toward A along the least-overlap (minimum-translation) axis and `pen`
+    is the penetration depth in metres, or None if the boxes are separated.
+
+    Unlike _aabb this respects each box's yaw, so it stays correct for the small per-car
+    heading jitter the camera detector produces at a stop line. aX/aZ and bX/bZ are the
+    boxes' local +X / +Z axes in the XZ plane (e.g. aX=(cos,-sin), aZ=(sin,cos))."""
+    axes = (aX, aZ, bX, bZ)
+    min_ov = math.inf
+    nx = nz = 0.0
+    dx, dz = acx - bcx, acz - bcz
+    for lx, lz in axes:
+        length = math.hypot(lx, lz) or 1.0
+        ux, uz = lx / length, lz / length
+        rA = abs(ahx * (aX[0] * ux + aX[1] * uz)) + abs(ahz * (aZ[0] * ux + aZ[1] * uz))
+        rB = abs(bhx * (bX[0] * ux + bX[1] * uz)) + abs(bhz * (bZ[0] * ux + bZ[1] * uz))
+        dist = dx * ux + dz * uz
+        ov = rA + rB - abs(dist)
+        if ov <= 0:
+            return None
+        if ov < min_ov:
+            min_ov = ov
+            sgn = 1.0 if dist >= 0 else -1.0
+            nx, nz = ux * sgn, uz * sgn
+    return (nx, nz, min_ov)
+
+
 # =====================================================================
 class World:
     def __init__(self, hz=50, max_agents=64, ground=None, buildings=None):
@@ -875,6 +929,11 @@ class World:
             for a in arr:
                 a.snap_ground(dt)
                 a.finalize(dt)
+            # Anti-clip: push overlapping footprints apart AFTER integration/ground-snap,
+            # so each rendered frame is overlap-free even though the project only does
+            # collision DETECTION (no physics response). This is the one step that pulls
+            # dense camera cars out of each other; detect() then reports the resolved poses.
+            self._separate()
             for a in arr:
                 a.detect()
             if self.kinematic_ttl:        # reap kinematic agents whose feed went silent
@@ -884,6 +943,81 @@ class World:
                         self.despawn(a.id)
             self.t += dt
             self.frame += 1
+
+    # ---- anti-clip separation (OBB minimum-translation-vector push-apart) ----
+    def _separate(self, iters=8):
+        """Resolve overlapping agent footprints by nudging each overlapping pair apart
+        along the OBB minimum-translation vector (XZ plane). A small fixed budget of
+        iterations per tick clears a dense stop-line queue in one tick and a tightly
+        packed 2D block over a few ticks (the pushes propagate outward); we don't chase
+        full convergence in a single tick because the next camera pose may move the cars
+        anyway -- the contract is only that the pose handed to detect() / the renderer is
+        overlap-free by the time the frame is read.
+
+        Kinematic camera cars ARE included (the bug was that they collided with nothing).
+        For them there is no velocity to correct, so we simply translate x/z. TRADEOFF:
+        the detector may shove a kinematic car back into an overlap on its next pose
+        update, but that pose is itself re-separated on the following tick, so every
+        frame the viewer renders is clean. Physics agents already integrate their own
+        motion; nudging their x/z directly (without touching velocity) just removes the
+        interpenetration, identical to a positional contact-resolution step.
+
+        Footprints use each agent's full half-extents (half[0]=L/2 along +X, half[2]=W/2
+        along +Z) and yaw, via the same SAT math (obbObbXZ) the detector uses. Broad-phase
+        is a uniform spatial hash so this stays cheap as the camera-car count grows; with
+        only a handful of agents the bucketing degenerates to the trivial all-pairs case.
+        """
+        arr = list(self.agents.values())
+        n = len(arr)
+        if n < 2:
+            return
+        # Precompute per-agent local axes once per tick (yaw is fixed across iterations).
+        axx = [(math.cos(a.yaw), -math.sin(a.yaw)) for a in arr]   # local +X in XZ
+        axz = [(math.sin(a.yaw), math.cos(a.yaw)) for a in arr]    # local +Z in XZ
+        # Bucket size = a generous footprint diagonal so any overlapping pair shares, or is
+        # adjacent in, the grid. Cars whose centres are further apart than this can't touch.
+        cell = 0.0
+        for a in arr:
+            cell = max(cell, a.half[0] + a.half[2])
+        cell = max(cell * 2.0, 1.0)
+        for _ in range(iters):
+            # rebuild the hash each iteration since positions shift as we push
+            buckets = {}
+            for i, a in enumerate(arr):
+                key = (int(a.x // cell), int(a.z // cell))
+                buckets.setdefault(key, []).append(i)
+            seen = set()
+            pairs = []
+            for (gx, gz), idxs in buckets.items():
+                neigh = []
+                for dgx in (-1, 0, 1):
+                    for dgz in (-1, 0, 1):
+                        neigh.extend(buckets.get((gx + dgx, gz + dgz), ()))
+                for i in idxs:
+                    for j in neigh:
+                        if j <= i:
+                            continue
+                        pk = (i, j)
+                        if pk in seen:
+                            continue
+                        seen.add(pk)
+                        pairs.append(pk)
+            moved = False
+            for i, j in pairs:
+                a, b = arr[i], arr[j]
+                r = obbObbXZ(a.x, a.z, axx[i], axz[i], a.half[0], a.half[2],
+                             b.x, b.z, axx[j], axz[j], b.half[0], b.half[2])
+                if not r:
+                    continue
+                nx, nz, pen = r          # unit normal points from b toward a
+                if pen <= 1e-9:
+                    continue
+                push = 0.5 * pen          # split the penetration 50/50 between the pair
+                a.x += nx * push; a.z += nz * push
+                b.x -= nx * push; b.z -= nz * push
+                moved = True
+            if not moved:
+                break
 
     def snapshot(self):
         with self.lock:
@@ -1281,6 +1415,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def end_headers(self):
+        # Dev caching policy: never cache the viewer's static assets, so live edits to
+        # web/*.js / *.html show up on a normal reload. ES modules cache aggressively, which
+        # otherwise pins the page to a stale build (e.g. flat-mode/drape edits not taking
+        # effect). API / tile / JPEG responses set their own Cache-Control, so skip those.
+        try:
+            if not self.path.startswith("/api/"):
+                self.send_header("Cache-Control", "no-store")
+        except Exception:
+            pass
+        super().end_headers()
+
     def _json(self, obj, status=200):
         # allow_nan=False: a stray NaN/inf would serialize to a bare `NaN` token that
         # browser JSON.parse rejects, silently breaking the viewer's poll. Refuse it
@@ -1647,7 +1793,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             b = self._body(); cam = b.get("camera")
             if not cam:
                 return self._json({"error": "need camera"}, 400)
-            return self._json(start_detector(cam) if b.get("on") else stop_detector(cam))
+            # analysis=true -> raw image-space detector for the PiP Analysis bootstrap (runs
+            # on an uncalibrated camera, alongside any normal detector for the same camera).
+            ana = bool(b.get("analysis"))
+            return self._json(start_detector(cam, analysis=ana) if b.get("on")
+                              else stop_detector(cam, analysis=ana))
         if WORLD is None and path.startswith("/api/world"):
             return self._json({"error": "world not running"}, 503)
         if path == "/api/world/spawn":
@@ -1720,7 +1870,7 @@ def make_server(port, directory=WEB):
 
 
 def main():
-    global WORLD, RENDER, PROXY, CAMERAS, DETECT_MODEL, DETECT_MAX_FPS, DETECT_CONF, SERVER_BASE
+    global WORLD, RENDER, PROXY, CAMERAS, DETECT_MODEL, DETECT_MAX_FPS, DETECT_INTERVAL, DETECT_CONF, SERVER_BASE
     load_dotenv()   # pick up GOOGLE_MAPS_API_KEY etc. from a gitignored .env
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8000)
@@ -1743,12 +1893,17 @@ def main():
                     help="YOLO weights for in-process per-camera detection (POST /api/cameras/detect). "
                          "Default yolo26x (largest/most accurate); needs ultralytics+opencv in the server's venv.")
     ap.add_argument("--detect-max-fps", type=float, default=8.0,
-                    help="detection pace per camera (frames/s)")
+                    help="legacy per-camera pace cap (used only when --detect-interval < 0)")
+    ap.add_argument("--detect-interval", type=float, default=0.0,
+                    help="min seconds between YOLO inferences per camera (default 0 = run on the "
+                         "freshest frame at model speed; stale frames are dropped so the twin never "
+                         "lags). Set e.g. 1.0 to cap GPU load.")
     ap.add_argument("--detect-conf", type=float, default=0.30,
                     help="detection confidence threshold")
     args = ap.parse_args()
     DETECT_MODEL = args.detect_model
     DETECT_MAX_FPS = args.detect_max_fps
+    DETECT_INTERVAL = args.detect_interval
     DETECT_CONF = args.detect_conf
     SERVER_BASE = f"http://127.0.0.1:{args.port}"   # in-process detector talks to ourselves
 
@@ -1773,7 +1928,7 @@ def main():
                "  ->  /api/transit/(vehicles|trips|alerts|meta)")
     cameras = ("off (--no-cameras)" if args.no_cameras else
                "LIVE (trafficvid.lexingtonky.gov)  ->  /api/cameras/(streams|meta)")
-    print(f"\nUKy campus twin server — authoritative shared world + live transit + traffic cameras")
+    print(f"\nLexington Digital Twin server — authoritative shared world + live transit + traffic cameras")
     print(f"  viewer:  http://localhost:{args.port}/")
     print(f"  world:   http://localhost:{args.port}/api/world/(state|meta|spawn|agents/<id>/...)")
     print(f"  transit: {transit}")

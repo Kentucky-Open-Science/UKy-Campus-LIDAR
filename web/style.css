@@ -237,6 +237,10 @@ code { color: #ffcf5e; }
 .cam-cal-bar button:hover { background: #335272; }
 #cam-cal-toggle.active, #cam-cal-spawn.active, #cam-det-toggle.active { background: #2f7d52; border-color: #49b07a; }
 #cam-det-run.active { background: #7d2f2f; border-color: #b04949; }   /* detector live (red) */
+#cam-analysis.running { background: #2f5a7d; border-color: #4a8fc0; }  /* analysis collecting (blue) */
+#cam-analysis.ready { background: #7d662f; border-color: #c0a04a; }    /* analysis has a proposal (amber) */
+#cam-cal-accept.hidden { display: none; }
+#cam-cal-accept { background: #2f5a7d; border-color: #4a8fc0; }
 /* a clearer grab affordance at the resize corner */
 .cam-pip::after {
   content: ''; position: absolute; right: 2px; bottom: 2px;
@@ -268,3 +272,44 @@ code { color: #ffcf5e; }
 }
 #drive-hint b { color: #ffcf5e; }
 #drive-hint.hidden { display: none; }
+
+/* External quick-access toolbar (top-center) — mirrors the most-used sidebar toggles.
+   Matches the glassy panel look; active layers light up green like the camera toggles. */
+#toolbar {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 8px;
+  background: rgba(16, 20, 26, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  backdrop-filter: blur(4px);
+  z-index: 6;
+  user-select: none;
+  max-width: calc(100vw - 24px);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.tb-btn {
+  background: rgba(45, 74, 102, 0.45);
+  color: #c6d0da;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 12px;
+  line-height: 1.3;
+  cursor: pointer;
+}
+.tb-btn:hover { background: rgba(58, 94, 128, 0.75); color: #fff; }
+.tb-btn.on {                       /* layer is visible */
+  background: #2f7d52;
+  border-color: #49b07a;
+  color: #fff;
+}
+.tb-action { background: #2d4a66; color: #e8e8e8; }
+.tb-action:hover { background: #3a5e80; color: #fff; }
+.tb-sep { width: 1px; height: 18px; background: rgba(255, 255, 255, 0.16); margin: 0 3px; }
