@@ -1,4 +1,4 @@
-// City-scale OSM context for the UKy Campus digital twin.
+// City-scale OSM context for the Lexington Digital Twin.
 //
 // The LiDAR/terrain only covers the ~2x3 km campus core, but the Lextran bus
 // network spans ~18x16 km of Lexington. city.js lays down the rest of the city as

@@ -1,4 +1,4 @@
-# UKy Campus — Interactive 3D Viewer
+# Lexington Digital Twin — Interactive 3D Viewer
 
 Extract UE 4.24.3 UKy Campus LiDAR point cloud + DTM terrain tiles + aerial
 imagery into open formats and view them in an interactive Three.js web viewer
@@ -228,6 +228,16 @@ the old single-plane mode). Tiles are **streamed live from the Map Tiles API at 
 fidelity** the data supports — the **detail** slider sets the target screen-space error in
 pixels (lower = sharper, more tiles; default **4**, drop to **1–2** for maximum detail or
 raise it for performance) and LOD refines as you zoom in.
+
+**Draping overlays onto the mesh.** Our overlays (road ribbons, lane markings, signals,
+street labels, buses, and traffic-camera/YOLO cars) are baked at our DTM/LiDAR elevation
+(NAVD88-ish), while Google's mesh sits on the WGS84 ellipsoid — tens of metres higher here,
+and the gap varies across the city (geoid + a terrain-source mismatch). So when the
+photoreal layer is on, the viewer samples that vertical gap at the camera's look-at point
+each frame (a downward raycast against the mesh vs. our ground) and lifts the overlay
+groups onto the Google surface, eased so panning across relief stays smooth. Without it the
+overlays sink under the mesh. It's automatic; it turns off (eases back to our own terrain)
+when the photoreal layer is off or in `?flat=1` mode.
 
 **Tile caching.** When served by `tools.twin_server` the viewer routes tile fetches through
 a bounded on-disk cache proxy (`/api/gtile` → `web/data/tilecache/`, gitignored,

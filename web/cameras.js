@@ -1,4 +1,4 @@
-// Live traffic-camera layer for the UKy Campus digital twin.
+// Live traffic-camera layer for the Lexington Digital Twin.
 //
 // Mirrors transit.js's two-half split:
 //   STATIC — each city traffic camera snapped to the twin intersection it watches,

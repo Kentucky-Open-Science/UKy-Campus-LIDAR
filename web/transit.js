@@ -1,4 +1,4 @@
-// Live Lextran transit layer for the UKy Campus digital twin.
+// Live Lextran transit layer for the Lexington Digital Twin.
 //
 // Two halves, mirroring the house style of roads.js (data-driven scene build) and
 // agents.js (a deterministic, frame-ticked controller exposed on window.__twin):
@@ -26,10 +26,12 @@
 // into the render loop.
 
 import * as THREE from 'three';
+import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 // ---- module-level scratch (no per-frame allocation; roads.js idiom) ----
 const D2R = Math.PI / 180;
-const BUS_LIFT = 0.35;          // wheels sit just above the road ribbon (LIFT 0.30)
+const BUS_LIFT = 0.05;          // box body (no wheel mesh) sits flush on the road ribbon
+                                // (its bottom is +0.3 inside the root, so +0.05 here ≈ road LIFT 0.30)
 const ROUTE_LIFT = 2.8;         // route lines float this far above cityGroundY. The road
                                 // asphalt rides ~2.3 m above the ground plane (placeholder
                                 // terrain + road LIFT), so one flat height here clears it
@@ -58,6 +60,7 @@ export function createTransitSystem(deps = {}) {
   const {
     scene, dataDir = 'data/', proxyBase = '', groundY: cityGroundY = 285,
     groups = {}, pollMs = 4000, slowPollMs = 15000,
+    drapeOffsetAt = () => 0,   // photoreal ground-conform offset at (x,z); 0 when off
   } = deps;
 
   const group = new THREE.Group(); group.name = 'transit';
@@ -124,6 +127,7 @@ export function createTransitSystem(deps = {}) {
     return _hm;
   }
   function groundY(x, z) {
+    if (FLAT_WORLD) return FLAT_Y;   // flat mode: one ground everywhere, matching roads/agents
     const hm = heightmap();
     if (!hm) return null;
     const cx = ((x - hm.minX) / CELL) | 0, cz = ((z - hm.minZ) / CELL) | 0;
@@ -156,7 +160,9 @@ export function createTransitSystem(deps = {}) {
     const N_LANES = 7, LANE = 1.0;        // lateral lanes (m apart) so routes that share a
                                           // street draw as parallel ribbons instead of one
                                           // coplanar pile that fights itself.
-    const routeY = cityGroundY + ROUTE_LIFT;   // ONE flat height, clear of the asphalt
+    // Flat mode: routes sit just above the flat road (no terrain to clear). Real-elevation:
+    // keep the big lift that clears varying terrain + the road LIFT everywhere.
+    const routeY = cityGroundY + (FLAT_WORLD ? 0.4 : ROUTE_LIFT);
     const positions = [], colors = [], index = [];
     let base = 0, ri = 0;
     for (const rt of routes) {
@@ -216,7 +222,8 @@ export function createTransitSystem(deps = {}) {
     const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(1, 1, 1), p = new THREE.Vector3();
     list.forEach((st, i) => {
       stops.push(st); stopsById.set(st.id, st);
-      const [x, y, z] = st.pos;
+      const [x, y0, z] = st.pos;
+      const y = FLAT_WORLD ? FLAT_Y : y0;   // flat mode: stops sit on the flat ground
       poles.setMatrixAt(i, m.compose(p.set(x, y + STOP_LIFT + 1.2, z), q, s));
       signs.setMatrixAt(i, m.compose(p.set(x, y + STOP_LIFT + 2.0, z), q, s));
     });
@@ -386,7 +393,7 @@ export function createTransitSystem(deps = {}) {
       // elevation (the old `refGroundY = gy`), or every off-campus bus would snap to
       // whatever height the last on-campus bus happened to be at and float/sink.
       const y = (gy != null ? gy : (bus.lastGroundY != null ? bus.lastGroundY : refGroundY)) + BUS_LIFT;
-      bus.object.position.set(bus.cur.x, y, bus.cur.z);
+      bus.object.position.set(bus.cur.x, y + drapeOffsetAt(bus.cur.x, bus.cur.z), bus.cur.z);
       bus.yaw += shortestAngle(bus.yaw, bus.tgtYaw) * k;
       bus.object.rotation.y = bus.yaw;
     }

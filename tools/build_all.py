@@ -30,7 +30,7 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
                    skip_pack=False, with_city=False, with_transit=False):
     """Run extraction steps (these may be no-ops if data already exists)."""
     print('=' * 60)
-    print(' UKy Campus — full data extraction pipeline')
+    print(' Lexington Digital Twin — full data extraction pipeline')
     print('=' * 60)
 
     if not skip_textures:
@@ -152,7 +152,7 @@ def merge_manifests():
             buildings['total_mesh_bytes'] = bld_manifest['total_mesh_bytes']
 
     manifest = {
-        'title': 'UKy Campus — extracted from UE 4.24.3 editor assets',
+        'title': 'Lexington Digital Twin — extracted from UE 4.24.3 editor assets',
         'origin_cm': origin_cm,
         'coordinate_note': scene_manifest.get('coordinate_note',
             'UE world centimeters, Z-up. Converted to Three.js meters Y-up on load.'),

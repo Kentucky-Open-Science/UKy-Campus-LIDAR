@@ -1,4 +1,4 @@
-# UKy Campus — web viewer
+# Lexington Digital Twin — web viewer
 
 Three.js viewer for the terrain tiles + LiDAR point cloud extracted from the
 UE 4.24 packages. Pure static files; no build step.

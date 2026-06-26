@@ -1,4 +1,4 @@
-"""Python client for the UKy campus digital-twin server (tools/twin_server.py).
+"""Python client for the Lexington Digital Twin server (tools/twin_server.py).
 
 The twin runs on its own server; your script talks to it over a small REST API. The
 world is SHARED — `twin.agents()` returns every agent currently in the world, including

@@ -1,4 +1,4 @@
-// Autonomous-agent simulation layer for the UKy Campus digital twin.
+// Autonomous-agent simulation layer for the Lexington Digital Twin.
 //
 // Spawn controllable agents (car | truck | robot | drone) on the scene and drive
 // them from user code, reading back four sensors:

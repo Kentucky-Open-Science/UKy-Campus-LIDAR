@@ -1,4 +1,4 @@
-// UKy Campus viewer — works against the shared data contract (see README.md).
+// Lexington Digital Twin viewer — works against the shared data contract (see README.md).
 // Data may not exist yet; every layer loads gracefully and reports status.
 //
 // Coordinates: source data is UE world space (centimeters, Z-up, left-handed).
@@ -13,10 +13,13 @@ import { createRoadNetwork } from './roads.js';
 import { createAgentSystem } from './agents.js';
 import { createTransitSystem } from './transit.js';
 import { createCameraSystem } from './cameras.js';
+import { createCameraAnalysis } from './camanalysis.js';
+import { solveHomography, applyHomography } from './homography.js';
 import { createCitySystem } from './city.js';
 import { createStreetLabels } from './labels.js';
 import { createNetAgents } from './netagents.js';
 import { createPhotorealTiles } from './tiles3d.js';
+import { createDrapeField } from './drape.js';
 import { FLAT_WORLD, FLAT_Y } from './flat.js';
 
 // ---------------------------------------------------------------- config ---
@@ -61,6 +64,7 @@ const state = {
   roadnet: null,       // real road network + props from roads.json (roads.js)
   city: null,          // city-wide OSM ground plane + streets (city.js)
   cityRoads: null,     // raw city.json roads (for street labels)
+  rawRoads: null,      // raw roads.json centrelines [x,y,z] (camera flow-analysis seed)
   labels: null,        // street-name labels (labels.js)
   netagents: null,     // shared-world agents from the twin server (netagents.js)
   transit: null,       // live Lextran transit layer (transit.js)
@@ -158,6 +162,14 @@ state.photoreal = createPhotorealTiles({
   scene, camera, renderer, dataDir: DATA_DIR,
   onStatus: (s) => { const n = $('photoreal-status'); if (n) setStatus(n, 'photoreal: ' + s); },
   onCredits: (c) => { const n = $('photoreal-credits'); if (n) n.textContent = c; },
+});
+
+// Streaming ground-conform field: rebases overlays onto the Google photoreal surface
+// per-location — replaces the old single global vertical offset that left everything
+// floating away from the camera focus. See drape.js. No-op until photoreal is enabled.
+state.drape = createDrapeField({
+  getOurGroundY: (x, z) => ourGroundY(x, z),
+  getPhotoreal: () => state.photoreal,
 });
 
 // ------------------------------------------------------------ coordinates ---
@@ -935,6 +947,19 @@ async function loadRoads() {
 
   state.roadnet = createRoadNetwork(data, { trees: false, cars: false, signalModel });
   scene.add(state.roadnet.group);
+  // Keep the raw campus centrelines ([x,y,z]) for the camera flow-analysis tool, which
+  // borrows the nearest road heading near a camera to seed a calibration (see camanalysis.js).
+  state.rawRoads = data.roads || [];
+
+  // Conform the road network (ribbons, lane markings, crosswalks, intersection pads,
+  // signals + props) onto the photoreal surface: cache its baked geometry in the drape
+  // field and size the field grid to the network's extent. The field then lifts each
+  // vertex onto Google's mesh as tiles stream in (no-op until photoreal is enabled).
+  if (state.drape) {
+    state.drape.registerTree(state.roadnet.group);
+    const _bb = new THREE.Box3().setFromObject(state.roadnet.group);
+    if (Number.isFinite(_bb.min.x)) state.drape.setBounds(_bb.min.x, _bb.min.z, _bb.max.x, _bb.max.z);
+  }
 
   // City-wide OSM context (flat ground plane + the full street network) so the
   // entire Lextran service area has ground + streets beyond the ~2x3 km campus
@@ -950,6 +975,7 @@ async function loadRoads() {
   // (cityGroundY) once they roam past the campus tiles.
   state.transit = createTransitSystem({
     scene, dataDir: DATA_DIR, proxyBase: '', groundY: cityGroundY,
+    drapeOffsetAt: (x, z) => (state.drape ? state.drape.offsetAt(x, z) : 0),
     groups: {
       terrain: state.terrain.group,
       roadRibbons: () => state.roadnet && state.roadnet.layers.roads,
@@ -983,6 +1009,7 @@ async function loadRoads() {
   // renders every agent in the shared world, including ones spawned by other clients'
   // scripts. Backs off to nothing when the page isn't served by the twin server.
   state.netagents = createNetAgents({ scene, base: '', pollMs: 120,
+    drapeOffsetAt: (x, z) => (state.drape ? state.drape.offsetAt(x, z) : 0),
     camCarsVisible: $('road-cars') ? $('road-cars').checked : true,        // Roads & props "cars" toggle
     camLabelsVisible: $('road-car-labels') ? $('road-car-labels').checked : true });
   const naCb = $('netagents-visible');
@@ -1156,6 +1183,7 @@ $('photoreal-detail')?.addEventListener('input', (e) => {
   const v = parseFloat(e.target.value);
   $('photoreal-detail-val').textContent = String(v);
   if (state.photoreal) state.photoreal.setDetail(v);   // lower px err = higher fidelity
+  const a = $('photoreal-adaptive'); if (a) a.checked = false;   // manual drag = stop auto-FPS
 });
 // The photorealistic mesh has REAL elevation; in flat mode our overlays are pinned to
 // FLAT_Y and get buried under it. This reloads in real-elevation mode (?flat=0) with the
@@ -1188,10 +1216,11 @@ state.photoreal?.probeKey?.().then((r) => {
     $('photoreal-key').placeholder = 'key loaded from .env — just tick "visible"';
   }
 }).catch(() => {});
-// Photorealistic basemap is ON by default (stream Google tiles + overlays on initial
-// load); pass ?photoreal=0 to start with it off. Tiles are pulled LIVE from the Map Tiles
-// API using a server/.env key (or one entered in the panel); degrades gracefully if none.
-if (params.get('photoreal') !== '0') {
+// Photorealistic Google-tiles basemap is OFF by default — the twin ships as the stylised
+// flat 3D city. Opt in with ?photoreal=1 (best with ?flat=0 for real elevation) or tick
+// "visible" in the panel. Tiles stream LIVE from the Map Tiles API using a server/.env key;
+// the layer (tiles3d.js) and the ground-conform field (drape.js) are retained but dormant.
+if (params.get('photoreal') === '1') {
   const cb = $('photoreal-visible');
   if (cb) cb.checked = true;
   if (state.photoreal) state.photoreal.setVisible(true);
@@ -1463,6 +1492,34 @@ const camCal = (() => {
   let detectTimer = null, lastDets = [], lastDetMeta = null, _detSig = '';
   const clickCars = [];            // [{id,x,z}] kinematic cars from clicks
   let heartbeat = null;
+  // Auto-analysis: watch the detector's boxes for ~12 s, infer per-quad traffic flow, and
+  // propose a road-aligned calibration seed (see camanalysis.js). Pure overlay + a proposal
+  // the user Accepts into the calibration session; never spawns or persists on its own.
+  const analysis = createCameraAnalysis({
+    homography: { solveHomography, applyHomography },
+    // both road sources: campus centrelines ([x,y,z]) + the city street net ([x,z]). The
+    // nearestRoad scanner reads x=pt[0], z=pt[last], so the differing element counts are fine.
+    getRoads: () => [...(state.rawRoads || []), ...(state.cityRoads || [])],
+    getDetections: async (camId) => {
+      const r = await fetch(`/api/cameras/detections?camera=${encodeURIComponent(camId)}`, { cache: 'no-store' });
+      return r.json();
+    },
+    cameraOf: (camId) => (api() ? api().get(camId) : null),
+    // Bootstrap an UNCALIBRATED camera: start/stop a raw image-space (analysis-mode) YOLO
+    // detector on the server so Analysis has boxes to watch even with zero calibration. The
+    // analysis:true flag keeps this detector in its own server slot, so it never clobbers (or
+    // is clobbered by) a normal "Run YOLO" detector for the same camera — and stopping it
+    // leaves any normal detector untouched.
+    startDetector: (camId) => fetch('/api/cameras/detect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ camera: camId, on: true, analysis: true }),
+    }).then((r) => r.json()),
+    stopDetector: (camId) => fetch('/api/cameras/detect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ camera: camId, on: false, analysis: true }),
+    }).then((r) => r.json()),
+  });
+  let analysisProposal = null;     // last proposal (per-quad {pairs,H,road}) for Accept + overlay
   // class colours/names match tools/camera_detect.py CLASS_COLOR / DETECT_CLASSES
   const CLS_COLOR = { 0: '#e25fae', 1: '#4aa05a', 2: '#27c4c4', 3: '#c77f2a', 5: '#e0a83a', 7: '#8e6bd0' };
   const CLS_NAME = { 0: 'ped', 1: 'bike', 2: 'car', 3: 'moto', 5: 'bus', 7: 'truck' };
@@ -1541,19 +1598,67 @@ const camCal = (() => {
     });
     if (s.pendingImg) { const [fu, fv] = fullOf(s.quad, s.pendingImg[0], s.pendingImg[1]); const [px, py] = toPx(cb, fu, fv);
       g.fillStyle = '#ffd23a'; g.beginPath(); g.arc(px, py, 6, 0, 7); g.fill(); }
+    drawAnalysis(g, cb);
+  }
+
+  // Overlay the inferred traffic flow (arrows, image space) + the proposed correspondence
+  // image points. Drawn whenever a proposal exists, on top of the calibration overlay, so
+  // the user sees WHY a seed was suggested and where the points sit before accepting.
+  function drawAnalysis(g, cb) {
+    const arrows = analysis.arrows();
+    if (arrows && arrows.length) {
+      for (const ar of arrows) {
+        const [fu, fv] = fullOf(ar.quad, ar.mid[0], ar.mid[1]);
+        const [x, y] = toPx(cb, fu, fv);
+        // arrow length scales with the displayed quad size so it reads at any panel size
+        const L = Math.min(cb.dispW, cb.dispH) * 0.12 * (ar.primary ? 1 : 0.8);
+        // image dir is in quad-local units; the quad maps to half the content box in each
+        // axis, so scale x and y by dispW/2 and dispH/2 to keep the on-screen angle correct
+        let ex = ar.dir[0] * (cb.dispW * 0.5), ey = ar.dir[1] * (cb.dispH * 0.5);
+        const el2 = Math.hypot(ex, ey) || 1; ex = ex / el2 * L; ey = ey / el2 * L;
+        g.strokeStyle = ar.color; g.fillStyle = ar.color; g.lineWidth = ar.primary ? 3 : 2;
+        g.beginPath(); g.moveTo(x, y); g.lineTo(x + ex, y + ey); g.stroke();
+        // arrowhead
+        const ang = Math.atan2(ey, ex), hs = 7;
+        g.beginPath(); g.moveTo(x + ex, y + ey);
+        g.lineTo(x + ex - hs * Math.cos(ang - 0.4), y + ey - hs * Math.sin(ang - 0.4));
+        g.lineTo(x + ex - hs * Math.cos(ang + 0.4), y + ey - hs * Math.sin(ang + 0.4));
+        g.closePath(); g.fill();
+      }
+    }
+    // proposed image points (faint squares) so the user previews the seed before Accept
+    if (analysisProposal && analysisProposal.quads) {
+      g.lineWidth = 1.5; g.strokeStyle = 'rgba(74,143,192,0.9)';
+      for (const q of Object.keys(analysisProposal.quads)) {
+        const pr = analysisProposal.quads[q];
+        for (const p of (pr.pairs || [])) {
+          const [fu, fv] = fullOf(Number(q), p.img[0], p.img[1]);
+          const [x, y] = toPx(cb, fu, fv);
+          g.strokeRect(x - 4, y - 4, 8, 8);
+        }
+      }
+    }
   }
 
   function showBars() {
-    const anyMode = mode || spawn || detect;
+    const running = analysis.isRunning();
+    const haveProposal = !!analysisProposal;
+    // the calibration bar (which holds Accept seed) is also useful when analysis is running
+    // or has produced a proposal, even before the user enters Calibrate mode.
+    const anyMode = mode || spawn || detect || running || haveProposal;
     $('cam-cal-bar')?.classList.toggle('hidden', !anyMode);
     overlay?.classList.toggle('hidden', !anyMode);
     $('cam-cal-toggle')?.classList.toggle('active', mode);
     $('cam-cal-spawn')?.classList.toggle('active', spawn);
     $('cam-det-toggle')?.classList.toggle('active', detect);
+    $('cam-analysis')?.classList.toggle('running', running);
+    $('cam-analysis')?.classList.toggle('ready', !running && haveProposal);
+    $('cam-cal-accept')?.classList.toggle('hidden', !haveProposal);
     draw();
   }
   function reset() {
     mode = false; spawn = false; stopDetect();
+    analysis.stop(); analysisProposal = null;     // drop any in-flight analysis + its proposal
     // Tear down click-spawned cars + their keep-alive heartbeat on PiP close / camera
     // switch — otherwise the 2 s heartbeat keeps re-posing orphaned cars forever (the
     // user can no longer see or clear them once the PiP is closed).
@@ -1598,6 +1703,63 @@ const camCal = (() => {
     if (!pip.id || !api()) return;
     spawn = !spawn; if (spawn) mode = false;
     calStatus(spawn ? 'spawn: click the video where a car is (the quad must be calibrated)' : 'spawn off');
+    showBars();
+  }
+  // ---- Analysis: auto-assist calibration from observed traffic flow ----
+  // Self-contained bootstrap for a COLD, uncalibrated camera: starts a raw image-space
+  // (analysis-mode) YOLO detector on the server (via the analysis controller's startDetector
+  // dep), watches its published boxes for ~12 s with a live countdown, infers the dominant
+  // flow direction(s) per quad (image space), overlays them as arrows, and — if the camera
+  // maps near a road — proposes a road-aligned image->scene correspondence the user can Accept
+  // into calibration. No prior Run YOLO / calibration needed. It stops the detector it started
+  // on finish or cancel (leaving any normal detector untouched). Re-clicking while running
+  // cancels. If YOLO can't run (no GPU/deps on the server) it degrades to a clear status.
+  function enterAnalysis() {
+    if (!pip.id) return;
+    if (analysis.isRunning()) { analysis.stop(); calStatus('analysis: cancelled'); showBars(); return; }
+    if (!detect) enterDetect();         // surface the live boxes too while we watch (visual)
+    analysisProposal = null;
+    analysis.start(pip.id, {
+      durationMs: 12000,
+      onUpdate: (vw) => {
+        calStatus(vw.status);
+        if (!vw.running) {              // finished: stash the proposal, light up Accept
+          analysisProposal = vw.proposal || null;
+        }
+        showBars();                     // refreshes arrows + button states each tick
+      },
+    });
+    showBars();
+  }
+  // Load the proposed (image, scene) correspondences for every proposed quad into the
+  // calibration session so the user can review/nudge in the 3D view, then Solve & Save.
+  // We seed ONE quad per Accept (the calib session is single-quad); if several quads were
+  // proposed we take the one with the most points and tell the user to re-Accept for the rest.
+  function acceptSeed() {
+    const a = api(); if (!a || !analysisProposal) return;
+    const quads = analysisProposal.quads || {};
+    const entries = Object.entries(quads).filter(([, q]) => q.pairs && q.pairs.length >= 1);
+    if (!entries.length) { calStatus('analysis: nothing to accept — no on-road seed was produced'); return; }
+    entries.sort((x, y) => (y[1].pairs.length - x[1].pairs.length));
+    const [quadStr, pr] = entries[0];
+    const quad = Number(quadStr);
+    // Re-begin a clean session and inject the seed pairs directly. addImagePoint locks the
+    // quad from the first point's full-frame coords, so we feed each pair as (image -> scene).
+    a.calib.begin(pip.id);
+    let added = 0;
+    for (const p of pr.pairs) {
+      const [fu, fv] = fullOf(quad, p.img[0], p.img[1]);     // quad-local -> full-frame for the API
+      const ai = a.calib.addImagePoint(fu, fv);
+      if (ai && ai.error) continue;                          // skip a point that fell in another quad
+      const as = a.calib.addScenePoint(p.scene[0], p.scene[1]);
+      if (!as.error) added++;
+    }
+    mode = true; spawn = false;                              // enter Calibrate so clicks edit the seed
+    const n = a.calib.session().pairs.length;
+    const more = entries.length - 1;
+    calStatus(`seed loaded: quad ${quad}, ${n} point(s)${more ? ` (+${more} more quad(s) — Accept again after Solve & Save)` : ''}. ` +
+      `Drag-free: click a video point then its 3D spot to refine, or just Solve & Save.`);
+    // keep the proposal so the on-video preview squares stay until the user saves/cancels
     showBars();
   }
   async function save() {
@@ -1661,6 +1823,8 @@ const camCal = (() => {
   });
   $('cam-det-toggle')?.addEventListener('click', enterDetect);
   $('cam-cal-toggle')?.addEventListener('click', enterCalibrate);
+  $('cam-analysis')?.addEventListener('click', enterAnalysis);
+  $('cam-cal-accept')?.addEventListener('click', acceptSeed);
   $('cam-cal-spawn')?.addEventListener('click', enterSpawn);
   $('cam-cal-save')?.addEventListener('click', save);
   $('cam-cal-undo')?.addEventListener('click', () => { api() && api().calib.undo(); draw(); calStatus('removed last point'); });
@@ -1670,6 +1834,7 @@ const camCal = (() => {
   if (typeof ResizeObserver !== 'undefined' && overlay) new ResizeObserver(() => draw()).observe(overlay);
 
   return { active: () => mode, spawning: () => spawn, detecting: () => detect,
+           analyzing: () => analysis.isRunning(), analysis,
            onScenePoint, reset, _draw: draw, _dets: () => lastDets,
            // surfaces feedback when a calibration scene-click missed the ground
            noGround: () => calStatus('clicked off the ground — aim at the road surface in the 3D view') };
@@ -2264,6 +2429,78 @@ let frames = 0;
 let fpsTimer = performance.now();
 const clock = new THREE.Clock();
 
+// --------------------------------------------- drape overlays onto photoreal ---
+// Our overlays (road ribbons + lane markings + signals, street labels, buses, shared-
+// world/YOLO cars, camera markers, LiDAR) are baked at OUR DTM/LiDAR elevation
+// (NAVD88-ish). Google's photorealistic mesh sits on the WGS84 ellipsoid — tens of metres
+// higher here, and the gap VARIES with location (geoid + terrain-source mismatch + the
+// alignment fit's own residual), so a single global lift can only make the two surfaces
+// coincide at ONE point and leaves everything else floating or sunk.
+//
+// The fix lives in drape.js: a streaming ground-conform FIELD that samples the gap
+// (Google ground minus our ground, via downward rays) on a coarse grid, settles each
+// cell against LOD streaming, and rebases each overlay by the LOCALLY interpolated gap.
+// The road network conforms per-vertex (so hills/overpasses keep their relative profile),
+// buses + shared-world cars sample the field per-object, and the agent sim ground-snaps
+// onto the now-conformed road ribbons on its own (see agents.js). updateDrape() just
+// drives the field each frame and rides the sparse point layers (LiDAR/labels/cameras) on
+// a single focus-sampled offset. ourGroundY() is the per-(x,z) probe of OUR baking surface.
+const _drapeRay = new THREE.Raycaster();
+const _drapeFrom = new THREE.Vector3();
+const _drapeDown = new THREE.Vector3(0, -1, 0);
+function ourGroundY(x, z) {
+  _drapeFrom.set(x, 6000, z);
+  _drapeRay.set(_drapeFrom, _drapeDown);
+  // raycast our DTM terrain first (matches the road baking), then the city ground plane;
+  // both are hit even when hidden by "replace" (the raycaster ignores .visible).
+  for (const s of [state.terrain, state.city]) {
+    if (s && s.group) { const h = _drapeRay.intersectObject(s.group, true); if (h.length) return h[0].point.y; }
+  }
+  return null;
+}
+// Drive the streaming ground-conform field each frame (drape.js). The field rebases the
+// road network PER-VERTEX and buses / shared-world cars PER-OBJECT onto Google's mesh as
+// tiles stream in; the driving-agent sim ground-snaps onto the now-conformed road ribbons
+// on its own (it raycasts the real, lifted geometry). LiDAR / labels / camera markers are
+// sparse point layers, so they ride a single focus-sampled offset (sub-metre local
+// variation across a marker is invisible) instead of per-vertex conforming.
+function updateDrape(now) {
+  const pr = state.photoreal;
+  const active = !!(pr && pr.enabled && pr.group.visible && !FLAT_WORLD);
+  const t = controls.target;
+  state.drape.update(now, t.x, t.z, active);
+  const o = state.drape.offsetAt(t.x, t.z);
+  for (const s of [state.lidar, state.labels, state.cameras]) {
+    if (s && s.group && s.group.position.y !== o) s.group.position.y = o;
+  }
+}
+
+// Adaptive photoreal fidelity (auto-FPS): nudge the tile errorTarget to hold ~60fps. Lower
+// errorTarget = finer tiles (sharper, heavier). With FPS headroom we creep toward the 1px
+// high-fidelity floor; below the band we back off fast. Disabled by the panel's "adaptive"
+// checkbox or by dragging the detail slider (manual override).
+let _emaFps = 60, _adaptAt = 0;
+function adaptPhotorealQuality(fpsVal, now) {
+  const pr = state.photoreal;
+  const on = pr && pr.enabled && pr.group.visible && !FLAT_WORLD;
+  const adaptive = $('photoreal-adaptive') ? $('photoreal-adaptive').checked : true;
+  if (!on || !adaptive) { _emaFps = fpsVal; return; }
+  _emaFps = _emaFps * 0.6 + fpsVal * 0.4;          // smooth so one slow frame doesn't lurch
+  if (now - _adaptAt < 1000) return;               // retune at ~1 Hz
+  _adaptAt = now;
+  const FLOOR = 1, CEIL = 16;
+  let d = pr.detail || 4;
+  if (_emaFps < 50) d = Math.min(CEIL, d + Math.max(0.5, d * 0.2));   // slow -> coarser, fast
+  else if (_emaFps > 57 && d > FLOOR) d = Math.max(FLOOR, d - 0.5);   // headroom -> finer
+  else return;
+  d = Math.round(d * 2) / 2;
+  if (d !== pr.detail) {
+    pr.setDetail(d);
+    const sl = $('photoreal-detail'); if (sl) sl.value = String(d);
+    const lab = $('photoreal-detail-val'); if (lab) lab.textContent = String(d);
+  }
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.1);
@@ -2287,15 +2524,18 @@ function animate() {
   if (follow.id != null) updateFollowCamera(dt); // follow AFTER the target moved this frame
   if (state.labels) state.labels.tick(camera, controls.target); // cull labels around the look-at point
   if (state.photoreal) state.photoreal.update();  // stream/LOD the photorealistic basemap (no-op when off)
+  updateDrape(performance.now());   // lift overlays onto the photoreal surface (no-op when off)
   renderer.render(scene, camera);
 
   frames++;
   const now = performance.now();
   if (now - fpsTimer >= 500) {
+    const fpsVal = Math.round((frames * 1000) / (now - fpsTimer));
     el.fps.textContent =
-      `${Math.round((frames * 1000) / (now - fpsTimer))} fps — ` +
+      `${fpsVal} fps — ` +
       `${renderer.info.render.triangles.toLocaleString()} tris, ` +
       `${renderer.info.render.points.toLocaleString()} pts`;
+    adaptPhotorealQuality(fpsVal, now);   // hold ~60fps by tuning tile errorTarget
     frames = 0;
     fpsTimer = now;
   }

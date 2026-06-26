@@ -1,4 +1,4 @@
-// Real road network layer for the UKy Campus viewer.
+// Real road network layer for the Lexington Digital Twin.
 //
 // Consumes web/data/roads.json (road centrelines extracted from the aerial
 // textures by tools/extract_roads.py — see that file). Points are already in
