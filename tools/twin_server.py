@@ -1900,20 +1900,24 @@ def make_server(port, directory=WEB, host="0.0.0.0"):
 
 
 def world_data_present():
-    """True once the georef manifest exists. It's the prerequisite every layer reads
-    (ground, buildings, the transit projector, and the terrain tiles --render waits on);
-    the others degrade when missing, but nothing can be *built* without it."""
-    return os.path.exists(os.path.join(DATA, "manifest.json"))
+    """True once the full city is built. The single-command bootstrap is meant to produce
+    ALL of Lexington, so gate on three reliable markers — manifest.json (georef + terrain),
+    ground.f32 (KyFromAbove citywide elevation), and buildings.pack.json (packed buildings).
+    If any is missing — e.g. only a partial campus base exists (manifest but no citywide
+    LiDAR/buildings) — the bootstrap offers to build the rest. Best-effort layers (cameras/
+    transit) are deliberately NOT gated on, so a flaky scrape can't cause a reprompt loop."""
+    return all(os.path.exists(os.path.join(DATA, f))
+               for f in ("manifest.json", "ground.f32", "buildings.pack.json"))
 
 
 def maybe_bootstrap_world_data(mode="prompt"):
     """Populate an empty web/data/ on first run.
 
     web/data/ is gitignored and built locally, so a fresh clone has no world. The georef
-    anchor + terrain/buildings come from the UE assets via tools/build_all.py — no public
-    download can substitute for it, and every other layer (incl. the KyFromAbove city
-    fill) reads that manifest — so this offers to run that build, with build_all's
-    best-effort city OSM + transit layers folded in.
+    anchor comes from this box's UE assets (no public download substitutes), and every
+    other layer reads that manifest — so this runs `build_all.py --citywide`, which after
+    the campus georef base downloads ALL of Lexington: ~114k buildings, roads, traffic
+    lights, intersections, crosswalks, cameras, buses, and the ~8 GB KYAPED LiDAR.
 
     mode: 'prompt' (ask, but only when stdin is a TTY — a headless --render must never
     block on input()), 'yes' (build without asking, for scripted setup), or 'off' (never
@@ -1922,15 +1926,15 @@ def maybe_bootstrap_world_data(mode="prompt"):
     if world_data_present():
         return True
 
-    build = [sys.executable, os.path.join(_REPO_ROOT, "tools", "build_all.py"),
-             "--with-city", "--with-transit"]
-    shown = "python tools/build_all.py --with-city --with-transit"
+    build = [sys.executable, os.path.join(_REPO_ROOT, "tools", "build_all.py"), "--citywide"]
+    shown = "python tools/build_all.py --citywide"
 
     def _guidance():
-        print(f"  [bootstrap] no web/data/ yet (gitignored, built locally). This box has the "
-              f"UE assets, so build it with:\n                {shown}")
-        print("              then restart the server. Citywide LiDAR (all of Lexington, ~8 GB) "
-              "is a separate step:\n                python -m tools.ky_lidar --download-aoi --build --heightmap")
+        print(f"  [bootstrap] no web/data/ yet (gitignored, built locally). This box has the UE "
+              f"assets, so build the whole city with:\n                {shown}")
+        print("              downloads all of Lexington — buildings, roads, traffic lights, "
+              "intersections,\n              crosswalks, cameras, buses + the ~8 GB KYAPED LiDAR "
+              "(needs laspy[lazrs]/shapely/scikit-image),\n              then restart the server.")
 
     if mode == "off":
         _guidance()
@@ -1944,10 +1948,11 @@ def maybe_bootstrap_world_data(mode="prompt"):
         return False
 
     if mode == "prompt":
-        print("\n  No world data found — web/data/ is empty (gitignored; built locally).")
-        print(f"  This box has the UE assets, so I can build it now:  {shown}")
-        print("  Extracts textures/meshes/LiDAR/buildings, then bakes city OSM + transit")
-        print("  (campus extract is local; city/transit need network and are best-effort).")
+        print("\n  World data is missing or incomplete (web/data/ is gitignored; built locally).")
+        print(f"  This box has the UE assets, so I can build ALL of Lexington now:  {shown}")
+        print("  Downloads everything: terrain + ~114k buildings, roads, traffic lights,")
+        print("  intersections, crosswalks, cameras, and buses — plus the ~8 GB KYAPED LiDAR.")
+        print("  Big job: needs network + laspy[lazrs]/shapely/scikit-image, and can take a while.")
         try:
             ans = input("  Build it now? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -1970,8 +1975,8 @@ def maybe_bootstrap_world_data(mode="prompt"):
     if world_data_present():
         print("\n  [bootstrap] world data ready.\n")
         return True
-    print("\n  [bootstrap] build finished but web/data/manifest.json is still missing — "
-          "check the output above.\n")
+    print("\n  [bootstrap] build finished but the city still looks incomplete "
+          "(need manifest.json + ground.f32 + buildings.pack.json) — check the output above.\n")
     return False
 
 

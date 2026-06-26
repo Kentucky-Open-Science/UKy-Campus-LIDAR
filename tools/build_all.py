@@ -28,7 +28,7 @@ class Args:
 
 def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
                    skip_pack=False, with_city=False, with_transit=False,
-                   skip_scene=False):
+                   skip_scene=False, citywide=False):
     """Run extraction steps (these may be no-ops if data already exists)."""
     print('=' * 60)
     print(' Lexington Digital Twin — full data extraction pipeline')
@@ -70,43 +70,80 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
     print('\n--- Step 5: Merge manifests -> web/data/manifest.json (georef + terrain) ---')
     merge_manifests()
 
-    if not skip_buildings:
-        print('\n--- Step 6: Buildings (lidar + OSM -> .bin) ---')
-        # Hybrid extractor: OSM footprints split/bound the LiDAR, LiDAR gives
-        # shape + height. Run as a module so tools.* imports resolve and the
-        # stdlib `inspect` isn't shadowed by tools/inspect.py.
-        subprocess.run([sys.executable, '-m', 'tools.extract_buildings_hybrid'],
-                       cwd=ROOT, check=True)
-        # Re-merge to fold the freshly-extracted buildings into the manifest.
-        print('\n--- Step 7: Merge manifests again (fold in buildings) ---')
-        merge_manifests()
-
-    # Step 6: pack the per-building meshes into ONE buffer for fast loading
-    # (3,109 fetches + draw calls -> 1). Local, no network; runs whenever the
-    # buildings exist. See tools/pack_buildings.py.
-    if not skip_pack and not skip_buildings:
-        print('\n--- Step 8: Pack buildings (3,109 meshes -> one buffer) ---')
+    if citywide:
+        # ===================== FULL CITY (all of Lexington) =====================
+        # Open-data fill over the whole Lextran service area: OpenStreetMap + the statewide
+        # KyFromAbove LiDAR. This is a BIG job — an ~8 GB LiDAR download and ~114k buildings —
+        # and it needs the extra deps laspy[lazrs] + shapely + scikit-image in this venv. The
+        # campus base above contributes only the scene<->UTM georef in web/data/manifest.json;
+        # these steps fill the ENTIRE city and REPLACE the campus-only buildings/roads. Every
+        # step is resumable (LiDAR downloads + OSM responses are cached on disk), so a failure
+        # part-way can simply be re-run. Ordering is load-bearing: osm_city writes the AOI bbox
+        # ky_lidar queries; ky_lidar --heightmap writes the ground.f32 build_city reads.
+        print('\n--- City 1/8: osm_city -> web/data/city.json (service-area bbox + ground plane) ---')
+        subprocess.run([sys.executable, '-m', 'tools.osm_city'], cwd=ROOT, check=True)
+        print('\n--- City 2/8: ky_lidar -> KYAPED tiles (~8 GB) + ground.f32 (citywide elevation) ---')
+        subprocess.run([sys.executable, '-m', 'tools.ky_lidar',
+                        '--download-aoi', '--build', '--heightmap'], cwd=ROOT, check=True)
+        print('\n--- City 3/8: build_city -> ~114k OSM+LiDAR buildings (merges the manifest) ---')
+        subprocess.run([sys.executable, '-m', 'tools.build_city'], cwd=ROOT, check=True)
+        print('\n--- City 4/8: pack_buildings -> one packed buffer / one draw call ---')
         subprocess.run([sys.executable, '-m', 'tools.pack_buildings'], cwd=ROOT, check=True)
+        print('\n--- City 5/8: osm_roads -> web/data/roads.json ---')
+        subprocess.run([sys.executable, '-m', 'tools.osm_roads'], cwd=ROOT, check=True)
+        print('\n--- City 6/8: smooth_roads -> smoothed roads.json + signals.json ---')
+        subprocess.run([sys.executable, '-m', 'tools.smooth_roads'], cwd=ROOT, check=True)
+        # Live-data bakes. Best-effort: a flaky city site / feed warns but never fails the
+        # whole city build. lex_cameras snaps cameras to signals.json junctions, so it must
+        # run AFTER smooth_roads; --scrape pulls the live camera list off the city map.
+        print('\n--- City 7/8: lex_cameras --scrape -> web/data/cameras.json ---')
+        try:
+            subprocess.run([sys.executable, '-m', 'tools.lex_cameras', '--scrape'], cwd=ROOT, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f'  [warn] lex_cameras failed ({e}); skipping camera mapping')
+        print('\n--- City 8/8: lextran_gtfs -> web/data/transit.json ---')
+        try:
+            subprocess.run([sys.executable, '-m', 'tools.lextran_gtfs'], cwd=ROOT, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f'  [warn] lextran_gtfs failed ({e}); skipping transit layer')
+    else:
+        if not skip_buildings:
+            print('\n--- Step 6: Buildings (lidar + OSM -> .bin) ---')
+            # Hybrid extractor: OSM footprints split/bound the LiDAR, LiDAR gives
+            # shape + height. Run as a module so tools.* imports resolve and the
+            # stdlib `inspect` isn't shadowed by tools/inspect.py.
+            subprocess.run([sys.executable, '-m', 'tools.extract_buildings_hybrid'],
+                           cwd=ROOT, check=True)
+            # Re-merge to fold the freshly-extracted buildings into the manifest.
+            print('\n--- Step 7: Merge manifests again (fold in buildings) ---')
+            merge_manifests()
 
-    # Steps 7-8 (opt-in; need network): the city-wide OSM context + the Lextran
-    # transit layer. Best-effort — a network failure warns but never fails the build.
-    # Order matters: city first, so the transit baker reads its ground elevation.
-    if with_city:
-        print('\n--- Step 9: City-wide OSM streets + ground plane ---')
-        try:
-            subprocess.run([sys.executable, '-m', 'tools.osm_city'], cwd=ROOT, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f'  [warn] osm_city failed ({e}); skipping city layer')
-        print('\n--- Step 9b: Road ribbons + signals (OSM -> roads.json + signals.json) ---')
-        try:
-            # osm_roads fetches OSM highways -> web/data/roads.json; smooth_roads then
-            # post-processes that into smoothed roads.json + signals.json. Best-effort, like
-            # osm_city/transit: a network hiccup warns but never fails the whole build.
-            subprocess.run([sys.executable, '-m', 'tools.osm_roads'], cwd=ROOT, check=True)
-            subprocess.run([sys.executable, '-m', 'tools.smooth_roads'], cwd=ROOT, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f'  [warn] road extraction failed ({e}); skipping roads/signals layer')
-    if with_transit:
+        # Pack the per-building meshes into ONE buffer for fast loading. Local, no network.
+        if not skip_pack and not skip_buildings:
+            print('\n--- Step 8: Pack buildings (-> one buffer) ---')
+            subprocess.run([sys.executable, '-m', 'tools.pack_buildings'], cwd=ROOT, check=True)
+
+        # Opt-in network layers: city-wide OSM streets/ground + campus road ribbons.
+        # Best-effort — a network failure warns but never fails the build.
+        if with_city:
+            print('\n--- Step 9: City-wide OSM streets + ground plane ---')
+            try:
+                subprocess.run([sys.executable, '-m', 'tools.osm_city'], cwd=ROOT, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f'  [warn] osm_city failed ({e}); skipping city layer')
+            print('\n--- Step 9b: Road ribbons + signals (OSM -> roads.json + signals.json) ---')
+            try:
+                subprocess.run([sys.executable, '-m', 'tools.osm_roads'], cwd=ROOT, check=True)
+                subprocess.run([sys.executable, '-m', 'tools.smooth_roads'], cwd=ROOT, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f'  [warn] road extraction failed ({e}); skipping roads/signals layer')
+            print('\n--- Step 9c: Traffic cameras (scrape -> cameras.json) ---')
+            try:
+                # snaps to signals.json junctions, so it runs after smooth_roads above
+                subprocess.run([sys.executable, '-m', 'tools.lex_cameras', '--scrape'], cwd=ROOT, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f'  [warn] lex_cameras failed ({e}); skipping camera mapping')
+    if with_transit and not citywide:   # citywide bakes transit itself (City 8/8 above)
         print('\n--- Step 10: Lextran static GTFS -> transit.json ---')
         try:
             subprocess.run([sys.executable, '-m', 'tools.lextran_gtfs'], cwd=ROOT, check=True)
@@ -287,6 +324,11 @@ if __name__ == '__main__':
                     help='also build the city-wide OSM context (needs network)')
     ap.add_argument('--with-transit', action='store_true',
                     help='also bake the Lextran transit layer (needs network)')
+    ap.add_argument('--citywide', action='store_true',
+                    help='build ALL of Lexington (open data), not just campus: after the campus '
+                         'georef base, run osm_city -> ky_lidar (~8 GB KYAPED download) -> '
+                         'build_city (~114k buildings) -> pack -> osm_roads -> smooth_roads. '
+                         'Needs network + laspy[lazrs]/shapely/scikit-image. Replaces campus buildings/roads.')
     ap.add_argument('--verify', action='store_true',
                     help='Verify data integrity without extracting')
     args = ap.parse_args()
@@ -297,4 +339,4 @@ if __name__ == '__main__':
 
     run_extraction(args.skip_textures, args.skip_meshes, args.skip_lidar,
                    args.skip_buildings, args.skip_pack, args.with_city, args.with_transit,
-                   skip_scene=args.skip_scene)
+                   skip_scene=args.skip_scene, citywide=args.citywide)
