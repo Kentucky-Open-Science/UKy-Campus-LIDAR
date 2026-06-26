@@ -60,6 +60,8 @@ import math
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -1328,7 +1330,18 @@ def build_proxy(mock=False, cache_seconds=None):
     # every ~15-30 s, so a 5 s cache there is plenty and spares the agency.
     if cache_seconds is None:
         cache_seconds = 0.5 if mock else 5.0
-    return TransitProxy(Projector(), load_route_map(), mock=mock, cache_seconds=cache_seconds)
+    try:
+        proj = Projector()
+    except FileNotFoundError as e:
+        # No georef manifest yet — e.g. a fresh clone, where web/data/ is gitignored and
+        # regenerated from the tools/ pipeline. The scene<->UTM offsets live in that
+        # manifest; without them buses can't be placed on the map, so transit degrades
+        # OFF rather than crashing the server — mirroring ground->flat-plane and
+        # buildings->no-collision above. Endpoints return 503; --render still comes up.
+        print(f"[transit] no georef manifest ({e}); live buses off "
+              "(regenerate web/data/ from the tools/ pipeline, or pass --no-transit to silence)")
+        return None
+    return TransitProxy(proj, load_route_map(), mock=mock, cache_seconds=cache_seconds)
 
 
 # =====================================================================
@@ -1482,7 +1495,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _transit(self, path):
         if PROXY is None:
-            return self._json({"error": "transit proxy off (started with --no-transit)"}, 503)
+            return self._json({"error": "transit proxy off (no georef manifest, or --no-transit)"}, 503)
         if path in ("/api/transit", "/api/transit/meta"):
             return self._json(PROXY.meta())
         for kind in ("vehicles", "trips", "alerts"):
@@ -1869,6 +1882,82 @@ def make_server(port, directory=WEB):
     return httpd
 
 
+def world_data_present():
+    """True once the georef manifest exists. It's the prerequisite every layer reads
+    (ground, buildings, the transit projector, and the terrain tiles --render waits on);
+    the others degrade when missing, but nothing can be *built* without it."""
+    return os.path.exists(os.path.join(DATA, "manifest.json"))
+
+
+def maybe_bootstrap_world_data(mode="prompt"):
+    """Populate an empty web/data/ on first run.
+
+    web/data/ is gitignored and built locally, so a fresh clone has no world. The georef
+    anchor + terrain/buildings come from the UE assets via tools/build_all.py — no public
+    download can substitute for it, and every other layer (incl. the KyFromAbove city
+    fill) reads that manifest — so this offers to run that build, with build_all's
+    best-effort city OSM + transit layers folded in.
+
+    mode: 'prompt' (ask, but only when stdin is a TTY — a headless --render must never
+    block on input()), 'yes' (build without asking, for scripted setup), or 'off' (never
+    build, just print guidance). Returns True iff the world data is present afterward.
+    """
+    if world_data_present():
+        return True
+
+    build = [sys.executable, os.path.join(_REPO_ROOT, "tools", "build_all.py"),
+             "--with-city", "--with-transit"]
+    shown = "python tools/build_all.py --with-city --with-transit"
+
+    def _guidance():
+        print(f"  [bootstrap] no web/data/ yet (gitignored, built locally). This box has the "
+              f"UE assets, so build it with:\n                {shown}")
+        print("              then restart the server. Citywide LiDAR (all of Lexington, ~8 GB) "
+              "is a separate step:\n                python -m tools.ky_lidar --download-aoi --build --heightmap")
+
+    if mode == "off":
+        _guidance()
+        return False
+
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    if mode == "prompt" and not interactive:
+        # Non-TTY guard: never hang a headless/automated run waiting on a prompt.
+        print("  [bootstrap] world data missing and no interactive terminal to prompt on — skipping.")
+        _guidance()
+        return False
+
+    if mode == "prompt":
+        print("\n  No world data found — web/data/ is empty (gitignored; built locally).")
+        print(f"  This box has the UE assets, so I can build it now:  {shown}")
+        print("  Extracts textures/meshes/LiDAR/buildings, then bakes city OSM + transit")
+        print("  (campus extract is local; city/transit need network and are best-effort).")
+        try:
+            ans = input("  Build it now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("  Skipping the build — serving a flat/empty world for now.")
+            _guidance()
+            return False
+
+    print(f"\n  [bootstrap] running: {shown}")
+    print("  (this can take a while — output streams below)\n")
+    try:
+        subprocess.run(build, cwd=_REPO_ROOT, check=True)
+    except (subprocess.CalledProcessError, OSError) as e:
+        print(f"\n  [bootstrap] build failed ({e}) — serving a flat/empty world.")
+        _guidance()
+        return False
+
+    if world_data_present():
+        print("\n  [bootstrap] world data ready.\n")
+        return True
+    print("\n  [bootstrap] build finished but web/data/manifest.json is still missing — "
+          "check the output above.\n")
+    return False
+
+
 def main():
     global WORLD, RENDER, PROXY, CAMERAS, DETECT_MODEL, DETECT_MAX_FPS, DETECT_INTERVAL, DETECT_CONF, SERVER_BASE
     load_dotenv()   # pick up GOOGLE_MAPS_API_KEY etc. from a gitignored .env
@@ -1877,6 +1966,11 @@ def main():
     ap.add_argument("--hz", type=int, default=50, help="simulation tick rate")
     ap.add_argument("--render", action="store_true",
                     help="enable first-person agent cameras (drives a headless browser; needs playwright)")
+    ap.add_argument("--bootstrap", action="store_true",
+                    help="if web/data/ is empty, build it from the UE assets (tools/build_all.py "
+                         "--with-city --with-transit) WITHOUT prompting — for scripted/headless setup")
+    ap.add_argument("--no-bootstrap", action="store_true",
+                    help="never offer to build a missing web/data/ (default: prompt when run in a terminal)")
     ap.add_argument("--mock", action="store_true",
                     help="replay tools/_transit_samples instead of the live Lextran feed (offline buses)")
     ap.add_argument("--no-transit", action="store_true", help="disable the live bus proxy")
@@ -1907,6 +2001,11 @@ def main():
     DETECT_CONF = args.detect_conf
     SERVER_BASE = f"http://127.0.0.1:{args.port}"   # in-process detector talks to ourselves
 
+    # First-run bootstrap: an empty web/data/ (fresh clone) can't be served meaningfully —
+    # offer to build it from the UE assets before the world loads, so World() picks it up.
+    boot_mode = "off" if args.no_bootstrap else ("yes" if args.bootstrap else "prompt")
+    maybe_bootstrap_world_data(boot_mode)
+
     print("loading world (terrain heightmap + building boxes) ...")
     WORLD = World(hz=args.hz)
     WORLD.kinematic_ttl = args.kinematic_ttl
@@ -1924,6 +2023,7 @@ def main():
         RENDER = RenderService(args.port)
 
     transit = ("off (--no-transit)" if args.no_transit else
+               "off (no georef manifest)" if PROXY is None else
                f"{'MOCK (fixtures)' if args.mock else 'LIVE (mystop.lextran.com)'}"
                "  ->  /api/transit/(vehicles|trips|alerts|meta)")
     cameras = ("off (--no-cameras)" if args.no_cameras else
