@@ -166,8 +166,13 @@ def main():
 
     # ---- 2. OSM footprints (scene metres) -------------------------------
     print('[2/6] OSM footprints ...')
-    man = json.load(open(os.path.join(EXTRACTED_DIR, 'manifest-buildings.json')))
-    s, w, n, e, _ = scene_bbox_lonlat(man['tiles'], A, B, O)
+    # OSM fetch bbox = the extent of the building-class LiDAR we just loaded (UE cm bounds
+    # -> padded lon/lat). This previously read extracted/manifest-buildings.json — the file
+    # THIS tool writes only at the very end (line ~331) — so a from-scratch build had nothing
+    # to read and crashed. The point cloud is the correct, self-contained source for the bbox.
+    bmn = [float(pts[:, 0].min()), float(pts[:, 1].min()), float(pts[:, 2].min())]
+    bmx = [float(pts[:, 0].max()), float(pts[:, 1].max()), float(pts[:, 2].max())]
+    s, w, n, e, _ = scene_bbox_lonlat([{'bounds_min_cm': bmn, 'bounds_max_cm': bmx}], A, B, O)
     cache = args.osm_cache or os.path.join(EXTRACTED_DIR, 'osm_buildings.json')
     if os.path.exists(cache):
         osm = json.load(open(cache))

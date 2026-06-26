@@ -97,6 +97,15 @@ def run_extraction(skip_textures, skip_meshes, skip_lidar, skip_buildings,
             subprocess.run([sys.executable, '-m', 'tools.osm_city'], cwd=ROOT, check=True)
         except subprocess.CalledProcessError as e:
             print(f'  [warn] osm_city failed ({e}); skipping city layer')
+        print('\n--- Step 9b: Road ribbons + signals (OSM -> roads.json + signals.json) ---')
+        try:
+            # osm_roads fetches OSM highways -> web/data/roads.json; smooth_roads then
+            # post-processes that into smoothed roads.json + signals.json. Best-effort, like
+            # osm_city/transit: a network hiccup warns but never fails the whole build.
+            subprocess.run([sys.executable, '-m', 'tools.osm_roads'], cwd=ROOT, check=True)
+            subprocess.run([sys.executable, '-m', 'tools.smooth_roads'], cwd=ROOT, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f'  [warn] road extraction failed ({e}); skipping roads/signals layer')
     if with_transit:
         print('\n--- Step 10: Lextran static GTFS -> transit.json ---')
         try:
