@@ -1872,12 +1872,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             pass
 
 
-def make_server(port, directory=WEB):
-    """ThreadingHTTPServer on `port` with the combined world+transit+static Handler.
-    The listen socket is open on return, so a --render browser can connect before
-    serve_forever() starts accepting. Shared by main() and tools/verify_transit.py."""
+def _lan_ip():
+    """Best-effort primary LAN IPv4 — the address other devices use to reach us.
+    Opens a UDP socket toward a public IP and reads the chosen source address; no
+    packets are actually sent. Returns None if it can't be determined (e.g. offline)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def make_server(port, directory=WEB, host="0.0.0.0"):
+    """ThreadingHTTPServer on `host:port` with the combined world+transit+static Handler.
+    `host` defaults to 0.0.0.0 (all interfaces) so the viewer is reachable from other
+    devices on the LAN; pass 127.0.0.1 for localhost-only. The listen socket is open on
+    return, so a --render browser can connect before serve_forever() starts accepting.
+    Shared by main() and tools/verify_transit.py."""
     handler = functools.partial(Handler, directory=directory)
-    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+    httpd = http.server.ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
     return httpd
 
@@ -1963,6 +1980,9 @@ def main():
     load_dotenv()   # pick up GOOGLE_MAPS_API_KEY etc. from a gitignored .env
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="interface to bind (default 0.0.0.0 = all, reachable on the LAN; "
+                         "use 127.0.0.1 for localhost-only)")
     ap.add_argument("--hz", type=int, default=50, help="simulation tick rate")
     ap.add_argument("--render", action="store_true",
                     help="enable first-person agent cameras (drives a headless browser; needs playwright)")
@@ -2018,7 +2038,7 @@ def main():
     if not args.no_cameras:
         CAMERAS = build_camera_proxy(cache_seconds=args.camera_cache_seconds)
 
-    httpd = make_server(args.port)
+    httpd = make_server(args.port, host=args.host)
     if args.render:
         RENDER = RenderService(args.port)
 
@@ -2028,8 +2048,16 @@ def main():
                "  ->  /api/transit/(vehicles|trips|alerts|meta)")
     cameras = ("off (--no-cameras)" if args.no_cameras else
                "LIVE (trafficvid.lexingtonky.gov)  ->  /api/cameras/(streams|meta)")
+    if args.host in ("0.0.0.0", "::"):
+        lan = _lan_ip()
+    elif args.host in ("127.0.0.1", "localhost", "::1"):
+        lan = None
+    else:
+        lan = args.host
     print(f"\nLexington Digital Twin server — authoritative shared world + live transit + traffic cameras")
     print(f"  viewer:  http://localhost:{args.port}/")
+    if lan:
+        print(f"           http://{lan}:{args.port}/   (LAN — reachable from other devices; bound on {args.host})")
     print(f"  world:   http://localhost:{args.port}/api/world/(state|meta|spawn|agents/<id>/...)")
     print(f"  transit: {transit}")
     print(f"  cameras: {cameras}")

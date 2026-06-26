@@ -282,13 +282,14 @@ def extract(path, out_dir=OUT_DIR, verbose=True):
     return info
 
 
-def main():
+def main(args=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('paths', nargs='*')
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--manifest', default=os.path.join(ROOT, 'extracted',
                                                        'manifest-meshes.json'))
-    args = ap.parse_args()
+    if args is None:                      # CLI use; build_all passes a prebuilt args in-process
+        args = ap.parse_args()
     paths = args.paths
     if args.all:
         paths = sorted(os.path.join(MESH_DIR, f) for f in os.listdir(MESH_DIR)

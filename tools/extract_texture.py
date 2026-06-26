@@ -225,7 +225,7 @@ def build_manifest():
     print('wrote', out, f'({len(parts)} textures)')
 
 
-def main():
+def main(args=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('path', nargs='?', help='single .uasset to extract')
     ap.add_argument('--all', action='store_true', help='process every texture')
@@ -236,7 +236,8 @@ def main():
     ap.add_argument('--manifest', action='store_true',
                     help='merge per-file JSONs into manifest-textures.json')
     ap.add_argument('--outdir', default=OUT_DIR)
-    args = ap.parse_args()
+    if args is None:                      # CLI use; build_all passes a prebuilt args in-process
+        args = ap.parse_args()
 
     if args.manifest:
         build_manifest()
