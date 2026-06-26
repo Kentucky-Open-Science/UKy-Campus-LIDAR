@@ -1227,6 +1227,15 @@ if (params.get('photoreal') === '1') {
   applyBaseLayerVis();
 }
 
+// The UKy campus DTM terrain (the UE mesh patch) ships OFF by default — it's a small area
+// now superseded by the citywide KYAPED ground + the photoreal basemap, and it visually
+// conflicts with them. Its checkbox is unchecked in index.html; opt back in with ?terrain=1
+// or by ticking "visible". Tiles still LOAD (so --render's terrain-tiles readiness gate is
+// unaffected) — they're just hidden. This call also syncs every base layer to its checkbox
+// default on first load (previously only synced after a manual toggle / photoreal opt-in).
+if (params.get('terrain') === '1' && $('terrain-visible')) $('terrain-visible').checked = true;
+applyBaseLayerVis();
+
 // --------------------------------------------------------------- transit ---
 // Live Lextran layer (transit.js). Master + per-layer toggles null-guard on
 // state.transit (created after roads.json loads). Status is refreshed on a timer

@@ -31,6 +31,7 @@ API (JSON, CORS-open; see client/twin.py for a Python wrapper):
     POST   /api/world/agents/<id>/stop
     DELETE /api/world/agents/<id>
         (kinematic agents carry no physics and auto-despawn after World.kinematic_ttl s without a pose update)
+    GET    /docs                             -> human-readable agent spawn/control API reference (HTML)
     GET    /api/transit/vehicles             -> live bus positions, projected to scene [x,_,z]
     GET    /api/transit/trips                -> predicted arrivals, indexed by stop and trip
     GET    /api/transit/alerts               -> service alerts (decoded cause/effect)
@@ -1424,6 +1425,193 @@ def build_camera_proxy(cache_seconds=60.0):
 
 
 # =====================================================================
+# Human-readable reference for the agent spawn/control API, served at GET /docs.
+# The agent-types table is generated from DEFS so it can never drift from the sim.
+_DOCS_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lexington Twin — Agent API</title>
+<style>
+ :root{--bg:#0d1117;--panel:#161b22;--line:#272e3a;--ink:#e6edf3;--mut:#9aa7b4;
+   --acc:#58a6ff;--get:#3fb950;--post:#d29922;--del:#f85149;--code:#0b0f14}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--ink);
+   font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+ code,pre{font-family:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+ .wrap{max-width:880px;margin:0 auto;padding:48px 24px 96px}
+ h1{font-size:30px;margin:0 0 8px;letter-spacing:-.02em}
+ header p{color:var(--mut);margin:0 0 6px;font-size:14.5px}
+ .base{display:inline-block;margin-top:12px;padding:7px 13px;background:var(--panel);
+   border:1px solid var(--line);border-radius:8px;color:var(--mut);font-size:13px}
+ .base code{color:var(--ink)}
+ h2{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);
+   margin:46px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+ .ep{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 18px;margin:12px 0}
+ .sig{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+ .verb{font:600 11px/1 ui-monospace,monospace;letter-spacing:.04em;padding:5px 8px;border-radius:6px;color:#0d1117}
+ .verb.get{background:var(--get)}.verb.post{background:var(--post)}.verb.del{background:var(--del)}
+ .path{font-family:ui-monospace,monospace;font-size:14px}
+ .ep p{color:var(--mut);margin:11px 0 0;font-size:14px}
+ pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:13px 15px;
+   overflow:auto;margin:12px 0 0;font-size:13px;color:#c9d6e3}
+ table{width:100%;border-collapse:collapse;margin-top:4px;font-size:14px}
+ th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+ td code{color:var(--acc)}
+ .fields{display:grid;grid-template-columns:max-content 1fr;gap:5px 16px;margin-top:12px;font-size:13.5px}
+ .fields code{color:var(--acc);white-space:nowrap}.fields span{color:var(--mut)}
+ .note{color:var(--mut);font-size:13.5px}em{color:var(--ink);font-style:normal;font-weight:600}
+</style></head><body><div class="wrap">
+<header>
+ <h1>Agent API</h1>
+ <p>Spawn and drive agents in the authoritative, shared Lexington digital twin.</p>
+ <p class="note">Every agent lives in <em>one</em> server-side simulation, so anything you spawn or move is
+ visible to all connected clients — browsers and scripts alike. JSON in and out; CORS open.</p>
+ <div class="base">Base URL&nbsp;&nbsp;<code>http://&lt;host&gt;:__PORT__</code> &nbsp;·&nbsp; a Python wrapper lives in <code>client/twin.py</code></div>
+</header>
+
+<h2>Quick start</h2>
+<pre># spawn a car, send it to a point, read its sensors, then despawn it
+curl -sX POST http://localhost:__PORT__/api/world/spawn -H 'content-type: application/json' \\
+     -d '{"type":"car","position":[120,0,-80],"heading":90,"name":"scout"}'
+# -> {"id":1,"name":"scout","type":"car","position":[120,0,-80],"heading":90, ...}
+
+curl -sX POST http://localhost:__PORT__/api/world/agents/1/driveTo \\
+     -H 'content-type: application/json' -d '{"x":260,"z":-40,"speed":12}'
+
+curl -s  http://localhost:__PORT__/api/world/agents/1            # read state
+curl -sX DELETE http://localhost:__PORT__/api/world/agents/1     # despawn</pre>
+
+<h2>Agent types</h2>
+<table><thead><tr><th>type</th><th>drive model</th><th>domain</th><th>L×W×H (m)</th><th>max speed (m/s)</th></tr></thead>
+<tbody>
+__TYPES_ROWS__
+</tbody></table>
+<p class="note">The <em>drive model</em> decides which control fields apply: <code>ackermann</code> = car-like
+(throttle + steering), <code>differential</code> = tank/wheel pair, <code>holonomic</code> = free-flying drone.</p>
+
+<h2>Spawn</h2>
+<div class="ep">
+ <div class="sig"><span class="verb post">POST</span><span class="path">/api/world/spawn</span></div>
+ <p>Create an agent. Returns its full state, including the assigned <code>id</code>. 400 on an unknown
+ <code>type</code>, a duplicate <code>name</code>, or when the agent cap (<code>/meta.maxAgents</code>) is reached.</p>
+ <div class="fields">
+  <code>type</code><span><b>required.</b> one of the agent types above.</span>
+  <code>position</code><span>[x, y, z] scene metres (default [0,0,0]). Ground agents snap to terrain; pass [x, z] for short.</span>
+  <code>heading</code><span>degrees, 0–360 (default 0).</span>
+  <code>color</code><span>integer RGB, e.g. 3503049 (0x3577c9). Defaults per type.</span>
+  <code>name</code><span>unique label (default "&lt;type&gt;_&lt;id&gt;").</span>
+  <code>owner</code><span>free-form owner tag (default "anon").</span>
+  <code>kinematic</code><span>true = pose-driven, no physics; auto-despawns after ~ttl s without a /pose update.</span>
+  <code>source</code><span>optional metadata (e.g. a camera id for detection-driven cars).</span>
+ </div>
+ <pre>POST /api/world/spawn   {"type":"drone","position":[100,40,-60],"name":"eye"}
+-> {"id":3,"type":"drone","position":[100,40,-60],"heading":0,"onGround":false, ...}</pre>
+</div>
+
+<h2>Control</h2>
+<div class="ep">
+ <div class="sig"><span class="verb post">POST</span><span class="path">/api/world/agents/{id}/controls</span></div>
+ <p>Set the agent's instantaneous inputs. They persist until you change them, and they cancel any
+ active <code>driveTo</code>. Fields depend on the drive model; out-of-range values are clamped.</p>
+ <div class="fields">
+  <code>ackermann</code><span>{ throttle 0..1, brake 0..1, steer -1..1, reverse bool }  — car, truck, bus, moto</span>
+  <code>differential</code><span>{ throttle 0..1, steer -1..1 }  or  { left -1..1, right -1..1 }  — bike, ped, robot</span>
+  <code>holonomic</code><span>{ move [x,y,z] each -1..1 }  or  { thrust 0..1, climb -1..1, yawRate deg/s }  — drone</span>
+ </div>
+ <pre>POST /api/world/agents/1/controls   {"throttle":0.8,"steer":-0.3}</pre>
+</div>
+<div class="ep">
+ <div class="sig"><span class="verb post">POST</span><span class="path">/api/world/agents/{id}/driveTo</span></div>
+ <p>Autopilot: steer + throttle toward a target. Overrides manual controls until reached or replaced.</p>
+ <div class="fields">
+  <code>x</code>, <code>z</code><span><b>required.</b> target in scene metres.</span>
+  <code>y</code><span>target altitude for drones (optional).</span>
+  <code>speed</code><span>cruise speed m/s (default 0.6 × the type's max speed).</span>
+  <code>arriveRadius</code><span>distance at which it counts as arrived (default 2 m).</span>
+  <code>stop</code><span>brake to a halt on arrival (default true).</span>
+ </div>
+ <pre>POST /api/world/agents/1/driveTo   {"x":260,"z":-40,"speed":12,"arriveRadius":3}</pre>
+</div>
+<div class="ep">
+ <div class="sig"><span class="verb post">POST</span><span class="path">/api/world/agents/{id}/pose</span></div>
+ <p>Set position/heading directly (teleport). Intended for <code>kinematic</code> agents, which carry no
+ physics — e.g. cars driven from external tracking. Each call also resets the auto-despawn timer.</p>
+ <div class="fields">
+  <code>x</code>, <code>z</code><span><b>required.</b> scene metres.</span>
+  <code>y</code><span>elevation (optional; ground agents otherwise snap to terrain).</span>
+  <code>heading</code><span>degrees (optional).</span>
+ </div>
+ <pre>POST /api/world/agents/7/pose   {"x":131.2,"z":-58.9,"heading":210}</pre>
+</div>
+<div class="ep">
+ <div class="sig"><span class="verb post">POST</span><span class="path">/api/world/agents/{id}/stop</span></div>
+ <p>Zero the velocity and controls and clear any <code>driveTo</code> goal. No body.</p>
+</div>
+
+<h2>Read</h2>
+<div class="ep">
+ <div class="sig"><span class="verb get">GET</span><span class="path">/api/world/agents/{id}</span></div>
+ <p>One agent's full state.</p>
+ <pre>{
+  "id":1,"name":"scout","type":"car","owner":"anon","color":3503049,
+  "position":[120.0,0.0,-80.0],"heading":90.0,"forward":[0,0,-1],
+  "velocity":[0,0,0],"speed":0.0,"surface":"road","groundY":0.0,
+  "altitudeAGL":null,"onGround":true,"offMap":false,
+  "utm":{"easting":...,"northing":...,"zone":"16N"},
+  "collisions":[],"kinematic":false,"source":null
+}</pre>
+</div>
+<div class="ep">
+ <div class="sig"><span class="verb get">GET</span><span class="path">/api/world/state</span></div>
+ <p>Snapshot of <em>every</em> agent in the shared world: <code>{ "t": &lt;sim seconds&gt;, "agents": [ &hellip; ] }</code>.</p>
+</div>
+<div class="ep">
+ <div class="sig"><span class="verb get">GET</span><span class="path">/api/world/meta</span></div>
+ <p>World info: <code>types</code>, sim rate <code>hz</code>, <code>maxAgents</code>, live <code>agents</code> count,
+ <code>ground</code>/<code>buildings</code> status, first-person <code>camera</code> availability, and the UTM-16N <code>georef</code>.</p>
+</div>
+<div class="ep">
+ <div class="sig"><span class="verb get">GET</span><span class="path">/api/world/agents/{id}/camera</span></div>
+ <p>First-person JPEG from the agent's viewpoint (eye height + pitch per type). Requires the server to
+ run with <code>--render</code> (a headless browser); otherwise 503.</p>
+</div>
+
+<h2>Remove</h2>
+<div class="ep">
+ <div class="sig"><span class="verb del">DELETE</span><span class="path">/api/world/agents/{id}</span></div>
+ <p>Despawn the agent. Returns <code>{ "ok": true }</code> (false if it was already gone).</p>
+</div>
+
+<h2>Notes</h2>
+<p class="note">
+ <em>Coordinates</em> are scene metres: <code>+X</code> = east, <code>+Z</code> = south, <code>+Y</code> = up.
+ Each agent state also carries its UTM-16N easting/northing (<code>state.utm</code>), and <code>/meta.georef</code>
+ gives the scene↔UTM offsets.<br>
+ <em>Authoritative &amp; shared</em> — the sim ticks at <code>/meta.hz</code> and agents are capped at
+ <code>/meta.maxAgents</code>; this is distinct from a single browser's private <code>window.__twin.agents</code>.<br>
+ <em>Kinematic agents</em> ignore physics and follow <code>/pose</code>; they auto-despawn after the
+ kinematic TTL with no update. Everything else is fully simulated (ground snapping + collisions).
+</p>
+</div></body></html>"""
+
+
+def agent_api_docs_html(port=None):
+    """Render the agent spawn/control API reference. The types table comes from DEFS, so
+    adding a vehicle class to the sim updates these docs automatically."""
+    rows = []
+    for t, d in DEFS.items():
+        dom = "ground" if d.get("ground") else "air"
+        size = f'{d["L"]:g}×{d["W"]:g}×{d["H"]:g}'
+        rows.append(f'<tr><td><code>{t}</code></td><td>{d["kin"]}</td><td>{dom}</td>'
+                    f'<td>{size}</td><td>{d["maxSpeed"]:g}</td></tr>')
+    return (_DOCS_TEMPLATE
+            .replace("__TYPES_ROWS__", "\n".join(rows))
+            .replace("__PORT__", str(port if port is not None else 8000)))
+
+
+# =====================================================================
 class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -1451,6 +1639,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             status = 500
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, html, status=200):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
@@ -1592,6 +1790,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/docs":           # agent spawn/control API reference (human-readable)
+            return self._html(agent_api_docs_html(self.server.server_address[1]))
         if path == "/api/photoreal":
             # Photorealistic-basemap key, supplied via the GOOGLE_MAPS_API_KEY env var (or
             # a gitignored .env) so it never lives in the repo. Returns {"key": null} when
@@ -2064,6 +2264,7 @@ def main():
     if lan:
         print(f"           http://{lan}:{args.port}/   (LAN — reachable from other devices; bound on {args.host})")
     print(f"  world:   http://localhost:{args.port}/api/world/(state|meta|spawn|agents/<id>/...)")
+    print(f"  docs:    http://localhost:{args.port}/docs   (agent spawn/control API reference)")
     print(f"  transit: {transit}")
     print(f"  cameras: {cameras}")
     print(f"  sim:     {args.hz} Hz   ground:{'on' if WORLD.ground.ok else 'flat'}   "
