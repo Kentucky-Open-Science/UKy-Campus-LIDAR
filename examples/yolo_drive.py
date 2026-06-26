@@ -1,31 +1,45 @@
 """Vision-based control shared by the car / truck / robot demos.
 
-Pulls an agent's first-person camera from the twin server, runs the SMALLEST YOLO
-model (yolov8n) on each frame, and steers to avoid whatever it sees — a minimal
-"drive by what the camera shows" loop. The twin server must be started with
-`--render` so the camera feed exists (`python -m tools.twin_server --render`).
+Pulls an agent's first-person camera from the twin server, runs a YOLO model on each
+frame, and steers to avoid whatever it sees — a minimal "drive by what the camera
+shows" loop. Each demo picks the model with --model (default yolov8n.pt, the smallest
+at ~6 MB). The twin server must be started with `--render` so the camera feed exists
+(`python -m tools.twin_server --render`).
 
 YOLO is pretrained on COCO, so it flags things like cars, trucks, and people — e.g.
 vehicles in the aerial ground imagery and other agents that cross the view. Where it
 sees nothing, the agent just cruises. Install once: `pip install ultralytics`.
 """
+import os
 import time
 
 _MODEL = None
+_MODEL_NAME = None
 
 
 def load_model(name="yolov8n.pt"):
-    """Load the smallest YOLO model once (weights auto-download on first use)."""
-    global _MODEL
-    if _MODEL is None:
-        try:
-            from ultralytics import YOLO
-        except ImportError:
-            raise SystemExit(
-                "YOLO not installed. Install the vision model with:\n"
-                "    pip install ultralytics\n"
-                "(it pulls in torch; yolov8n weights download automatically on first run)")
-        _MODEL = YOLO(name)            # 'yolov8n.pt' is the smallest YOLOv8 model (~6 MB)
+    """Load a YOLO model once and cache it (weights auto-download on first use).
+
+    `name` is any Ultralytics model id/path (e.g. "yolov8n.pt" .. "yolov8x.pt"). A bare
+    filename that sits next to this script is used directly, so the demos find their
+    bundled weights no matter which directory you launch them from.
+    """
+    global _MODEL, _MODEL_NAME
+    if _MODEL is not None and _MODEL_NAME == name:
+        return _MODEL
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        raise SystemExit(
+            "YOLO not installed. Install the vision model with:\n"
+            "    pip install ultralytics\n"
+            "(it pulls in torch; the weights download automatically on first run)")
+    resolved = name
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    if not os.path.dirname(name) and os.path.exists(local):
+        resolved = local          # prefer weights bundled in this directory
+    _MODEL = YOLO(resolved)
+    _MODEL_NAME = name
     return _MODEL
 
 
